@@ -1,6 +1,8 @@
 # Thalovant Rust SDK
 
-Rust SDK for direct Thalovant HiveMind HTTPS clients and agents.
+Rust SDK for direct Thalovant hub HTTPS clients and agents.
+
+Full documentation: <https://docs.thalovant.com/developers/sdks/rust/>
 
 ```bash
 cargo add thalovant
@@ -24,8 +26,8 @@ async fn main() -> thalovant::Result<()> {
 
 This is an alpha SDK scaffold with identity, event, session, conversation,
 AES-GCM preshared-key helpers, and an async HTTP transport compatible with the
-Thalovant SDK contract. The live transport targets the preshared-key HiveMind
-HTTP path used by Thalovant public hubs.
+Thalovant SDK contract. The live transport targets the preshared-key HTTP path
+used by Thalovant public hubs.
 
 ## Identity
 
@@ -37,7 +39,7 @@ HTTP path used by Thalovant public hubs.
   "site_id": "my-client-site",
   "default_master": "https://hub.example.com",
   "default_port": 443,
-  "default_path": "/hivemind/public"
+  "default_path": "/public"
 }
 ```
 
@@ -47,13 +49,12 @@ HTTP path used by Thalovant public hubs.
 use thalovant::{build_client_context, ClientContextOptions};
 
 let context = build_client_context(None, ClientContextOptions {
-    user_id: Some("operator-42".into()),
+    user_id: Some("user-42".into()),
     user_name: Some("Ada".into()),
-    auth_token: Some("access-token".into()),
     auth_provider: Some("oidc".into()),
-    roles: vec!["operator".into()],
-    platform: Some("mobile".into()),
-    source: Some("line-a-tablet-3".into()),
+    roles: vec!["member".into()],
+    platform: Some("kiosk".into()),
+    source: Some("checkout-kiosk".into()),
     channel: Some("chat".into()),
     ..Default::default()
 });

@@ -2,13 +2,13 @@
 name = "thalovant"
 version = "0.2.0"
 edition = "2021"
-description = "Rust SDK for direct Thalovant HiveMind HTTPS clients and agents"
+description = "Rust SDK for direct Thalovant hub HTTPS clients and agents"
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/thalovant/thalovant-rust-sdk"
-homepage = "https://thalovant.com"
+homepage = "https://docs.thalovant.com/developers/sdks/rust/"
 documentation = "https://docs.rs/thalovant"
-keywords = ["thalovant", "hivemind", "ovos", "sdk", "agent"]
+keywords = ["thalovant", "sdk", "agent", "voice", "assistant"]
 categories = ["api-bindings", "network-programming"]
 rust-version = "1.75"
 
