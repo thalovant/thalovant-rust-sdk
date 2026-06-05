@@ -33,45 +33,120 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Read package version
-        id: version
+      - name: Plan automatic release
+        id: plan
         run: |
-          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import subprocess
 
-      - name: Check existing tag
-        id: tag
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-        run: |
-          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          relevant_paths = ("src", "Cargo.toml", "README.md", "LICENSE")
+
+          def git(*args: str, check: bool = True) -> str:
+              result = subprocess.run(
+                  ["git", *args],
+                  check=check,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              return result.stdout.strip()
+
+          def tag_exists(tag: str) -> bool:
+              return subprocess.run(
+                  ["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              ).returncode == 0
+
+          def version() -> str:
+              match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pathlib.Path("Cargo.toml").read_text())
+              if not match:
+                  raise SystemExit("Cargo.toml does not contain a package version")
+              return match.group(1)
+
+          def changed_since_latest_tag() -> list[str]:
+              latest = subprocess.run(
+                  ["git", "describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+                  text=True,
+              )
+              if latest.returncode != 0:
+                  return ["<initial-release>"]
+              return [
+                  line
+                  for line in git("diff", "--name-only", f"{latest.stdout.strip()}..HEAD").splitlines()
+                  if line
+              ]
+
+          def is_relevant(path: str) -> bool:
+              return any(path == prefix or path.startswith(f"{prefix}/") for prefix in relevant_paths)
+
+          def bump_patch(current: str) -> str:
+              match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", current)
+              if not match:
+                  raise SystemExit(f"Cannot auto-bump non-standard version: {current}")
+              major, minor, patch = (int(part) for part in match.groups())
+              return f"{major}.{minor}.{patch + 1}"
+
+          def replace(path: str, old: str, new: str) -> None:
+              file_path = pathlib.Path(path)
+              file_path.write_text(file_path.read_text().replace(old, new))
+
+          changed = changed_since_latest_tag()
+          if changed != ["<initial-release>"] and not any(is_relevant(path) for path in changed):
+              current = version()
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write("release_needed=false\n")
+                  output.write(f"version={current}\n")
+                  output.write(f"tag=v{current}\n")
+                  output.write(f"release_sha={git('rev-parse', 'HEAD')}\n")
+              print("No release-relevant SDK changes since the latest tag.")
+              raise SystemExit(0)
+
+          current = version()
+          if tag_exists(f"v{current}"):
+              next_version = bump_patch(current)
+              replace("Cargo.toml", f'version = "{current}"', f'version = "{next_version}"')
+              replace("src/constants.rs", f"thalovant-rust-sdk/{current}", f"thalovant-rust-sdk/{next_version}")
+              git("config", "user.name", "github-actions[bot]")
+              git("config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com")
+              git("add", "Cargo.toml", "src/constants.rs")
+              git("commit", "-m", f"release: bump Rust SDK to {next_version}")
+              git("push", "origin", "HEAD:main")
+              current = next_version
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("release_needed=true\n")
+              output.write(f"version={current}\n")
+              output.write(f"tag=v{current}\n")
+              output.write(f"release_sha={git('rev-parse', 'HEAD')}\n")
+          PY
 
       - name: Check formatting
-        if: steps.tag.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true'
         run: cargo fmt --check
 
       - name: Run clippy
-        if: steps.tag.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        if: steps.tag.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true'
         run: cargo test --all-features
 
       - name: Check package contents
-        if: steps.tag.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true'
         run: cargo package --allow-dirty --list
 
       - name: Check whether version is already on crates.io
-        if: steps.tag.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true'
         id: registry
         env:
-          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE_VERSION: ${{ steps.plan.outputs.version }}
         run: |
           STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -A 'thalovant-release-check' "https://crates.io/api/v1/crates/thalovant/$PACKAGE_VERSION")"
           case "$STATUS" in
@@ -81,30 +156,30 @@ jobs:
           esac
 
       - name: Publish skipped
-        if: steps.tag.outputs.exists == 'false' && steps.registry.outputs.exists == 'true'
-        run: echo "thalovant ${{ steps.version.outputs.version }} is already published on crates.io."
+        if: steps.plan.outputs.release_needed == 'true' && steps.registry.outputs.exists == 'true'
+        run: echo "thalovant ${{ steps.plan.outputs.version }} is already published on crates.io."
 
       - name: Authenticate with crates.io trusted publishing
-        if: ${{ steps.tag.outputs.exists == 'false' && steps.registry.outputs.exists == 'false' && env.CARGO_REGISTRY_TOKEN_FROM_SECRET == '' }}
+        if: ${{ steps.plan.outputs.release_needed == 'true' && steps.registry.outputs.exists == 'false' && env.CARGO_REGISTRY_TOKEN_FROM_SECRET == '' }}
         id: crates-auth
         uses: rust-lang/crates-io-auth-action@v1
 
       - name: Publish to crates.io dry run
-        if: steps.tag.outputs.exists == 'false' && steps.registry.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true' && steps.registry.outputs.exists == 'false'
         run: cargo publish --dry-run
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
 
       - name: Publish to crates.io
-        if: steps.tag.outputs.exists == 'false' && steps.registry.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true' && steps.registry.outputs.exists == 'false'
         run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
 
       - name: Verify crates.io version
-        if: steps.tag.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true'
         env:
-          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE_VERSION: ${{ steps.plan.outputs.version }}
         run: |
           for attempt in $(seq 1 12); do
             STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -A 'thalovant-release-check' "https://crates.io/api/v1/crates/thalovant/$PACKAGE_VERSION")"
@@ -118,8 +193,9 @@ jobs:
           exit 1
 
       - name: Create GitHub release
-        if: steps.tag.outputs.exists == 'false'
+        if: steps.plan.outputs.release_needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.version.outputs.tag }}
-        run: gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes "Release $TAG"
+          TAG: ${{ steps.plan.outputs.tag }}
+          RELEASE_SHA: ${{ steps.plan.outputs.release_sha }}
+        run: gh release create "$TAG" --target "$RELEASE_SHA" --title "$TAG" --notes "Release $TAG"
