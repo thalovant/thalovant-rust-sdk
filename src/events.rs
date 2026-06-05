@@ -52,7 +52,11 @@ impl Event {
     pub fn utterances(&self) -> Vec<String> {
         match self.data.get("utterances") {
             Some(Value::String(value)) => vec![value.clone()],
-            Some(Value::Array(values)) => values.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            Some(Value::Array(values)) => values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
             _ => self
                 .data
                 .get("utterance")
@@ -126,14 +130,21 @@ pub fn context_with_correlation(
         session.insert("session_id".to_string(), Value::String(value.to_string()));
     }
     if let Some(value) = site_id.filter(|value| !value.is_empty()) {
-        session.entry("site_id".to_string()).or_insert_with(|| Value::String(value.to_string()));
+        session
+            .entry("site_id".to_string())
+            .or_insert_with(|| Value::String(value.to_string()));
     }
     if let Some(value) = lang.filter(|value| !value.is_empty()) {
-        session.entry("lang".to_string()).or_insert_with(|| Value::String(value.to_string()));
+        session
+            .entry("lang".to_string())
+            .or_insert_with(|| Value::String(value.to_string()));
     }
     if let Some(value) = request_id.filter(|value| !value.is_empty()) {
         next.insert("request_id".to_string(), Value::String(value.to_string()));
-        next.insert("thalovant_request_id".to_string(), Value::String(value.to_string()));
+        next.insert(
+            "thalovant_request_id".to_string(),
+            Value::String(value.to_string()),
+        );
         session.insert("request_id".to_string(), Value::String(value.to_string()));
     }
     if !session.is_empty() {
@@ -169,7 +180,11 @@ pub(crate) fn event_from_bus_payload(payload: &Map<String, Value>, raw: Option<V
         .and_then(Value::as_str)
         .unwrap_or(EVENT_RECOGNIZER_LOOP_UTTERANCE)
         .to_string();
-    let data = payload.get("data").and_then(Value::as_object).cloned().unwrap_or_default();
+    let data = payload
+        .get("data")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let context = payload
         .get("context")
         .and_then(Value::as_object)
@@ -183,7 +198,12 @@ fn session_id_from_context(context: &Context) -> Option<String> {
         .get("session_id")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .or_else(|| context.get("session_id").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| {
+            context
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 fn request_id_from_context(context: &Context) -> Option<String> {
@@ -191,7 +211,11 @@ fn request_id_from_context(context: &Context) -> Option<String> {
 }
 
 fn session_from_context(context: &Context) -> Context {
-    context.get("session").and_then(Value::as_object).cloned().unwrap_or_default()
+    context
+        .get("session")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn request_id_from_map(values: &Map<String, Value>) -> Option<String> {
@@ -206,7 +230,13 @@ mod tests {
 
     #[test]
     fn event_text_and_context_matching_work() {
-        let context = context_with_correlation(None, Some("session-1"), Some("site"), Some("en-us"), Some("request-1"));
+        let context = context_with_correlation(
+            None,
+            Some("session-1"),
+            Some("site"),
+            Some("en-us"),
+            Some("request-1"),
+        );
         let mut data = Data::new();
         data.insert("utterance".to_string(), Value::String("hi".to_string()));
         let event = Event::new("speak", data, context.clone(), None);

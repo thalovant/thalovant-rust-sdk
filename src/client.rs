@@ -5,12 +5,13 @@ use crate::{
     },
     errors::{Result, ThalovantError},
     events::{
-        context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
-        utterance_payload, Context, Data, Reply,
+        context_with_correlation, event_matches_context, merge_context, new_request_id,
+        new_session_id, utterance_payload, Context, Data, Reply,
     },
     identity::Identity,
     transport::{HttpTransport, TransportHealth},
 };
+use serde_json::{Map, Value};
 use std::{path::Path, time::Duration};
 use tokio::time::timeout;
 
@@ -23,6 +24,25 @@ pub struct Client {
 #[derive(Clone, Debug, Default)]
 pub struct RequestOptions {
     pub timeout: Option<Duration>,
+    pub lang: Option<String>,
+    pub context: Option<Context>,
+    pub session_id: Option<String>,
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ActionOptions {
+    pub title: Option<String>,
+    pub lang: Option<String>,
+    pub context: Option<Context>,
+    pub session_id: Option<String>,
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CodeOptions {
+    pub kind: Option<String>,
+    pub label: Option<String>,
     pub lang: Option<String>,
     pub context: Option<Context>,
     pub session_id: Option<String>,
@@ -83,7 +103,9 @@ impl Client {
     pub async fn send_utterance(&self, text: &str, opts: RequestOptions) -> Result<()> {
         let prompt = text.trim();
         if prompt.is_empty() {
-            return Err(ThalovantError::Runtime("send_utterance requires non-empty text".to_string()));
+            return Err(ThalovantError::Runtime(
+                "send_utterance requires non-empty text".to_string(),
+            ));
         }
         let lang = opts.lang.as_deref().unwrap_or("en-us");
         let request_id = opts.request_id.unwrap_or_else(new_request_id);
@@ -94,14 +116,82 @@ impl Client {
             Some(lang),
             Some(&request_id),
         );
-        self.emit(EVENT_RECOGNIZER_LOOP_UTTERANCE, utterance_payload(prompt, lang), context)
+        self.emit(
+            EVENT_RECOGNIZER_LOOP_UTTERANCE,
+            utterance_payload(prompt, lang),
+            context,
+        )
+        .await
+    }
+
+    pub async fn send_action(&self, payload: &str, opts: ActionOptions) -> Result<()> {
+        let prompt = payload.trim();
+        if prompt.is_empty() {
+            return Err(ThalovantError::Runtime(
+                "send_action requires non-empty payload".to_string(),
+            ));
+        }
+        let mut input = Map::new();
+        input.insert("kind".to_string(), Value::String("action".to_string()));
+        if let Some(title) = opts.title {
+            input.insert("title".to_string(), Value::String(title));
+        }
+        input.insert("payload".to_string(), Value::String(prompt.to_string()));
+        let mut extra = Context::new();
+        extra.insert("input".to_string(), Value::Object(input));
+        self.send_utterance(
+            prompt,
+            RequestOptions {
+                lang: opts.lang,
+                context: Some(merge_context(opts.context.as_ref(), Some(&extra))),
+                session_id: opts.session_id,
+                request_id: opts.request_id,
+                timeout: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn send_code(&self, value: &str, opts: CodeOptions) -> Result<()> {
+        let code = value.trim();
+        if code.is_empty() {
+            return Err(ThalovantError::Runtime(
+                "send_code requires non-empty value".to_string(),
+            ));
+        }
+        let lang = opts.lang.as_deref().unwrap_or("en-us");
+        let request_id = opts.request_id.unwrap_or_else(new_request_id);
+        let mut input = Map::new();
+        input.insert(
+            "kind".to_string(),
+            Value::String(opts.kind.unwrap_or_else(|| "code".to_string())),
+        );
+        if let Some(label) = opts.label {
+            input.insert("label".to_string(), Value::String(label));
+        }
+        input.insert("value".to_string(), Value::String(code.to_string()));
+        input.insert("exact".to_string(), Value::Bool(true));
+        let mut extra = Context::new();
+        extra.insert("input".to_string(), Value::Object(input.clone()));
+        let context = context_with_correlation(
+            Some(&merge_context(opts.context.as_ref(), Some(&extra))),
+            opts.session_id.as_deref(),
+            Some(&self.identity.site_id),
+            Some(lang),
+            Some(&request_id),
+        );
+        let mut data = utterance_payload(code, lang);
+        data.insert("input".to_string(), Value::Object(input));
+        self.emit(EVENT_RECOGNIZER_LOOP_UTTERANCE, data, context)
             .await
     }
 
     pub async fn ask(&self, text: &str, opts: RequestOptions) -> Result<Reply> {
         let prompt = text.trim();
         if prompt.is_empty() {
-            return Err(ThalovantError::Runtime("ask requires non-empty text".to_string()));
+            return Err(ThalovantError::Runtime(
+                "ask requires non-empty text".to_string(),
+            ));
         }
         self.connect().await?;
         let lang = opts.lang.as_deref().unwrap_or("en-us");
@@ -116,7 +206,11 @@ impl Client {
         );
         let mut receiver = self.transport.subscribe();
         self.transport
-            .emit_bus(EVENT_RECOGNIZER_LOOP_UTTERANCE, utterance_payload(prompt, lang), context.clone())
+            .emit_bus(
+                EVENT_RECOGNIZER_LOOP_UTTERANCE,
+                utterance_payload(prompt, lang),
+                context.clone(),
+            )
             .await?;
         let mut events = Vec::new();
         let mut fragments = Vec::new();
@@ -149,7 +243,10 @@ impl Client {
         .map_err(|_| ThalovantError::Timeout("utterance handling timed out".to_string()))??;
         if failure_event.is_some() && fragments.is_empty() {
             return Err(ThalovantError::Runtime(
-                failure_event.as_ref().map(|event| event.name.clone()).unwrap_or_default(),
+                failure_event
+                    .as_ref()
+                    .map(|event| event.name.clone())
+                    .unwrap_or_default(),
             ));
         }
         Ok(Reply {
@@ -195,5 +292,23 @@ impl Conversation {
         }
         opts.context = Some(merge_context(Some(&self.context), opts.context.as_ref()));
         self.client.send_utterance(text, opts).await
+    }
+
+    pub async fn send_action(&self, payload: &str, mut opts: ActionOptions) -> Result<()> {
+        opts.session_id = Some(self.session_id.clone());
+        if opts.lang.is_none() {
+            opts.lang = Some(self.lang.clone());
+        }
+        opts.context = Some(merge_context(Some(&self.context), opts.context.as_ref()));
+        self.client.send_action(payload, opts).await
+    }
+
+    pub async fn send_code(&self, value: &str, mut opts: CodeOptions) -> Result<()> {
+        opts.session_id = Some(self.session_id.clone());
+        if opts.lang.is_none() {
+            opts.lang = Some(self.lang.clone());
+        }
+        opts.context = Some(merge_context(Some(&self.context), opts.context.as_ref()));
+        self.client.send_code(value, opts).await
     }
 }

@@ -62,7 +62,11 @@ impl HttpTransport {
         Self::with_options(identity, DEFAULT_USER_AGENT, Duration::from_secs(1))
     }
 
-    pub fn with_options(identity: Identity, user_agent: impl Into<String>, poll_interval: Duration) -> Self {
+    pub fn with_options(
+        identity: Identity,
+        user_agent: impl Into<String>,
+        poll_interval: Duration,
+    ) -> Self {
         let (bus_tx, _) = broadcast::channel(64);
         Self {
             state: Arc::new(HttpTransportState {
@@ -90,7 +94,10 @@ impl HttpTransport {
     }
 
     pub fn authorization(&self) -> String {
-        general_purpose::STANDARD.encode(format!("{}:{}", self.state.user_agent, self.state.identity.access_key))
+        general_purpose::STANDARD.encode(format!(
+            "{}:{}",
+            self.state.user_agent, self.state.identity.access_key
+        ))
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -120,7 +127,9 @@ impl HttpTransport {
             }
         }
         if !self.is_handshake_complete().await {
-            return Err(ThalovantError::Timeout("HiveMind HTTP handshake timed out".to_string()));
+            return Err(ThalovantError::Timeout(
+                "HiveMind HTTP handshake timed out".to_string(),
+            ));
         }
         self.start_polling().await;
         Ok(())
@@ -130,7 +139,12 @@ impl HttpTransport {
         if let Some(task) = self.state.poll_task.lock().await.take() {
             task.abort();
         }
-        let _ = self.state.http_client.post(self.endpoint("/disconnect")).send().await;
+        let _ = self
+            .state
+            .http_client
+            .post(self.endpoint("/disconnect"))
+            .send()
+            .await;
         let mut health = self.state.health.lock().await;
         health.connected = false;
         health.handshake_complete = false;
@@ -142,7 +156,12 @@ impl HttpTransport {
         self.state.health.lock().await.clone()
     }
 
-    pub async fn emit_bus(&self, event_type: &str, data: Data, context: Map<String, Value>) -> Result<()> {
+    pub async fn emit_bus(
+        &self,
+        event_type: &str,
+        data: Data,
+        context: Map<String, Value>,
+    ) -> Result<()> {
         self.send_hive_message(
             HiveMessage {
                 msg_type: "bus".to_string(),
@@ -218,7 +237,9 @@ impl HttpTransport {
                     parsed
                 }
             }
-            Value::Object(object) if object.get("ciphertext").is_some() => self.decrypt_message_value(Value::Object(object))?,
+            Value::Object(object) if object.get("ciphertext").is_some() => {
+                self.decrypt_message_value(Value::Object(object))?
+            }
             other => other,
         };
         let message: HiveMessage = serde_json::from_value(decoded.clone())?;
@@ -234,22 +255,25 @@ impl HttpTransport {
     }
 
     fn decrypt_message_value(&self, value: Value) -> Result<Value> {
-        let key = self
-            .state
-            .identity
-            .crypto_key
-            .as_deref()
-            .ok_or_else(|| ThalovantError::Crypto("encrypted message received without identity.crypto_key".to_string()))?;
+        let key = self.state.identity.crypto_key.as_deref().ok_or_else(|| {
+            ThalovantError::Crypto(
+                "encrypted message received without identity.crypto_key".to_string(),
+            )
+        })?;
         let decrypted = decrypt_from_json(key, &value.to_string())?;
         Ok(serde_json::from_str(&decrypted)?)
     }
 
     async fn handle_handshake(&self, payload: Map<String, Value>) -> Result<()> {
-        if truthy(payload.get("preshared_key")) && !truthy(payload.get("handshake")) && payload.get("envelope").is_none() {
+        if truthy(payload.get("preshared_key"))
+            && !truthy(payload.get("handshake"))
+            && payload.get("envelope").is_none()
+        {
             let crypto_key = self.state.identity.crypto_key.as_deref();
             if runtime_crypto_key(crypto_key).is_none() {
                 return Err(ThalovantError::Connection(
-                    "HiveMind requested a preshared key, but identity.crypto_key is missing".to_string(),
+                    "HiveMind requested a preshared key, but identity.crypto_key is missing"
+                        .to_string(),
                 ));
             }
             self.send_hive_message(

@@ -28,8 +28,10 @@ pub fn runtime_crypto_key(raw: Option<&str>) -> Option<[u8; 16]> {
 }
 
 pub fn encrypt_as_json(key: &str, plaintext: &str) -> Result<String> {
-    let key = runtime_crypto_key(Some(key)).ok_or_else(|| ThalovantError::Crypto("missing crypto key".to_string()))?;
-    let cipher = Aes128Gcm::new_from_slice(&key).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
+    let key = runtime_crypto_key(Some(key))
+        .ok_or_else(|| ThalovantError::Crypto("missing crypto key".to_string()))?;
+    let cipher =
+        Aes128Gcm::new_from_slice(&key).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
     let mut nonce = [0_u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce);
     let sealed = cipher
@@ -49,10 +51,14 @@ pub fn encrypt_as_json(key: &str, plaintext: &str) -> Result<String> {
 
 pub fn decrypt_from_json(key: &str, raw: &str) -> Result<String> {
     let encrypted: EncryptedJson = serde_json::from_str(raw)?;
-    let key = runtime_crypto_key(Some(key)).ok_or_else(|| ThalovantError::Crypto("missing crypto key".to_string()))?;
-    let cipher = Aes128Gcm::new_from_slice(&key).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
-    let nonce = hex::decode(encrypted.nonce).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
-    let ciphertext = hex::decode(encrypted.ciphertext).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
+    let key = runtime_crypto_key(Some(key))
+        .ok_or_else(|| ThalovantError::Crypto("missing crypto key".to_string()))?;
+    let cipher =
+        Aes128Gcm::new_from_slice(&key).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
+    let nonce =
+        hex::decode(encrypted.nonce).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
+    let ciphertext =
+        hex::decode(encrypted.ciphertext).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
     let tag = hex::decode(encrypted.tag).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
     let mut sealed = ciphertext;
     sealed.extend(tag);
