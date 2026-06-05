@@ -1,0 +1,26 @@
+[package]
+name = "thalovant"
+version = "0.1.0"
+edition = "2021"
+description = "Rust SDK for direct Thalovant HiveMind HTTPS clients and agents"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/thalovant/thalovant-rust-sdk"
+homepage = "https://thalovant.com"
+documentation = "https://docs.rs/thalovant"
+keywords = ["thalovant", "hivemind", "ovos", "sdk", "agent"]
+categories = ["api-bindings", "network-programming"]
+rust-version = "1.75"
+
+[dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+hex = "0.4"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+urlencoding = "2"
+uuid = { version = "1", features = ["v4", "fast-rng"] }
