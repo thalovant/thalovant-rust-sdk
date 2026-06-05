@@ -26,16 +26,51 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: Read package version
+        id: version
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Check whether version is already on crates.io
+        id: registry
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -A 'thalovant-release-check' "https://crates.io/api/v1/crates/thalovant/$PACKAGE_VERSION")"
+          case "$STATUS" in
+            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "Unexpected crates.io status: $STATUS"; exit 1 ;;
+          esac
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+      - name: Publish skipped
+        if: steps.registry.outputs.exists == 'true'
+        run: echo "thalovant ${{ steps.version.outputs.version }} is already published on crates.io."
       - name: Authenticate with crates.io trusted publishing
-        if: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET == '' }}
+        if: ${{ steps.registry.outputs.exists == 'false' && env.CARGO_REGISTRY_TOKEN_FROM_SECRET == '' }}
         id: crates-auth
         uses: rust-lang/crates-io-auth-action@v1
       - run: cargo publish --dry-run
+        if: steps.registry.outputs.exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
       - run: cargo publish
+        if: steps.registry.outputs.exists == 'false'
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
+      - name: Verify crates.io version
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for attempt in $(seq 1 12); do
+            STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -A 'thalovant-release-check' "https://crates.io/api/v1/crates/thalovant/$PACKAGE_VERSION")"
+            if [ "$STATUS" = "200" ]; then
+              echo "Verified thalovant $PACKAGE_VERSION on crates.io."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "thalovant $PACKAGE_VERSION was not visible on crates.io after waiting."
+          exit 1
