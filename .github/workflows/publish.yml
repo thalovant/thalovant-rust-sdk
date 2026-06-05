@@ -11,6 +11,7 @@ env:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -18,6 +19,8 @@ jobs:
     environment:
       name: crates
       url: https://crates.io/crates/thalovant
+    env:
+      CARGO_REGISTRY_TOKEN_FROM_SECRET: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -26,9 +29,13 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-features
+      - name: Authenticate with crates.io trusted publishing
+        if: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET == '' }}
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
       - run: cargo publish --dry-run
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
       - run: cargo publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
