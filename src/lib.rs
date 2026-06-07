@@ -7,6 +7,7 @@ pub mod crypto;
 pub mod errors;
 pub mod events;
 pub mod identity;
+pub mod protocols;
 pub mod rich;
 pub mod transport;
 
@@ -22,5 +23,8 @@ pub use events::{
     utterance_payload, Context, Data, Event, Reply,
 };
 pub use identity::Identity;
+pub use protocols::{
+    endpoint_from_domain, HubDataPlaneEndpoints, HubProtocol, HubProtocolSettings,
+};
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
 pub use transport::{HttpTransport, TransportHealth};

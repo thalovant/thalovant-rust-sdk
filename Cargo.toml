@@ -1,8 +1,8 @@
 [package]
 name = "thalovant"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-description = "Rust SDK for direct Thalovant hub HTTPS clients and agents"
+description = "Rust SDK for direct Thalovant hub data-plane clients and agents"
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/thalovant/thalovant-rust-sdk"
