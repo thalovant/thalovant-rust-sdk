@@ -5,6 +5,7 @@ use crate::{
         endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,
         HubProtocolSettings, SelectedHubEndpoint, DEFAULT_PROTOCOL_PREFERENCE,
     },
+    tls::ensure_rustls_provider,
 };
 use base64::{engine::general_purpose, Engine as _};
 use rand::{rngs::OsRng, RngCore};
@@ -12,7 +13,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.4";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.5";
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -43,6 +44,7 @@ pub struct BootstrapIdentityResult {
 
 impl ControlPlane {
     pub fn new(api_url: impl Into<String>, access_token: Option<String>) -> Self {
+        ensure_rustls_provider();
         Self {
             api_url: format!("{}/", api_url.into().trim_end_matches('/')),
             access_token,
@@ -211,6 +213,7 @@ impl ControlPlane {
                 default_port: 443,
                 default_path: String::new(),
                 public_key: None,
+                metadata: Map::new(),
                 name: Some(opts.name),
                 data_plane_endpoints: endpoints,
                 protocols,
@@ -327,6 +330,12 @@ impl BootstrapIdentityResult {
         let endpoints = self.identity.data_plane_endpoints.as_map(!include_secrets);
         if !endpoints.is_empty() {
             identity.insert("data_plane_endpoints".to_string(), Value::Object(endpoints));
+        }
+        if !self.identity.metadata.is_empty() {
+            identity.insert(
+                "metadata".to_string(),
+                Value::Object(self.identity.metadata.clone()),
+            );
         }
         if include_secrets {
             identity.insert(

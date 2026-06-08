@@ -108,7 +108,30 @@ impl Client {
 
     pub async fn emit(&self, event_type: &str, data: Data, context: Context) -> Result<()> {
         self.connect().await?;
-        self.transport.emit_bus(event_type, data, context).await
+        self.transport
+            .emit_bus(
+                event_type,
+                data,
+                self.context_with_identity_metadata(context),
+            )
+            .await
+    }
+
+    fn context_with_identity_metadata(&self, context: Context) -> Context {
+        if self.identity.metadata.is_empty() {
+            return context;
+        }
+        let mut next = context;
+        let mut metadata = next
+            .get("metadata")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        for (key, value) in &self.identity.metadata {
+            metadata.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        next.insert("metadata".to_string(), Value::Object(metadata));
+        next
     }
 
     pub async fn send_utterance(&self, text: &str, opts: RequestOptions) -> Result<()> {

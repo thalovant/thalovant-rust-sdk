@@ -113,6 +113,7 @@ pub struct Identity {
     pub default_port: u16,
     pub default_path: String,
     pub public_key: Option<String>,
+    pub metadata: Map<String, Value>,
     pub name: Option<String>,
     pub data_plane_endpoints: HubDataPlaneEndpoints,
     pub protocols: HubProtocolSettings,
@@ -159,6 +160,11 @@ impl Identity {
             default_port,
             default_path,
             public_key: optional_string(object, "public_key", &["publicKey"])?,
+            metadata: object
+                .get("metadata")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default(),
             name: optional_string(object, "name", &[])?,
             data_plane_endpoints: HubDataPlaneEndpoints::from_object(object),
             protocols: HubProtocolSettings::from_object(object),
@@ -391,7 +397,8 @@ mod tests {
             "site": "site",
             "host": "https://hub.example.com/",
             "port": "443",
-            "path": "/hivemind/public"
+            "path": "/hivemind/public",
+            "metadata": {"thalovant_owner_id": "owner-1"}
         }))
         .unwrap();
         assert_eq!(identity.access_key, "access");
@@ -402,6 +409,7 @@ mod tests {
             identity.base_url(),
             "https://hub.example.com/hivemind/public"
         );
+        assert_eq!(identity.metadata["thalovant_owner_id"], "owner-1");
     }
 
     #[test]
@@ -566,6 +574,33 @@ mod tests {
                 c2s: "hivemind/hub/c2s/access".to_string(),
                 s2c: "hivemind/hub/s2c/access".to_string(),
                 status: "hivemind/hub/status/access".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn mqtt_topics_append_hub_id_for_scoped_acls() {
+        let identity = Identity::from_value(json!({
+            "key": "access",
+            "password": "secret",
+            "site": "site",
+            "host": "https://hub.example.com",
+            "mqtt": {
+                "endpoint": "mqtts://mqtt.example.com:8883",
+                "username": "access",
+                "password": "broker-password",
+                "topic_prefix": "hivemind",
+                "hub_id": "hub-1"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            mqtt_topics_for_identity(&identity).unwrap(),
+            crate::transport::MqttTopicSet {
+                c2s: "hivemind/hub-1/c2s/access".to_string(),
+                s2c: "hivemind/hub-1/s2c/access".to_string(),
+                status: "hivemind/hub-1/status/access".to_string(),
             }
         );
     }

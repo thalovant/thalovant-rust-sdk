@@ -1,10 +1,14 @@
 use crate::{
     constants::DEFAULT_USER_AGENT,
-    crypto::{decrypt_from_json, encrypt_as_json, runtime_crypto_key},
+    crypto::{
+        decrypt_binary, decrypt_from_json, encrypt_as_binary, encrypt_as_json, runtime_crypto_key,
+    },
     errors::{Result, ThalovantError},
     events::{event_from_bus_payload, Data, Event},
     identity::Identity,
     protocols::HubProtocol,
+    tls::ensure_rustls_provider,
+    wire::{decode_hive_binary_frame, encode_hive_binary_frame},
 };
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
@@ -152,6 +156,7 @@ impl HttpTransport {
         user_agent: impl Into<String>,
         poll_interval: Duration,
     ) -> Self {
+        ensure_rustls_provider();
         let (bus_tx, _) = broadcast::channel(64);
         Self {
             state: Arc::new(HttpTransportState {
@@ -329,7 +334,7 @@ impl HttpTransport {
         };
         let message: HiveMessage = serde_json::from_value(decoded.clone())?;
         match message.msg_type.as_str() {
-            "handshake" => self.handle_handshake(message.payload).await,
+            "handshake" | "shake" => self.handle_handshake(message.payload).await,
             "bus" => {
                 let event = event_from_bus_payload(&message.payload, Some(decoded));
                 let _ = self.state.bus_tx.send(event);
@@ -449,6 +454,7 @@ struct WssTransportState {
 
 impl WssTransport {
     pub fn new(identity: Identity) -> Self {
+        ensure_rustls_provider();
         let (bus_tx, _) = broadcast::channel(64);
         Self {
             state: Arc::new(WssTransportState {
@@ -664,6 +670,7 @@ struct MqttTransportState {
 
 impl MqttTransport {
     pub fn new(identity: Identity) -> Result<Self> {
+        ensure_rustls_provider();
         let topics = mqtt_topics_for_identity(&identity)?;
         let (bus_tx, _) = broadcast::channel(64);
         Ok(Self {
@@ -713,8 +720,10 @@ impl MqttTransport {
             loop {
                 match eventloop.poll().await {
                     Ok(MqttEvent::Incoming(Packet::Publish(publish))) => {
-                        let raw = String::from_utf8_lossy(&publish.payload).to_string();
-                        if let Err(error) = transport.handle_raw_message(Value::String(raw)).await {
+                        if let Err(error) = transport
+                            .handle_raw_mqtt_payload(publish.payload.to_vec())
+                            .await
+                        {
                             transport.mark_error(error).await;
                             break;
                         }
@@ -749,7 +758,7 @@ impl MqttTransport {
         }
         self.send_hive_message(
             hello_hive_message(&self.state.identity, "thalovant-rust-mqtt-"),
-            false,
+            true,
         )
         .await?;
         let deadline = Instant::now() + Duration::from_secs(6);
@@ -818,18 +827,33 @@ impl MqttTransport {
         self.state.health.lock().await.handshake_complete
     }
 
-    async fn handle_raw_message(&self, raw: Value) -> Result<()> {
-        let completed = handle_runtime_message(
-            &self.state.identity,
-            &self.state.bus_tx,
-            raw,
-            |message, encrypt| {
-                let transport = self.clone();
-                async move { transport.send_hive_message(message, encrypt).await }
-            },
-        )
-        .await?;
-        if completed {
+    async fn handle_raw_mqtt_payload(&self, raw: Vec<u8>) -> Result<()> {
+        let (message, decoded) = decode_mqtt_hive_message(&self.state.identity, &raw)?;
+        match message.msg_type.as_str() {
+            "handshake" | "shake" => {
+                if !truthy(message.payload.get("preshared_key"))
+                    || truthy(message.payload.get("handshake"))
+                    || message.payload.get("envelope").is_some()
+                {
+                    return Err(ThalovantError::Connection(
+                        "Only HiveMind preshared-key MQTT handshakes are supported".to_string(),
+                    ));
+                }
+                if runtime_crypto_key(self.state.identity.crypto_key.as_deref()).is_none() {
+                    return Err(ThalovantError::Connection(
+                        "HiveMind requested a preshared key, but identity.crypto_key is missing"
+                            .to_string(),
+                    ));
+                }
+            }
+            "bus" => {
+                let event = event_from_bus_payload(&message.payload, Some(decoded));
+                let _ = self.state.bus_tx.send(event);
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+        {
             let mut health = self.state.health.lock().await;
             health.handshake_complete = true;
             health.transport_alive = true;
@@ -837,13 +861,13 @@ impl MqttTransport {
         Ok(())
     }
 
-    async fn send_hive_message(&self, message: HiveMessage, encrypt: bool) -> Result<()> {
-        let payload = serialize_hive_message(
-            &self.state.identity,
-            self.is_handshake_complete().await,
-            message,
-            encrypt,
-        )?;
+    async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
+        let mut payload = encode_hive_binary_frame(&message)?;
+        if let Some(key) = self.state.identity.crypto_key.as_deref() {
+            if !key.trim().is_empty() {
+                payload = encrypt_as_binary(key, &payload)?;
+            }
+        }
         let client = self.state.client.lock().await.clone().ok_or_else(|| {
             ThalovantError::Connection("HiveMind MQTT transport is not connected".to_string())
         })?;
@@ -918,7 +942,7 @@ where
     };
     let message: HiveMessage = serde_json::from_value(decoded.clone())?;
     match message.msg_type.as_str() {
-        "handshake" => {
+        "handshake" | "shake" => {
             if truthy(message.payload.get("preshared_key"))
                 && !truthy(message.payload.get("handshake"))
                 && message.payload.get("envelope").is_none()
@@ -952,6 +976,36 @@ fn decrypt_message_value(identity: &Identity, value: Value) -> Result<Value> {
     })?;
     let decrypted = decrypt_from_json(key, &value.to_string())?;
     Ok(serde_json::from_str(&decrypted)?)
+}
+
+fn decode_mqtt_hive_message(identity: &Identity, raw: &[u8]) -> Result<(HiveMessage, Value)> {
+    if let Ok(text) = std::str::from_utf8(raw) {
+        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+            if parsed.get("ciphertext").is_some() {
+                let decoded = decrypt_message_value(identity, parsed)?;
+                let message = serde_json::from_value(decoded.clone())?;
+                return Ok((message, decoded));
+            }
+            if parsed.get("msg_type").is_some() {
+                let message = serde_json::from_value(parsed.clone())?;
+                return Ok((message, parsed));
+            }
+        }
+    }
+    if let Some(key) = identity
+        .crypto_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Ok(decrypted) = decrypt_binary(key, raw) {
+            let message = decode_hive_binary_frame(&decrypted)?;
+            let decoded = serde_json::to_value(&message)?;
+            return Ok((message, decoded));
+        }
+    }
+    let message = decode_hive_binary_frame(raw)?;
+    let decoded = serde_json::to_value(&message)?;
+    Ok((message, decoded))
 }
 
 fn serialize_hive_message(
@@ -1071,12 +1125,26 @@ pub fn mqtt_topics_for_identity(identity: &Identity) -> Result<MqttTopicSet> {
         }
         let mut parts = raw.split('/').collect::<Vec<_>>();
         let last = parts.last().copied().unwrap_or_default();
-        if last == identity.access_key || last == credentials.username || last == satellite_id {
+        let mut base = if last == identity.access_key
+            || last == credentials.username
+            || last == satellite_id
+        {
             parts.pop();
             parts.join("/")
         } else {
             raw
+        };
+        if let Some(hub_id) = credentials
+            .hub_id
+            .as_deref()
+            .map(|value| value.trim_matches('/'))
+            .filter(|value| !value.is_empty())
+        {
+            if !base.split('/').any(|part| part == hub_id) {
+                base = format!("{base}/{hub_id}");
+            }
         }
+        base
     } else if let Some(hub_id) = credentials.hub_id.as_deref() {
         format!("hivemind/{}", hub_id.trim_matches('/'))
     } else {

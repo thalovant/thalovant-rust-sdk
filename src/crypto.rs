@@ -1,10 +1,13 @@
 use crate::errors::{Result, ThalovantError};
 use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes128Gcm, Nonce,
+    aead::{consts::U16, generic_array::GenericArray, Aead, KeyInit},
+    aes::Aes128,
+    Aes128Gcm, AesGcm, Nonce,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+
+type Aes128Gcm16 = AesGcm<Aes128, U16>;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct EncryptedJson {
@@ -68,6 +71,39 @@ pub fn decrypt_from_json(key: &str, raw: &str) -> Result<String> {
     String::from_utf8(plaintext).map_err(|err| ThalovantError::Crypto(err.to_string()))
 }
 
+pub fn encrypt_as_binary(key: &str, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let key = runtime_crypto_key(Some(key))
+        .ok_or_else(|| ThalovantError::Crypto("missing crypto key".to_string()))?;
+    let cipher =
+        Aes128Gcm16::new_from_slice(&key).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
+    let mut nonce = [0_u8; 16];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let sealed = cipher
+        .encrypt(GenericArray::from_slice(&nonce), plaintext)
+        .map_err(|err| ThalovantError::Crypto(err.to_string()))?;
+    let mut out = Vec::with_capacity(nonce.len() + sealed.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&sealed);
+    Ok(out)
+}
+
+pub fn decrypt_binary(key: &str, payload: &[u8]) -> Result<Vec<u8>> {
+    let key = runtime_crypto_key(Some(key))
+        .ok_or_else(|| ThalovantError::Crypto("missing crypto key".to_string()))?;
+    if payload.len() <= 32 {
+        return Err(ThalovantError::Crypto(
+            "invalid encrypted binary payload".to_string(),
+        ));
+    }
+    let cipher =
+        Aes128Gcm16::new_from_slice(&key).map_err(|err| ThalovantError::Crypto(err.to_string()))?;
+    let nonce = &payload[..16];
+    let ciphertext = &payload[16..];
+    cipher
+        .decrypt(GenericArray::from_slice(nonce), ciphertext)
+        .map_err(|err| ThalovantError::Crypto(err.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +122,12 @@ mod tests {
         let encrypted = encrypt_as_json("0123456789abcdef-extra", "hello").unwrap();
         let decrypted = decrypt_from_json("0123456789abcdef-extra", &encrypted).unwrap();
         assert_eq!(decrypted, "hello");
+    }
+
+    #[test]
+    fn encrypted_binary_round_trips() {
+        let encrypted = encrypt_as_binary("0123456789abcdef-extra", b"hello").unwrap();
+        let decrypted = decrypt_binary("0123456789abcdef-extra", &encrypted).unwrap();
+        assert_eq!(decrypted, b"hello");
     }
 }
