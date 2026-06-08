@@ -194,7 +194,12 @@ fn normalize_path(path: Option<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use crate::{
+        client::Client,
+        control::BootstrapIdentityResult,
+        protocols::{select_data_plane_endpoint, SelectedHubEndpoint},
+    };
+    use serde_json::{json, Value};
 
     #[test]
     fn normalizes_identity_aliases() {
@@ -278,5 +283,70 @@ mod tests {
             Some("https://jokes.thalovant.io")
         );
         assert_eq!(endpoints.mqtt, None);
+    }
+
+    #[test]
+    fn selects_first_enabled_endpoint_from_preference() {
+        let endpoints = HubDataPlaneEndpoints {
+            https: Some("https://hub.example.com/public".to_string()),
+            wss: Some("wss://hub.example.com/public".to_string()),
+            mqtt: None,
+        };
+        let selected = select_data_plane_endpoint(
+            &endpoints,
+            &HubProtocolSettings {
+                wss: true,
+                http: true,
+                mqtt: false,
+            },
+            &[HubProtocol::Mqtt, HubProtocol::Wss, HubProtocol::Https],
+        )
+        .unwrap();
+
+        assert_eq!(selected.protocol, HubProtocol::Wss);
+        assert_eq!(selected.endpoint, "wss://hub.example.com/public");
+    }
+
+    #[test]
+    fn client_rejects_unsupported_runtime_protocol() {
+        let identity = Identity::from_value(json!({
+            "key": "access",
+            "password": "secret",
+            "site": "site",
+            "host": "https://hub.example.com"
+        }))
+        .unwrap();
+
+        assert!(Client::with_protocol(identity, HubProtocol::Mqtt).is_err());
+    }
+
+    #[test]
+    fn bootstrap_summary_redacts_secrets_by_default() {
+        let identity = Identity::from_value(json!({
+            "key": "access",
+            "password": "secret",
+            "cryptoKey": "crypto",
+            "site": "site",
+            "host": "https://hub.example.com",
+            "protocols": {"http": {"enabled": true}}
+        }))
+        .unwrap();
+        let result = BootstrapIdentityResult {
+            identity,
+            hub: json!({"id": "hub-1"}),
+            client: json!({"id": "client-1"}),
+            endpoint: Some(SelectedHubEndpoint {
+                protocol: HubProtocol::Https,
+                endpoint: "https://hub.example.com".to_string(),
+            }),
+        };
+
+        assert!(result.as_value(false)["identity"]
+            .get("access_key")
+            .is_none());
+        assert_eq!(
+            result.as_value(true)["identity"]["access_key"],
+            Value::String("access".to_string())
+        );
     }
 }

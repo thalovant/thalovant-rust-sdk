@@ -9,6 +9,15 @@ pub enum HubProtocol {
     Mqtt,
 }
 
+pub const DEFAULT_PROTOCOL_PREFERENCE: &[HubProtocol] =
+    &[HubProtocol::Https, HubProtocol::Wss, HubProtocol::Mqtt];
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectedHubEndpoint {
+    pub protocol: HubProtocol,
+    pub endpoint: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubProtocolSettings {
     pub wss: bool,
@@ -170,6 +179,29 @@ impl HubDataPlaneEndpoints {
         }
         data
     }
+}
+
+pub fn select_data_plane_endpoint(
+    endpoints: &HubDataPlaneEndpoints,
+    protocols: &HubProtocolSettings,
+    preferred_protocols: &[HubProtocol],
+) -> Option<SelectedHubEndpoint> {
+    let preferred = if preferred_protocols.is_empty() {
+        DEFAULT_PROTOCOL_PREFERENCE
+    } else {
+        preferred_protocols
+    };
+    preferred.iter().find_map(|protocol| {
+        if !protocols.is_enabled(*protocol) {
+            return None;
+        }
+        endpoints
+            .endpoint_for(*protocol)
+            .map(|endpoint| SelectedHubEndpoint {
+                protocol: *protocol,
+                endpoint: endpoint.to_string(),
+            })
+    })
 }
 
 pub fn endpoint_from_domain(domain: &str, protocol: HubProtocol) -> Option<String> {

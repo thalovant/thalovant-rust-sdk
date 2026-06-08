@@ -3,6 +3,7 @@
 pub mod client;
 pub mod constants;
 pub mod context;
+pub mod control;
 pub mod crypto;
 pub mod errors;
 pub mod events;
@@ -16,6 +17,7 @@ pub use client::{
 };
 pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
+pub use control::{BootstrapIdentityOptions, BootstrapIdentityResult, ControlPlane};
 pub use crypto::{decrypt_from_json, encrypt_as_json, runtime_crypto_key};
 pub use errors::{Result, ThalovantError};
 pub use events::{
@@ -24,7 +26,8 @@ pub use events::{
 };
 pub use identity::Identity;
 pub use protocols::{
-    endpoint_from_domain, HubDataPlaneEndpoints, HubProtocol, HubProtocolSettings,
+    endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,
+    HubProtocolSettings, SelectedHubEndpoint, DEFAULT_PROTOCOL_PREFERENCE,
 };
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
 pub use transport::{HttpTransport, TransportHealth};

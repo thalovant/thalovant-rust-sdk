@@ -65,6 +65,29 @@ println!("{:?}", identity.endpoint_for(HubProtocol::Wss));
 println!("{:?}", identity.endpoint_for(HubProtocol::Mqtt));
 ```
 
+You can also create a hub client through the Thalovant API:
+
+```rust
+use thalovant::{BootstrapIdentityOptions, Client, ControlPlane};
+
+let mut control = ControlPlane::new("https://dash.thalovant.com/api", None);
+control.login("you@example.com", "password", None).await?;
+
+let result = control
+    .create_client_identity_for_hub_id("hub-id", BootstrapIdentityOptions {
+        name: "kiosk-1".into(),
+        ..Default::default()
+    })
+    .await?;
+
+let client = Client::new(result.identity);
+```
+
+The SDK generates `apiKey`, `password`, and `cryptoKey` locally and sends them
+to the API once. The API can store them in Vault and return only secret
+references; `result.identity` is the usable local client identity. Do not log
+`result.as_value(true)`.
+
 ## Generic Client Context
 
 ```rust

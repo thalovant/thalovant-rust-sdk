@@ -14,6 +14,10 @@ pub enum ThalovantError {
     Timeout(String),
     #[error("runtime error: {0}")]
     Runtime(String),
+    #[error("api error: {0}")]
+    Api(String),
+    #[error("unsupported protocol: {0}")]
+    UnsupportedProtocol(String),
     #[error("crypto error: {0}")]
     Crypto(String),
     #[error(transparent)]

@@ -9,6 +9,7 @@ use crate::{
         new_session_id, utterance_payload, Context, Data, Reply,
     },
     identity::Identity,
+    protocols::HubProtocol,
     transport::{HttpTransport, TransportHealth},
 };
 use serde_json::{Map, Value};
@@ -70,6 +71,19 @@ impl Client {
             transport: HttpTransport::new(identity.clone()),
             identity,
         }
+    }
+
+    pub fn with_protocol(identity: Identity, protocol: HubProtocol) -> Result<Self> {
+        if protocol != HubProtocol::Https {
+            let detail = identity
+                .endpoint_for(protocol)
+                .map(|endpoint| format!(" at {endpoint}"))
+                .unwrap_or_default();
+            return Err(ThalovantError::UnsupportedProtocol(format!(
+                "{protocol:?} is enabled{detail}, but this SDK runtime currently connects through the HTTPS HiveMind HTTP protocol transport"
+            )));
+        }
+        Ok(Self::new(identity))
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
