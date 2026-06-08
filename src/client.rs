@@ -10,7 +10,7 @@ use crate::{
     },
     identity::Identity,
     protocols::HubProtocol,
-    transport::{HttpTransport, TransportHealth},
+    transport::{RuntimeTransport, TransportHealth},
 };
 use serde_json::{Map, Value};
 use std::{path::Path, time::Duration};
@@ -19,7 +19,7 @@ use tokio::time::timeout;
 #[derive(Clone)]
 pub struct Client {
     pub identity: Identity,
-    pub transport: HttpTransport,
+    pub transport: RuntimeTransport,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,22 +68,19 @@ pub struct Conversation {
 impl Client {
     pub fn new(identity: Identity) -> Self {
         Self {
-            transport: HttpTransport::new(identity.clone()),
+            transport: RuntimeTransport::Http(crate::transport::HttpTransport::new(
+                identity.clone(),
+            )),
             identity,
         }
     }
 
     pub fn with_protocol(identity: Identity, protocol: HubProtocol) -> Result<Self> {
-        if protocol != HubProtocol::Https {
-            let detail = identity
-                .endpoint_for(protocol)
-                .map(|endpoint| format!(" at {endpoint}"))
-                .unwrap_or_default();
-            return Err(ThalovantError::UnsupportedProtocol(format!(
-                "{protocol:?} is enabled{detail}, but this SDK runtime currently connects through the HTTPS HiveMind HTTP protocol transport"
-            )));
-        }
-        Ok(Self::new(identity))
+        let transport = RuntimeTransport::for_protocol(identity.clone(), protocol)?;
+        Ok(Self {
+            identity,
+            transport,
+        })
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {

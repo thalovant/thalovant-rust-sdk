@@ -1,6 +1,6 @@
 [package]
 name = "thalovant"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 description = "Rust SDK for direct Thalovant hub data-plane clients and agents"
 readme = "README.md"
@@ -15,12 +15,17 @@ rust-version = "1.75"
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.22"
+futures-util = { version = "0.3", features = ["sink"] }
 hex = "0.4"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rumqttc = "0.25.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4", "fast-rng"] }

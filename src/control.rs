@@ -12,7 +12,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.3";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.4";
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -230,23 +230,18 @@ impl ControlPlane {
         result: &BootstrapIdentityResult,
         protocol: HubProtocol,
     ) -> Result<SelectedHubEndpoint> {
-        if protocol != HubProtocol::Https {
-            return Err(ThalovantError::UnsupportedProtocol(format!(
-                "{protocol:?} endpoint metadata is available, but this SDK runtime currently connects through the HTTPS HiveMind HTTP protocol transport"
-            )));
+        if protocol == HubProtocol::Mqtt && result.identity.mqtt.is_none() {
+            return Err(ThalovantError::UnsupportedProtocol(
+                "MQTT is enabled, but the API did not return client-scoped MQTT broker credentials"
+                    .to_string(),
+            ));
         }
-        let endpoint = result
-            .identity
-            .endpoint_for(HubProtocol::Https)
-            .ok_or_else(|| {
-                ThalovantError::UnsupportedProtocol(
-                    "this hub does not expose an HTTPS endpoint for the SDK runtime".to_string(),
-                )
-            })?;
-        Ok(SelectedHubEndpoint {
-            protocol: HubProtocol::Https,
-            endpoint,
-        })
+        let endpoint = result.identity.endpoint_for(protocol).ok_or_else(|| {
+            ThalovantError::UnsupportedProtocol(format!(
+                "this hub does not expose a {protocol:?} endpoint for the SDK runtime"
+            ))
+        })?;
+        Ok(SelectedHubEndpoint { protocol, endpoint })
     }
 
     async fn request(

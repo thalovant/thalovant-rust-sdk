@@ -12,6 +12,12 @@ pub struct MqttBrokerCredentials {
     pub username: String,
     pub password: String,
     pub topic_prefix: Option<String>,
+    pub hub_id: Option<String>,
+    pub c2s_topic: Option<String>,
+    pub s2c_topic: Option<String>,
+    pub status_topic: Option<String>,
+    pub hash_topics: bool,
+    pub qos: u8,
     pub tls: bool,
 }
 
@@ -30,12 +36,32 @@ impl MqttBrokerCredentials {
         let topic_prefix = optional_string(object, "topic_prefix", &["topicPrefix"])
             .ok()
             .flatten();
+        let hub_id = optional_string(object, "hub_id", &["hubId"]).ok().flatten();
+        let c2s_topic = optional_string(object, "c2s_topic", &["c2sTopic"])
+            .ok()
+            .flatten();
+        let s2c_topic = optional_string(object, "s2c_topic", &["s2cTopic"])
+            .ok()
+            .flatten();
+        let status_topic = optional_string(object, "status_topic", &["statusTopic"])
+            .ok()
+            .flatten();
+        let hash_topics = optional_bool(object, "hash_topics")
+            .or_else(|| optional_bool(object, "hashTopics"))
+            .unwrap_or(false);
+        let qos = optional_u8(object, "qos").unwrap_or(1).min(1);
         let tls = optional_bool(object, "tls").unwrap_or_else(|| endpoint.starts_with("mqtts://"));
         Some(Self {
             endpoint,
             username,
             password,
             topic_prefix,
+            hub_id,
+            c2s_topic,
+            s2c_topic,
+            status_topic,
+            hash_topics,
+            qos,
             tls,
         })
     }
@@ -50,6 +76,27 @@ impl MqttBrokerCredentials {
             data.insert("password".to_string(), Value::String(self.password.clone()));
             if let Some(topic_prefix) = self.topic_prefix.clone() {
                 data.insert("topic_prefix".to_string(), Value::String(topic_prefix));
+            }
+            if let Some(hub_id) = self.hub_id.clone() {
+                data.insert("hub_id".to_string(), Value::String(hub_id));
+            }
+            if let Some(topic) = self.c2s_topic.clone() {
+                data.insert("c2s_topic".to_string(), Value::String(topic));
+            }
+            if let Some(topic) = self.s2c_topic.clone() {
+                data.insert("s2c_topic".to_string(), Value::String(topic));
+            }
+            if let Some(topic) = self.status_topic.clone() {
+                data.insert("status_topic".to_string(), Value::String(topic));
+            }
+            if self.hash_topics {
+                data.insert("hash_topics".to_string(), Value::Bool(true));
+            }
+            if self.qos != 1 {
+                data.insert(
+                    "qos".to_string(),
+                    Value::Number(serde_json::Number::from(self.qos)),
+                );
             }
         }
         Value::Object(data)
@@ -143,6 +190,12 @@ impl Identity {
             ("MQTT_USERNAME", "mqtt_username"),
             ("MQTT_PASSWORD", "mqtt_password"),
             ("MQTT_TOPIC_PREFIX", "mqtt_topic_prefix"),
+            ("MQTT_HUB_ID", "mqtt_hub_id"),
+            ("MQTT_C2S_TOPIC", "mqtt_c2s_topic"),
+            ("MQTT_S2C_TOPIC", "mqtt_s2c_topic"),
+            ("MQTT_STATUS_TOPIC", "mqtt_status_topic"),
+            ("MQTT_HASH_TOPICS", "mqtt_hash_topics"),
+            ("MQTT_QOS", "mqtt_qos"),
             ("PUBLIC_KEY", "public_key"),
             ("NAME", "name"),
         ] {
@@ -179,6 +232,12 @@ impl Identity {
         let mqtt_username = object.remove("mqtt_username");
         let mqtt_password = object.remove("mqtt_password");
         let mqtt_topic_prefix = object.remove("mqtt_topic_prefix");
+        let mqtt_hub_id = object.remove("mqtt_hub_id");
+        let mqtt_c2s_topic = object.remove("mqtt_c2s_topic");
+        let mqtt_s2c_topic = object.remove("mqtt_s2c_topic");
+        let mqtt_status_topic = object.remove("mqtt_status_topic");
+        let mqtt_hash_topics = object.remove("mqtt_hash_topics");
+        let mqtt_qos = object.remove("mqtt_qos");
         let mut mqtt = Map::new();
         if let Some(value) = mqtt_endpoint {
             mqtt.insert("endpoint".to_string(), value);
@@ -191,6 +250,24 @@ impl Identity {
         }
         if let Some(value) = mqtt_topic_prefix {
             mqtt.insert("topic_prefix".to_string(), value);
+        }
+        if let Some(value) = mqtt_hub_id {
+            mqtt.insert("hub_id".to_string(), value);
+        }
+        if let Some(value) = mqtt_c2s_topic {
+            mqtt.insert("c2s_topic".to_string(), value);
+        }
+        if let Some(value) = mqtt_s2c_topic {
+            mqtt.insert("s2c_topic".to_string(), value);
+        }
+        if let Some(value) = mqtt_status_topic {
+            mqtt.insert("status_topic".to_string(), value);
+        }
+        if let Some(value) = mqtt_hash_topics {
+            mqtt.insert("hash_topics".to_string(), value);
+        }
+        if let Some(value) = mqtt_qos {
+            mqtt.insert("qos".to_string(), value);
         }
         if !mqtt.is_empty() {
             object.insert("mqtt".to_string(), Value::Object(mqtt));
@@ -274,6 +351,14 @@ fn optional_bool(object: &Map<String, Value>, key: &str) -> Option<bool> {
     }
 }
 
+fn optional_u8(object: &Map<String, Value>, key: &str) -> Option<u8> {
+    match object.get(key)? {
+        Value::Number(value) => value.as_u64().and_then(|value| u8::try_from(value).ok()),
+        Value::String(value) => value.trim().parse::<u8>().ok(),
+        _ => None,
+    }
+}
+
 fn normalize_path(path: Option<String>) -> String {
     let Some(path) = path else {
         return String::new();
@@ -293,6 +378,7 @@ mod tests {
         client::Client,
         control::BootstrapIdentityResult,
         protocols::{select_data_plane_endpoint, SelectedHubEndpoint},
+        transport::mqtt_topics_for_identity,
     };
     use serde_json::{json, Value};
 
@@ -438,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn client_rejects_unsupported_runtime_protocol() {
+    fn client_requires_mqtt_credentials_for_mqtt_runtime() {
         let identity = Identity::from_value(json!({
             "key": "access",
             "password": "secret",
@@ -448,6 +534,40 @@ mod tests {
         .unwrap();
 
         assert!(Client::with_protocol(identity, HubProtocol::Mqtt).is_err());
+    }
+
+    #[test]
+    fn client_selects_wss_and_mqtt_runtime_transports() {
+        let identity = Identity::from_value(json!({
+            "key": "access",
+            "password": "secret",
+            "crypto_key": "0123456789abcdef",
+            "site": "site",
+            "host": "https://hub.example.com",
+            "data_plane_endpoints": {
+                "https": "https://hub.example.com",
+                "wss": "wss://hub.example.com",
+                "mqtt": "mqtts://mqtt.example.com:8883"
+            },
+            "mqtt": {
+                "endpoint": "mqtts://mqtt.example.com:8883",
+                "username": "access",
+                "password": "broker-password",
+                "topic_prefix": "hivemind/hub/access"
+            }
+        }))
+        .unwrap();
+
+        assert!(Client::with_protocol(identity.clone(), HubProtocol::Wss).is_ok());
+        assert!(Client::with_protocol(identity.clone(), HubProtocol::Mqtt).is_ok());
+        assert_eq!(
+            mqtt_topics_for_identity(&identity).unwrap(),
+            crate::transport::MqttTopicSet {
+                c2s: "hivemind/hub/c2s/access".to_string(),
+                s2c: "hivemind/hub/s2c/access".to_string(),
+                status: "hivemind/hub/status/access".to_string(),
+            }
+        );
     }
 
     #[test]

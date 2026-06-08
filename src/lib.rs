@@ -30,4 +30,7 @@ pub use protocols::{
     HubProtocolSettings, SelectedHubEndpoint, DEFAULT_PROTOCOL_PREFERENCE,
 };
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
-pub use transport::{HttpTransport, TransportHealth};
+pub use transport::{
+    mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport, RuntimeTransport,
+    TransportHealth, WssTransport,
+};
