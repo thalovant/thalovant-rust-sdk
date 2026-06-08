@@ -12,7 +12,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.2";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.3";
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -191,18 +191,31 @@ impl ControlPlane {
         };
         let endpoint = select_data_plane_endpoint(&endpoints, &protocols, preferred);
         let default_master = default_master(&hub, &endpoints, endpoint.as_ref())?;
-        let identity = Identity {
-            access_key: api_key,
-            password,
-            crypto_key: Some(crypto_key),
-            site_id,
-            default_master,
-            default_port: 443,
-            default_path: String::new(),
-            public_key: None,
-            name: Some(opts.name),
-            data_plane_endpoints: endpoints,
-            protocols,
+        let identity = if let Some(initial_identify) =
+            client.get("initial_identify").and_then(Value::as_object)
+        {
+            let mut identity = initial_identify.clone();
+            identity.insert(
+                "data_plane_endpoints".to_string(),
+                Value::Object(endpoints.as_map(false)),
+            );
+            identity.insert("protocols".to_string(), protocols.as_spec_value());
+            Identity::from_value(Value::Object(identity))?
+        } else {
+            Identity {
+                access_key: api_key,
+                password,
+                crypto_key: Some(crypto_key),
+                site_id,
+                default_master,
+                default_port: 443,
+                default_path: String::new(),
+                public_key: None,
+                name: Some(opts.name),
+                data_plane_endpoints: endpoints,
+                protocols,
+                mqtt: None,
+            }
         };
         Ok(BootstrapIdentityResult {
             identity,
@@ -332,6 +345,9 @@ impl BootstrapIdentityResult {
             if let Some(crypto_key) = self.identity.crypto_key.clone() {
                 identity.insert("crypto_key".to_string(), Value::String(crypto_key));
             }
+        }
+        if let Some(mqtt) = self.identity.mqtt.as_ref() {
+            identity.insert("mqtt".to_string(), mqtt.as_value(include_secrets));
         }
         json!({
             "identity": identity,

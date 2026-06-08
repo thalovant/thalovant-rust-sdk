@@ -50,6 +50,12 @@ hubs.
     "wss": {"enabled": true},
     "http": {"enabled": true},
     "mqtt": {"enabled": false}
+  },
+  "mqtt": {
+    "endpoint": "mqtts://mqtt.example.com:8883",
+    "username": "client-access-key",
+    "password": "mqtt-broker-password",
+    "topic_prefix": "hivemind/hub-id/client-access-key"
   }
 }
 ```
@@ -63,6 +69,7 @@ println!("{:?}", identity.enabled_protocols());
 println!("{:?}", identity.endpoint_for(HubProtocol::Https));
 println!("{:?}", identity.endpoint_for(HubProtocol::Wss));
 println!("{:?}", identity.endpoint_for(HubProtocol::Mqtt));
+println!("{:?}", identity.mqtt.as_ref().map(|mqtt| &mqtt.endpoint));
 ```
 
 You can also create a hub client through the Thalovant API:
@@ -85,8 +92,8 @@ let client = Client::new(result.identity);
 
 The SDK generates `apiKey`, `password`, and `cryptoKey` locally and sends them
 to the API once. The API can store them in Vault and return only secret
-references; `result.identity` is the usable local client identity. Do not log
-`result.as_value(true)`.
+references. When MQTT is enabled, `result.identity.mqtt` contains the broker
+credentials returned by the API. Do not log `result.as_value(true)`.
 
 ## Generic Client Context
 
