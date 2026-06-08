@@ -37,7 +37,7 @@ pub fn decode_hive_binary_frame(payload: &[u8]) -> Result<HiveMessage> {
     }
     let type_id = reader.read_uint(5)? as u8;
     let compressed = reader.read_bit()? == 1;
-    let metadata_len = reader.read_uint(8)? as usize;
+    let metadata_len = reader.read_uint(8)?;
     let metadata = parse_map(&decode_wire_text(
         &reader.read_bytes(metadata_len)?,
         compressed,
