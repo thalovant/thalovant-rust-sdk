@@ -13,7 +13,7 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.5";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.6";
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -108,6 +108,25 @@ impl ControlPlane {
         .await
     }
 
+    pub async fn list_public_hubs(
+        &self,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<Value> {
+        let mut params = vec![format!("limit={}", limit.unwrap_or(24))];
+        if let Some(cursor) = cursor {
+            params.push(format!("cursor={}", urlencoding::encode(cursor)));
+        }
+        self.request(
+            "GET",
+            &format!("/v1/public/hubs?{}", params.join("&")),
+            None,
+            None,
+            false,
+        )
+        .await
+    }
+
     pub async fn get_hub(&self, hub_id: &str) -> Result<Value> {
         self.request(
             "GET",
@@ -115,6 +134,17 @@ impl ControlPlane {
             None,
             None,
             true,
+        )
+        .await
+    }
+
+    pub async fn get_public_hub(&self, hub_ref: &str) -> Result<Value> {
+        self.request(
+            "GET",
+            &format!("/v1/public/hubs/{}", urlencoding::encode(hub_ref)),
+            None,
+            None,
+            false,
         )
         .await
     }
@@ -422,5 +452,61 @@ fn json_string(value: &Value) -> Option<String> {
         }
         Value::Null => None,
         other => Some(other.to_string().trim_matches('"').to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
+
+    #[tokio::test]
+    async fn public_hub_discovery_does_not_send_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0_u8; 4096];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(
+                    !request.to_ascii_lowercase().contains("\r\nauthorization:"),
+                    "public hub requests must not send Authorization"
+                );
+                let body = if request.starts_with("GET /v1/public/hubs?limit=12 ") {
+                    r#"{"data":[{"id":"hub-public","name":"joke-garden","slug":"joke-garden","title":"Joke Garden"}],"meta":{"count":1,"next":null},"links":{"next":null}}"#
+                } else if request.starts_with("GET /v1/public/hubs/joke-garden ") {
+                    r#"{"id":"hub-public","name":"joke-garden","slug":"joke-garden","title":"Joke Garden"}"#
+                } else {
+                    panic!("unexpected request: {request}");
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write response");
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let page = control
+            .list_public_hubs(Some(12), None)
+            .await
+            .expect("list public hubs");
+        let hub = control
+            .get_public_hub("joke-garden")
+            .await
+            .expect("get public hub");
+
+        assert_eq!(page["data"][0]["slug"].as_str(), Some("joke-garden"));
+        assert_eq!(hub["title"].as_str(), Some("Joke Garden"));
+        server.join().expect("test server finished");
     }
 }

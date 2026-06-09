@@ -79,6 +79,17 @@ use thalovant::{BootstrapIdentityOptions, Client, ControlPlane};
 let mut control = ControlPlane::new("https://dash.thalovant.com/api", None);
 control.login("you@example.com", "password", None).await?;
 
+let public_hubs = control.list_public_hubs(Some(12), None).await?;
+if let Some(items) = public_hubs.get("data").and_then(|value| value.as_array()) {
+    for hub in items {
+        println!(
+            "{} {}",
+            hub.get("slug").and_then(|value| value.as_str()).unwrap_or(""),
+            hub.get("title").and_then(|value| value.as_str()).unwrap_or("")
+        );
+    }
+}
+
 let result = control
     .create_client_identity_for_hub_id("hub-id", BootstrapIdentityOptions {
         name: "kiosk-1".into(),
