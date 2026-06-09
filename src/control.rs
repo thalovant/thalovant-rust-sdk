@@ -13,7 +13,8 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYP
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.6";
+pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.7";
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -46,11 +47,15 @@ impl ControlPlane {
     pub fn new(api_url: impl Into<String>, access_token: Option<String>) -> Self {
         ensure_rustls_provider();
         Self {
-            api_url: format!("{}/", api_url.into().trim_end_matches('/')),
+            api_url: normalize_control_api_url(api_url.into()),
             access_token,
             user_agent: DEFAULT_CONTROL_USER_AGENT.to_string(),
             http_client: reqwest::Client::new(),
         }
+    }
+
+    pub fn with_access_token(access_token: impl Into<String>) -> Self {
+        Self::new(DEFAULT_CONTROL_API_URL, Some(access_token.into()))
     }
 
     pub async fn login(
@@ -333,6 +338,12 @@ impl ControlPlane {
     }
 }
 
+impl Default for ControlPlane {
+    fn default() -> Self {
+        Self::new(DEFAULT_CONTROL_API_URL, None)
+    }
+}
+
 impl BootstrapIdentityResult {
     pub fn selected_protocol(&self) -> Option<HubProtocol> {
         self.endpoint.as_ref().map(|endpoint| endpoint.protocol)
@@ -444,6 +455,17 @@ fn strip_endpoint_path(endpoint: &str) -> String {
     url.as_str().trim_end_matches('/').to_string()
 }
 
+fn normalize_control_api_url(api_url: String) -> String {
+    let mut normalized = api_url.trim().trim_end_matches('/').to_string();
+    if normalized.is_empty() {
+        normalized = DEFAULT_CONTROL_API_URL.to_string();
+    }
+    if normalized.ends_with("/v1") {
+        normalized.truncate(normalized.len() - 3);
+    }
+    format!("{}/", normalized.trim_end_matches('/'))
+}
+
 fn json_string(value: &Value) -> Option<String> {
     match value {
         Value::String(raw) => {
@@ -463,6 +485,26 @@ mod tests {
         net::TcpListener,
         thread,
     };
+
+    #[test]
+    fn default_api_url_and_v1_normalization() {
+        assert_eq!(
+            ControlPlane::default().api_url,
+            "https://api.thalovant.com/"
+        );
+        assert_eq!(
+            ControlPlane::new("", None).api_url,
+            "https://api.thalovant.com/"
+        );
+        assert_eq!(
+            ControlPlane::new("https://api.thalovant.com/v1", None).api_url,
+            "https://api.thalovant.com/"
+        );
+        assert_eq!(
+            ControlPlane::new("https://dash.example.com/api/v1", None).api_url,
+            "https://dash.example.com/api/"
+        );
+    }
 
     #[tokio::test]
     async fn public_hub_discovery_does_not_send_auth() {

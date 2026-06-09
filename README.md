@@ -29,7 +29,7 @@ use thalovant::{
 
 #[tokio::main]
 async fn main() -> thalovant::Result<()> {
-    let mut control = ControlPlane::new("https://dash.thalovant.com/api", None);
+    let mut control = ControlPlane::default();
 
     // Public hub discovery does not require auth.
     let public_hubs = control.list_public_hubs(Some(12), None).await?;
@@ -69,6 +69,9 @@ async fn main() -> thalovant::Result<()> {
 }
 ```
 
+`ControlPlane::default()` uses `https://api.thalovant.com`. Use
+`ControlPlane::new(...)` only for local development or a self-hosted control plane.
+
 Keep `result.identity` secret. It contains the client credentials used by the
 hub. Do not log `result.as_value(true)`.
 
@@ -77,7 +80,7 @@ hub. Do not log `result.as_value(true)`.
 Authenticated accounts can list owned or visible hubs:
 
 ```rust
-let mut control = ControlPlane::new("https://dash.thalovant.com/api", None);
+let mut control = ControlPlane::default();
 control.login("you@example.com", "password", None).await?;
 
 let page = control.list_hubs(Some(50), None, None).await?;
@@ -272,7 +275,8 @@ for item in items {
 
 ## API Shape
 
-- `ControlPlane::new(api_url, access_token)`
+- `ControlPlane::default()`
+- `ControlPlane::new(api_url, access_token)` for local or self-hosted control planes
 - `control.login(email, password, scope)`
 - `control.list_public_hubs(limit, cursor)`
 - `control.get_public_hub(hub_ref)`
