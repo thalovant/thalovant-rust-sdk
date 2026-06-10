@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.10";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.11";
 
 #[derive(Clone)]
 pub struct ControlPlane {

@@ -9,7 +9,7 @@ use crate::{
         new_session_id, utterance_payload, Context, Data, Reply,
     },
     identity::Identity,
-    protocols::HubProtocol,
+    protocols::{HubProtocol, DEFAULT_PROTOCOL_PREFERENCE},
     transport::{RuntimeTransport, TransportHealth},
 };
 use serde_json::{Map, Value};
@@ -83,12 +83,24 @@ impl Client {
         })
     }
 
+    pub fn auto(identity: Identity) -> Result<Self> {
+        Self::with_protocol(identity.clone(), default_runtime_protocol(&identity)?)
+    }
+
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        Ok(Self::new(Identity::from_file(path)?))
+        Self::auto(Identity::from_file(path)?)
+    }
+
+    pub fn from_config(profile: Option<&str>) -> Result<Self> {
+        Self::auto(Identity::from_config(profile)?)
+    }
+
+    pub fn from_config_file(path: impl AsRef<Path>, profile: Option<&str>) -> Result<Self> {
+        Self::auto(Identity::from_config_file(path, profile)?)
     }
 
     pub fn from_env() -> Result<Self> {
-        Ok(Self::new(Identity::from_env()?))
+        Self::auto(Identity::from_env()?)
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -307,6 +319,35 @@ impl Client {
             context: opts.context.unwrap_or_default(),
         }
     }
+}
+
+fn default_runtime_protocol(identity: &Identity) -> Result<HubProtocol> {
+    for protocol in DEFAULT_PROTOCOL_PREFERENCE {
+        match protocol {
+            HubProtocol::Wss => {
+                if identity.supports_protocol(HubProtocol::Wss)
+                    && identity.endpoint_for(HubProtocol::Wss).is_some()
+                {
+                    return Ok(HubProtocol::Wss);
+                }
+            }
+            HubProtocol::Https => {
+                if identity.supports_protocol(HubProtocol::Https)
+                    || identity.endpoint_for(HubProtocol::Https).is_some()
+                {
+                    return Ok(HubProtocol::Https);
+                }
+            }
+            HubProtocol::Mqtt => {
+                if identity.supports_protocol(HubProtocol::Mqtt) && identity.mqtt.is_some() {
+                    return Ok(HubProtocol::Mqtt);
+                }
+            }
+        }
+    }
+    Err(ThalovantError::UnsupportedProtocol(
+        "identity does not include a usable WSS, HTTPS, or MQTT endpoint".to_string(),
+    ))
 }
 
 impl Conversation {

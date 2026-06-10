@@ -4,7 +4,40 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
-use std::{env, fs, path::Path};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
+
+pub const DEFAULT_CONFIG_FILENAME: &str = "config.yaml";
+
+pub fn default_config_path() -> Result<PathBuf> {
+    if let Ok(config_home) = env::var("XDG_CONFIG_HOME") {
+        if !config_home.trim().is_empty() {
+            return Ok(PathBuf::from(config_home)
+                .join("thalovant")
+                .join(DEFAULT_CONFIG_FILENAME));
+        }
+    }
+    if cfg!(windows) {
+        if let Ok(appdata) = env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return Ok(PathBuf::from(appdata)
+                    .join("Thalovant")
+                    .join(DEFAULT_CONFIG_FILENAME));
+            }
+        }
+    }
+    let home = env::var("HOME").map_err(|_| {
+        ThalovantError::InvalidIdentity("unable to resolve home directory".to_string())
+    })?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("thalovant")
+        .join(DEFAULT_CONFIG_FILENAME))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MqttBrokerCredentials {
@@ -124,6 +157,29 @@ impl Identity {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let raw = fs::read_to_string(path)?;
         Self::from_json(&raw)
+    }
+
+    pub fn from_config(profile: Option<&str>) -> Result<Self> {
+        Self::from_config_file(default_config_path()?, profile)
+    }
+
+    pub fn from_config_file(path: impl AsRef<Path>, profile: Option<&str>) -> Result<Self> {
+        let path = path.as_ref();
+        assert_secure_config_file(path)?;
+        let raw = fs::read_to_string(path)?;
+        let value: Value = serde_yaml::from_str(&raw).map_err(|err| {
+            ThalovantError::InvalidIdentity(format!(
+                "Thalovant config file is not valid YAML: {err}"
+            ))
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            ThalovantError::InvalidIdentity(
+                "Thalovant config file must contain a YAML object".to_string(),
+            )
+        })?;
+        Self::from_value(Value::Object(
+            identity_config_object(object, profile)?.clone(),
+        ))
     }
 
     pub fn from_json(raw: &str) -> Result<Self> {
@@ -315,6 +371,54 @@ fn required_string(
     optional_string(object, key, aliases)?.ok_or(ThalovantError::MissingIdentityField(key))
 }
 
+fn identity_config_object<'a>(
+    object: &'a Map<String, Value>,
+    profile: Option<&str>,
+) -> Result<&'a Map<String, Value>> {
+    if let Some(profiles) = object.get("profiles").and_then(Value::as_object) {
+        let profile_name = profile
+            .map(str::to_string)
+            .or(optional_string(
+                object,
+                "profile",
+                &["default_profile", "defaultProfile"],
+            )?)
+            .unwrap_or_else(|| "default".to_string());
+        let selected = profiles
+            .get(&profile_name)
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ThalovantError::InvalidIdentity(format!(
+                    "missing Thalovant config profile: {profile_name}"
+                ))
+            })?;
+        return profile_identity_object(selected);
+    }
+    profile_identity_object(object)
+}
+
+fn profile_identity_object(object: &Map<String, Value>) -> Result<&Map<String, Value>> {
+    if let Some(identity) = object.get("identity").and_then(Value::as_object) {
+        return Ok(identity);
+    }
+    Ok(object)
+}
+
+fn assert_secure_config_file(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ThalovantError::InvalidIdentity(format!(
+                "Thalovant config file is too permissive: {}. Run `chmod 600 {}`.",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn optional_string(
     object: &Map<String, Value>,
     key: &str,
@@ -384,9 +488,19 @@ mod tests {
         client::Client,
         control::BootstrapIdentityResult,
         protocols::{select_data_plane_endpoint, SelectedHubEndpoint},
-        transport::mqtt_topics_for_identity,
+        transport::{mqtt_topics_for_identity, RuntimeTransport},
     };
     use serde_json::{json, Value};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    fn temp_config_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "thalovant-{name}-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
 
     #[test]
     fn normalizes_identity_aliases() {
@@ -489,6 +603,62 @@ mod tests {
     }
 
     #[test]
+    fn identity_loads_yaml_config_profile() {
+        let path = temp_config_path("config");
+        fs::write(
+            &path,
+            r#"
+version: 1
+profile: prod
+profiles:
+  prod:
+    identity:
+      access_key: access
+      password: secret
+      site_id: site
+      default_master: https://hub.example.com
+      default_port: 443
+      mqtt:
+        endpoint: mqtts://mqtt.example.com:8883
+        username: access
+        password: broker-password
+        topic_prefix: hivemind/hub/access
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+
+        let identity = Identity::from_config_file(&path, None).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(identity.access_key, "access");
+        assert_eq!(
+            identity.mqtt.as_ref().map(|mqtt| mqtt.password.as_str()),
+            Some("broker-password")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_rejects_permissive_config_file() {
+        let path = temp_config_path("insecure");
+        fs::write(&path, "identity: {}\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        let error = Identity::from_config_file(&path, None).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.to_string().contains("too permissive"));
+    }
+
+    #[test]
     fn data_plane_endpoints_can_be_derived_from_hub_resource() {
         let endpoints = HubDataPlaneEndpoints::from_hub(&json!({
             "domain": "jokes.thalovant.io",
@@ -568,6 +738,8 @@ mod tests {
 
         assert!(Client::with_protocol(identity.clone(), HubProtocol::Wss).is_ok());
         assert!(Client::with_protocol(identity.clone(), HubProtocol::Mqtt).is_ok());
+        let auto_client = Client::auto(identity.clone()).unwrap();
+        assert!(matches!(auto_client.transport, RuntimeTransport::Wss(_)));
         assert_eq!(
             mqtt_topics_for_identity(&identity).unwrap(),
             crate::transport::MqttTopicSet {
@@ -576,6 +748,20 @@ mod tests {
                 status: "hivemind/hub/status/access".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn client_falls_back_to_https_when_wss_endpoint_is_missing() {
+        let identity = Identity::from_value(json!({
+            "key": "access",
+            "password": "secret",
+            "site": "site",
+            "host": "https://hub.example.com"
+        }))
+        .unwrap();
+
+        let auto_client = Client::auto(identity).unwrap();
+        assert!(matches!(auto_client.transport, RuntimeTransport::Http(_)));
     }
 
     #[test]

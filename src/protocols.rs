@@ -10,7 +10,7 @@ pub enum HubProtocol {
 }
 
 pub const DEFAULT_PROTOCOL_PREFERENCE: &[HubProtocol] =
-    &[HubProtocol::Https, HubProtocol::Wss, HubProtocol::Mqtt];
+    &[HubProtocol::Wss, HubProtocol::Https, HubProtocol::Mqtt];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectedHubEndpoint {

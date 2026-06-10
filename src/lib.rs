@@ -30,7 +30,7 @@ pub use events::{
     context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
     utterance_payload, Context, Data, Event, Reply,
 };
-pub use identity::{Identity, MqttBrokerCredentials};
+pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use protocols::{
     endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,
     HubProtocolSettings, SelectedHubEndpoint, DEFAULT_PROTOCOL_PREFERENCE,
