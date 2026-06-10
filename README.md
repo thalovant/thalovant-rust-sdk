@@ -160,7 +160,8 @@ for protocol in [HubProtocol::Wss, HubProtocol::Https, HubProtocol::Mqtt] {
 
 MQTT identities include a broker endpoint, username, password, TLS flag, and
 topic prefix. The broker credentials are scoped to that client and should be
-treated like a password.
+treated like a password. Public identities should use `mqtts://`; the SDK also
+honors an explicit `tls: true` flag from the identity.
 
 ## Conversations
 

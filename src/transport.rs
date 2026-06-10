@@ -5,7 +5,7 @@ use crate::{
     },
     errors::{Result, ThalovantError},
     events::{event_from_bus_payload, Data, Event},
-    identity::Identity,
+    identity::{Identity, MqttBrokerCredentials},
     protocols::HubProtocol,
     tls::ensure_rustls_provider,
     wire::{decode_hive_binary_frame, encode_hive_binary_frame},
@@ -1178,19 +1178,29 @@ fn mqtt_options_for_identity(identity: &Identity) -> Result<MqttOptions> {
     let host = parsed.host_str().ok_or_else(|| {
         ThalovantError::Connection("MQTT endpoint must include a host".to_string())
     })?;
-    let port = parsed.port().unwrap_or(match parsed.scheme() {
-        "mqtts" | "ssl" => 8883,
-        _ => 1883,
-    });
+    let tls_enabled = mqtt_tls_enabled(credentials, parsed.scheme());
+    let port = parsed.port().unwrap_or(mqtt_default_port(tls_enabled));
     let mut options = MqttOptions::new(
         format!("thalovant-{}", safe_mqtt_client_id(&identity.access_key)),
         host,
         port,
     );
-    if parsed.scheme() == "mqtts" || parsed.scheme() == "ssl" {
+    if tls_enabled {
         options.set_transport(Transport::tls_with_default_config());
     }
     Ok(options)
+}
+
+fn mqtt_tls_enabled(credentials: &MqttBrokerCredentials, scheme: &str) -> bool {
+    credentials.tls || matches!(scheme, "mqtts" | "ssl")
+}
+
+fn mqtt_default_port(tls_enabled: bool) -> u16 {
+    if tls_enabled {
+        8883
+    } else {
+        1883
+    }
 }
 
 fn qos(value: u8) -> QoS {
@@ -1217,5 +1227,35 @@ fn safe_mqtt_client_id(value: &str) -> String {
         uuid::Uuid::new_v4().simple().to_string()
     } else {
         id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mqtt_credentials(endpoint: &str, tls: bool) -> MqttBrokerCredentials {
+        MqttBrokerCredentials {
+            endpoint: endpoint.to_string(),
+            username: "access".to_string(),
+            password: "broker-password".to_string(),
+            topic_prefix: Some("hivemind/hub".to_string()),
+            hub_id: None,
+            c2s_topic: None,
+            s2c_topic: None,
+            status_topic: None,
+            hash_topics: false,
+            qos: 1,
+            tls,
+        }
+    }
+
+    #[test]
+    fn mqtt_tls_flag_controls_default_port() {
+        let credentials = mqtt_credentials("mqtt://mqtt.example.com", true);
+
+        assert!(mqtt_tls_enabled(&credentials, "mqtt"));
+        assert_eq!(mqtt_default_port(true), 8883);
+        assert_eq!(mqtt_default_port(false), 1883);
     }
 }
