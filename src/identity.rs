@@ -155,6 +155,8 @@ pub struct Identity {
 
 impl Identity {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        assert_secure_identity_file(path)?;
         let raw = fs::read_to_string(path)?;
         Self::from_json(&raw)
     }
@@ -405,18 +407,35 @@ fn profile_identity_object(object: &Map<String, Value>) -> Result<&Map<String, V
 }
 
 fn assert_secure_config_file(path: &Path) -> Result<()> {
+    assert_secure_secret_file(path, "Thalovant config file")
+}
+
+fn assert_secure_identity_file(path: &Path) -> Result<()> {
+    assert_secure_secret_file(path, "identity file")
+}
+
+fn assert_secure_secret_file(path: &Path, description: &str) -> Result<()> {
     let metadata = fs::metadata(path)?;
     #[cfg(unix)]
     {
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(ThalovantError::InvalidIdentity(format!(
-                "Thalovant config file is too permissive: {}. Run `chmod 600 {}`.",
+                "{} is too permissive: {}. Run `chmod 600 {}`.",
+                capitalize(description),
                 path.display(),
                 path.display()
             )));
         }
     }
     Ok(())
+}
+
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn optional_string(
@@ -498,6 +517,13 @@ mod tests {
     fn temp_config_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "thalovant-{name}-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    fn temp_identity_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "thalovant-{name}-{}.json",
             uuid::Uuid::new_v4().simple()
         ))
     }
@@ -600,6 +626,53 @@ mod tests {
                 "topic_prefix": "hivemind/hub/access"
             })
         );
+    }
+
+    #[test]
+    fn identity_loads_private_json_file() {
+        let path = temp_identity_path("identity");
+        fs::write(
+            &path,
+            r#"{
+                "access_key": "access",
+                "password": "secret",
+                "site_id": "site",
+                "default_master": "https://hub.example.com",
+                "default_port": 443
+            }"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o600);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+
+        let identity = Identity::from_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(identity.access_key, "access");
+        assert_eq!(identity.default_master, "https://hub.example.com");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_rejects_permissive_json_file() {
+        let path = temp_identity_path("insecure");
+        fs::write(
+            &path,
+            r#"{"access_key":"access","password":"secret","site_id":"site","default_master":"https://hub.example.com"}"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o644);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        let error = Identity::from_file(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+
+        assert!(error.to_string().contains("too permissive"));
     }
 
     #[test]
