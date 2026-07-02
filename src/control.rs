@@ -14,7 +14,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.11";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.12";
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -33,6 +33,37 @@ pub struct BootstrapIdentityOptions {
     pub active: Option<bool>,
     pub preferred_protocols: Vec<HubProtocol>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AnalyticsOverviewOptions {
+    pub admin: bool,
+    pub range: Option<String>,
+    pub bucket: Option<String>,
+    pub owner_id: Option<String>,
+    pub hub_id: Option<String>,
+    pub client_id: Option<String>,
+    pub country: Option<String>,
+    pub message: Option<String>,
+    pub utterance: Option<String>,
+    pub intent: Option<String>,
+    pub time_start: Option<String>,
+    pub time_end: Option<String>,
+    pub weekday: Option<u8>,
+    pub hour: Option<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MemoryListOptions {
+    pub scope: Option<String>,
+    pub kind: Option<String>,
+    pub owner_id: Option<String>,
+    pub hub_id: Option<String>,
+    pub query: Option<String>,
+    pub include_deleted: bool,
+    pub include_expired: bool,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +161,118 @@ impl ControlPlane {
             false,
         )
         .await
+    }
+
+    pub async fn list_memory_items(&self, opts: MemoryListOptions) -> Result<Value> {
+        let mut params = Vec::new();
+        push_query_param(&mut params, "scope", opts.scope.as_deref());
+        push_query_param(&mut params, "kind", opts.kind.as_deref());
+        push_query_param(&mut params, "owner_id", opts.owner_id.as_deref());
+        push_query_param(&mut params, "hub_id", opts.hub_id.as_deref());
+        push_query_param(&mut params, "q", opts.query.as_deref());
+        if opts.include_deleted {
+            params.push("include_deleted=true".to_string());
+        }
+        if opts.include_expired {
+            params.push("include_expired=true".to_string());
+        }
+        if let Some(limit) = opts.limit {
+            params.push(format!("limit={limit}"));
+        }
+        if let Some(offset) = opts.offset {
+            params.push(format!("offset={offset}"));
+        }
+        let path = if params.is_empty() {
+            "/v1/memory".to_string()
+        } else {
+            format!("/v1/memory?{}", params.join("&"))
+        };
+        self.request("GET", &path, None, None, true).await
+    }
+
+    pub async fn get_memory_summary(&self, owner_id: Option<&str>) -> Result<Value> {
+        let mut params = Vec::new();
+        push_query_param(&mut params, "owner_id", owner_id);
+        let path = if params.is_empty() {
+            "/v1/memory/summary".to_string()
+        } else {
+            format!("/v1/memory/summary?{}", params.join("&"))
+        };
+        self.request("GET", &path, None, None, true).await
+    }
+
+    pub async fn create_memory_item(&self, payload: Value) -> Result<Value> {
+        self.request("POST", "/v1/memory", Some(payload), None, true)
+            .await
+    }
+
+    pub async fn get_memory_item(&self, memory_id: &str) -> Result<Value> {
+        self.request(
+            "GET",
+            &format!("/v1/memory/{}", urlencoding::encode(memory_id)),
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    pub async fn update_memory_item(&self, memory_id: &str, payload: Value) -> Result<Value> {
+        self.request(
+            "PATCH",
+            &format!("/v1/memory/{}", urlencoding::encode(memory_id)),
+            Some(payload),
+            None,
+            true,
+        )
+        .await
+    }
+
+    pub async fn delete_memory_item(&self, memory_id: &str) -> Result<()> {
+        let _ = self
+            .request(
+                "DELETE",
+                &format!("/v1/memory/{}", urlencoding::encode(memory_id)),
+                None,
+                None,
+                true,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_analytics_overview(&self, opts: AnalyticsOverviewOptions) -> Result<Value> {
+        let endpoint = if opts.admin {
+            "/v1/admin/analytics/overview"
+        } else {
+            "/v1/analytics/overview"
+        };
+        let mut params = Vec::new();
+        push_query_param(&mut params, "range", opts.range.as_deref());
+        push_query_param(&mut params, "bucket", opts.bucket.as_deref());
+        if opts.admin {
+            push_query_param(&mut params, "owner_id", opts.owner_id.as_deref());
+        }
+        push_query_param(&mut params, "hub_id", opts.hub_id.as_deref());
+        push_query_param(&mut params, "client_id", opts.client_id.as_deref());
+        push_query_param(&mut params, "country", opts.country.as_deref());
+        push_query_param(&mut params, "message", opts.message.as_deref());
+        push_query_param(&mut params, "utterance", opts.utterance.as_deref());
+        push_query_param(&mut params, "intent", opts.intent.as_deref());
+        push_query_param(&mut params, "time_start", opts.time_start.as_deref());
+        push_query_param(&mut params, "time_end", opts.time_end.as_deref());
+        if let Some(weekday) = opts.weekday {
+            params.push(format!("weekday={weekday}"));
+        }
+        if let Some(hour) = opts.hour {
+            params.push(format!("hour={hour}"));
+        }
+        let path = if params.is_empty() {
+            endpoint.to_string()
+        } else {
+            format!("{}?{}", endpoint, params.join("&"))
+        };
+        self.request("GET", &path, None, None, true).await
     }
 
     pub async fn get_hub(&self, hub_id: &str) -> Result<Value> {
@@ -334,7 +477,14 @@ impl ControlPlane {
             let body = response.text().await.unwrap_or_default();
             return Err(ThalovantError::Api(format!("HTTP {status}: {body}")));
         }
-        response.json::<Value>().await.map_err(ThalovantError::from)
+        let body = response
+            .text()
+            .await
+            .map_err(|err| ThalovantError::Api(err.to_string()))?;
+        if body.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str::<Value>(&body).map_err(ThalovantError::from)
     }
 }
 
@@ -466,6 +616,12 @@ fn normalize_control_api_url(api_url: String) -> String {
     format!("{}/", normalized.trim_end_matches('/'))
 }
 
+fn push_query_param(params: &mut Vec<String>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        params.push(format!("{}={}", key, urlencoding::encode(value)));
+    }
+}
+
 fn json_string(value: &Value) -> Option<String> {
     match value {
         Value::String(raw) => {
@@ -549,6 +705,208 @@ mod tests {
 
         assert_eq!(page["data"][0]["slug"].as_str(), Some("joke-garden"));
         assert_eq!(hub["title"].as_str(), Some("Joke Garden"));
+        server.join().expect("test server finished");
+    }
+
+    #[tokio::test]
+    async fn memory_crud_sends_filters_payloads_and_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0_u8; 8192];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("\r\nauthorization: bearer token\r\n"),
+                    "memory requests must send Authorization: {request}"
+                );
+                let (status, body) = if request.starts_with("GET /v1/memory?") {
+                    for fragment in [
+                        "scope=workspace",
+                        "kind=preference",
+                        "owner_id=owner-1",
+                        "hub_id=hub-1",
+                        "q=timezone",
+                        "include_deleted=true",
+                        "include_expired=true",
+                        "limit=25",
+                        "offset=50",
+                    ] {
+                        assert!(request.contains(fragment), "missing {fragment}: {request}");
+                    }
+                    (
+                        "200 OK",
+                        r#"{"data":[{"id":"memory-1","content":"Use UTC."}],"meta":{"count":1,"next":null},"links":{"next":null}}"#,
+                    )
+                } else if request.starts_with("GET /v1/memory/summary?owner_id=owner-1 ") {
+                    (
+                        "200 OK",
+                        r#"{"total":1,"by_scope":{"workspace":1},"by_kind":{"preference":1},"expired":0,"deleted":0}"#,
+                    )
+                } else if request.starts_with("POST /v1/memory ") {
+                    assert!(
+                        request.contains(r#""content":"Use UTC.""#),
+                        "missing create body: {request}"
+                    );
+                    (
+                        "201 Created",
+                        r#"{"id":"memory-1","scope":"workspace","kind":"preference","content":"Use UTC."}"#,
+                    )
+                } else if request.starts_with("GET /v1/memory/memory-1 ") {
+                    (
+                        "200 OK",
+                        r#"{"id":"memory-1","scope":"workspace","kind":"preference","content":"Use UTC."}"#,
+                    )
+                } else if request.starts_with("PATCH /v1/memory/memory-1 ") {
+                    assert!(
+                        request.contains(r#""content":"Use America/Toronto.""#),
+                        "missing update body: {request}"
+                    );
+                    (
+                        "200 OK",
+                        r#"{"id":"memory-1","scope":"workspace","kind":"preference","content":"Use America/Toronto."}"#,
+                    )
+                } else if request.starts_with("DELETE /v1/memory/memory-1 ") {
+                    ("204 No Content", "")
+                } else {
+                    panic!("unexpected request: {request}");
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write response");
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let page = control
+            .list_memory_items(MemoryListOptions {
+                scope: Some("workspace".to_string()),
+                kind: Some("preference".to_string()),
+                owner_id: Some("owner-1".to_string()),
+                hub_id: Some("hub-1".to_string()),
+                query: Some("timezone".to_string()),
+                include_deleted: true,
+                include_expired: true,
+                limit: Some(25),
+                offset: Some(50),
+            })
+            .await
+            .expect("list memory");
+        let summary = control
+            .get_memory_summary(Some("owner-1"))
+            .await
+            .expect("memory summary");
+        let created = control
+            .create_memory_item(json!({
+                "scope": "workspace",
+                "kind": "preference",
+                "content": "Use UTC.",
+            }))
+            .await
+            .expect("create memory");
+        let item = control
+            .get_memory_item("memory-1")
+            .await
+            .expect("get memory");
+        let updated = control
+            .update_memory_item(
+                "memory-1",
+                json!({
+                    "content": "Use America/Toronto.",
+                    "clear_expires_at": true,
+                }),
+            )
+            .await
+            .expect("update memory");
+        control
+            .delete_memory_item("memory-1")
+            .await
+            .expect("delete memory");
+
+        assert_eq!(page["data"][0]["id"].as_str(), Some("memory-1"));
+        assert_eq!(summary["total"].as_i64(), Some(1));
+        assert_eq!(created["id"].as_str(), Some("memory-1"));
+        assert_eq!(item["content"].as_str(), Some("Use UTC."));
+        assert_eq!(updated["content"].as_str(), Some("Use America/Toronto."));
+        server.join().expect("test server finished");
+    }
+
+    #[tokio::test]
+    async fn analytics_overview_sends_filters() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let size = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(
+                request.starts_with("GET /v1/admin/analytics/overview?"),
+                "unexpected request: {request}"
+            );
+            assert!(
+                request.contains("\r\nauthorization: Bearer token\r\n")
+                    || request.contains("\r\nAuthorization: Bearer token\r\n"),
+                "analytics requests must send Authorization"
+            );
+            for fragment in [
+                "range=30d",
+                "bucket=1d",
+                "owner_id=owner-1",
+                "hub_id=hub-1",
+                "client_id=client-1",
+                "country=CA",
+                "message=speak",
+                "utterance=hello",
+                "intent=DailyDeskIntent",
+                "time_start=2026-05-03T20%3A00%3A00Z",
+                "time_end=2026-05-03T21%3A00%3A00Z",
+                "weekday=6",
+                "hour=0",
+            ] {
+                assert!(request.contains(fragment), "missing {fragment}: {request}");
+            }
+            let body = r#"{"meta":{"scope":"admin"},"totals":{"utterances":7}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let overview = control
+            .get_analytics_overview(AnalyticsOverviewOptions {
+                admin: true,
+                range: Some("30d".to_string()),
+                bucket: Some("1d".to_string()),
+                owner_id: Some("owner-1".to_string()),
+                hub_id: Some("hub-1".to_string()),
+                client_id: Some("client-1".to_string()),
+                country: Some("CA".to_string()),
+                message: Some("speak".to_string()),
+                utterance: Some("hello".to_string()),
+                intent: Some("DailyDeskIntent".to_string()),
+                time_start: Some("2026-05-03T20:00:00Z".to_string()),
+                time_end: Some("2026-05-03T21:00:00Z".to_string()),
+                weekday: Some(6),
+                hour: Some(0),
+            })
+            .await
+            .expect("analytics overview");
+
+        assert_eq!(overview["meta"]["scope"].as_str(), Some("admin"));
+        assert_eq!(overview["totals"]["utterances"].as_i64(), Some(7));
         server.join().expect("test server finished");
     }
 }

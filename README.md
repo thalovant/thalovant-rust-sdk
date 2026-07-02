@@ -96,6 +96,46 @@ if let Some(items) = page.get("data").and_then(|value| value.as_array()) {
 }
 ```
 
+## Workspace Analytics
+
+Authenticated accounts can read the same overview used by the dashboard:
+
+```rust
+let overview = control
+    .get_analytics_overview(thalovant::AnalyticsOverviewOptions {
+        range: Some("7d".into()),
+        hub_id: Some("hub-id".into()),
+        ..Default::default()
+    })
+    .await?;
+println!("{}", overview["totals"]);
+```
+
+## Durable Memory
+
+Private Daily Desk and workspace assistants can manage explicit opt-in memory:
+
+```rust
+let memory = control
+    .create_memory_item(serde_json::json!({
+        "scope": "workspace",
+        "kind": "preference",
+        "content": "Prefer America/Toronto for scheduling.",
+        "tags": ["timezone"],
+    }))
+    .await?;
+println!("{}", memory["id"]);
+
+let items = control
+    .list_memory_items(thalovant::MemoryListOptions {
+        scope: Some("workspace".into()),
+        query: Some("timezone".into()),
+        ..Default::default()
+    })
+    .await?;
+println!("{}", items["data"]);
+```
+
 ## Use An Existing Identity
 
 For local development, store one or more identities in the protected SDK config:
@@ -319,6 +359,13 @@ for item in items {
 - `control.get_public_hub(hub_ref)`
 - `control.list_hubs(limit, cursor, owner_id)`
 - `control.get_hub(hub_id)`
+- `control.get_analytics_overview(options)`
+- `control.list_memory_items(options)`
+- `control.get_memory_summary(owner_id)`
+- `control.create_memory_item(payload)`
+- `control.get_memory_item(memory_id)`
+- `control.update_memory_item(memory_id, payload)`
+- `control.delete_memory_item(memory_id)`
 - `control.create_client_identity_for_hub_id(hub_id, options)`
 - `Identity::from_config(profile)`
 - `Client::from_config(profile)`
