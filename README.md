@@ -59,6 +59,9 @@ async fn main() -> thalovant::Result<()> {
         .await?;
 
     let client = Client::with_protocol(result.identity, HubProtocol::Wss)?;
+    let info = client.connect_with_info().await?;
+    println!("connected in {:?} ms", info.connect_ms);
+
     let reply = client
         .ask("Tell me a short clean joke.", RequestOptions::default())
         .await?;
@@ -234,6 +237,10 @@ for protocol in [HubProtocol::Wss, HubProtocol::Https, HubProtocol::Mqtt] {
 }
 ```
 
+Use `client.connect_with_info().await` when you need connection telemetry for
+benchmarks or health dashboards. The returned snapshot includes phase,
+socket/open time, handshake time, total connect time, and last error.
+
 MQTT identities include a broker endpoint, username, password, TLS flag, and
 topic prefix. The broker credentials are scoped to that client and should be
 treated like a password. Public identities should use `mqtts://`; the SDK also
@@ -373,6 +380,8 @@ for item in items {
 - `Client::from_file(path)`
 - `Client::from_env()`
 - `Client::with_protocol(identity, protocol)`
+- `client.connect_with_info()`
+- `client.connection_info()`
 - `client.ask(text, options)`
 - `client.send_utterance(text, options)`
 - `client.send_action(payload, options)`

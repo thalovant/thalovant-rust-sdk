@@ -15,12 +15,15 @@ use futures_util::{SinkExt, StreamExt};
 use rumqttc::{AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, QoS, Transport};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use tokio::{
     net::TcpStream,
-    sync::{broadcast, Mutex},
+    sync::{broadcast, Mutex, Notify},
     task::JoinHandle,
-    time::{sleep, Instant},
+    time::{sleep, timeout, Instant},
 };
 use tokio_tungstenite::{
     connect_async, tungstenite::Message as WebSocketMessage, MaybeTlsStream, WebSocketStream,
@@ -33,6 +36,45 @@ pub struct TransportHealth {
     pub handshake_complete: bool,
     pub transport_alive: bool,
     pub last_error: Option<String>,
+    pub connection: TransportConnectionInfo,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum TransportConnectionPhase {
+    #[default]
+    Idle,
+    Connecting,
+    Handshake,
+    Ready,
+    Closed,
+    Error,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransportConnectionInfo {
+    pub phase: TransportConnectionPhase,
+    pub started_at: Option<SystemTime>,
+    pub connected_at: Option<SystemTime>,
+    pub transport_open_ms: Option<f64>,
+    pub socket_open_ms: Option<f64>,
+    pub handshake_ms: Option<f64>,
+    pub connect_ms: Option<f64>,
+    pub last_error: Option<String>,
+}
+
+impl Default for TransportConnectionInfo {
+    fn default() -> Self {
+        Self {
+            phase: TransportConnectionPhase::Idle,
+            started_at: None,
+            connected_at: None,
+            transport_open_ms: None,
+            socket_open_ms: None,
+            handshake_ms: None,
+            connect_ms: None,
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -117,6 +159,10 @@ impl RuntimeTransport {
         }
     }
 
+    pub async fn connection_info(&self) -> TransportConnectionInfo {
+        self.healthcheck().await.connection
+    }
+
     pub async fn emit_bus(
         &self,
         event_type: &str,
@@ -191,36 +237,54 @@ impl HttpTransport {
     }
 
     pub async fn connect(&self) -> Result<()> {
+        let started = Instant::now();
+        self.set_connection(connecting_connection()).await;
         let response = self
             .state
             .http_client
             .post(self.endpoint("/connect"))
             .send()
             .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()))?;
+            .map_err(|err| ThalovantError::Connection(err.to_string()));
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.mark_connection_error(&error).await;
+                return Err(error);
+            }
+        };
         if !response.status().is_success() {
-            return Err(ThalovantError::Connection(format!(
+            let error = ThalovantError::Connection(format!(
                 "HiveMind HTTP connect status {}",
                 response.status()
-            )));
+            ));
+            self.mark_connection_error(&error).await;
+            return Err(error);
         }
+        let opened = Instant::now();
         {
             let mut health = self.state.health.lock().await;
             health.connected = true;
             health.transport_alive = true;
+            health.connection.phase = TransportConnectionPhase::Handshake;
+            health.connection.transport_open_ms = Some(elapsed_ms(started, opened));
         }
         let deadline = Instant::now() + Duration::from_secs(6);
         while !self.is_handshake_complete().await && Instant::now() < deadline {
-            self.poll_once().await?;
+            if let Err(error) = self.poll_once().await {
+                self.mark_connection_error(&error).await;
+                return Err(error);
+            }
             if !self.is_handshake_complete().await {
                 sleep(Duration::from_millis(100)).await;
             }
         }
         if !self.is_handshake_complete().await {
-            return Err(ThalovantError::Timeout(
-                "HiveMind HTTP handshake timed out".to_string(),
-            ));
+            let error = ThalovantError::Timeout("HiveMind HTTP handshake timed out".to_string());
+            self.mark_connection_error(&error).await;
+            return Err(error);
         }
+        self.mark_connection_ready(started, opened).await;
         self.start_polling().await;
         Ok(())
     }
@@ -239,11 +303,16 @@ impl HttpTransport {
         health.connected = false;
         health.handshake_complete = false;
         health.transport_alive = false;
+        health.connection.phase = TransportConnectionPhase::Closed;
         Ok(())
     }
 
     pub async fn healthcheck(&self) -> TransportHealth {
         self.state.health.lock().await.clone()
+    }
+
+    pub async fn connection_info(&self) -> TransportConnectionInfo {
+        self.healthcheck().await.connection
     }
 
     pub async fn emit_bus(
@@ -307,6 +376,8 @@ impl HttpTransport {
                     health.connected = false;
                     health.transport_alive = false;
                     health.last_error = Some(error.to_string());
+                    health.connection.phase = TransportConnectionPhase::Error;
+                    health.connection.last_error = Some(error.to_string());
                     break;
                 }
             }
@@ -433,6 +504,27 @@ impl HttpTransport {
             urlencoding::encode(&self.authorization())
         )
     }
+
+    async fn set_connection(&self, connection: TransportConnectionInfo) {
+        self.state.health.lock().await.connection = connection;
+    }
+
+    async fn mark_connection_ready(&self, started: Instant, opened: Instant) {
+        let now = Instant::now();
+        let mut health = self.state.health.lock().await;
+        health.connection.phase = TransportConnectionPhase::Ready;
+        health.connection.connected_at = Some(SystemTime::now());
+        health.connection.handshake_ms = Some(elapsed_ms(opened, now));
+        health.connection.connect_ms = Some(elapsed_ms(started, now));
+        health.connection.last_error = None;
+    }
+
+    async fn mark_connection_error(&self, error: &ThalovantError) {
+        let mut health = self.state.health.lock().await;
+        health.last_error = Some(error.to_string());
+        health.connection.phase = TransportConnectionPhase::Error;
+        health.connection.last_error = Some(error.to_string());
+    }
 }
 
 type WssWriter =
@@ -450,6 +542,7 @@ struct WssTransportState {
     health: Mutex<TransportHealth>,
     writer: Mutex<Option<WssWriter>>,
     read_task: Mutex<Option<JoinHandle<()>>>,
+    handshake_notify: Notify,
 }
 
 impl WssTransport {
@@ -464,6 +557,7 @@ impl WssTransport {
                 health: Mutex::new(TransportHealth::default()),
                 writer: Mutex::new(None),
                 read_task: Mutex::new(None),
+                handshake_notify: Notify::new(),
             }),
         }
     }
@@ -477,6 +571,8 @@ impl WssTransport {
     }
 
     pub async fn connect(&self) -> Result<()> {
+        let started = Instant::now();
+        self.set_connection(connecting_connection()).await;
         let endpoint_value = self
             .state
             .identity
@@ -485,17 +581,41 @@ impl WssTransport {
                 ThalovantError::UnsupportedProtocol(
                     "identity does not include a WSS endpoint".to_string(),
                 )
-            })?;
-        let endpoint = authorized_wss_url(&endpoint_value, &self.authorization())?;
-        let (stream, _) = connect_async(endpoint)
+            });
+        let endpoint_value = match endpoint_value {
+            Ok(endpoint_value) => endpoint_value,
+            Err(error) => {
+                self.mark_error(&error).await;
+                return Err(error);
+            }
+        };
+        let endpoint = match authorized_wss_url(&endpoint_value, &self.authorization()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.mark_error(&error).await;
+                return Err(error);
+            }
+        };
+        let stream = connect_async(endpoint)
             .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()))?;
+            .map_err(|err| ThalovantError::Connection(err.to_string()));
+        let (stream, _) = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                self.mark_error(&error).await;
+                return Err(error);
+            }
+        };
+        let opened = Instant::now();
         let (writer, mut reader) = stream.split();
         *self.state.writer.lock().await = Some(writer);
         {
             let mut health = self.state.health.lock().await;
             health.connected = true;
             health.transport_alive = true;
+            health.connection.phase = TransportConnectionPhase::Handshake;
+            health.connection.transport_open_ms = Some(elapsed_ms(started, opened));
+            health.connection.socket_open_ms = Some(elapsed_ms(started, opened));
         }
         let transport = self.clone();
         *self.state.read_task.lock().await = Some(tokio::spawn(async move {
@@ -505,7 +625,7 @@ impl WssTransport {
                         if let Err(error) =
                             transport.handle_raw_message(Value::String(payload)).await
                         {
-                            transport.mark_error(error).await;
+                            transport.mark_error(&error).await;
                             break;
                         }
                     }
@@ -513,7 +633,7 @@ impl WssTransport {
                         let text = String::from_utf8_lossy(&payload).to_string();
                         if let Err(error) = transport.handle_raw_message(Value::String(text)).await
                         {
-                            transport.mark_error(error).await;
+                            transport.mark_error(&error).await;
                             break;
                         }
                     }
@@ -523,24 +643,25 @@ impl WssTransport {
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        transport
-                            .mark_error(ThalovantError::Connection(error.to_string()))
-                            .await;
+                        let error = ThalovantError::Connection(error.to_string());
+                        transport.mark_error(&error).await;
                         break;
                     }
                 }
             }
         }));
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while !self.is_handshake_complete().await && Instant::now() < deadline {
-            sleep(Duration::from_millis(100)).await;
+        let notified = self.state.handshake_notify.notified();
+        tokio::pin!(notified);
+        if !self.is_handshake_complete().await {
+            let _ = timeout(Duration::from_secs(6), &mut notified).await;
         }
         if !self.is_handshake_complete().await {
             self.disconnect().await?;
-            return Err(ThalovantError::Timeout(
-                "HiveMind WSS handshake timed out".to_string(),
-            ));
+            let error = ThalovantError::Timeout("HiveMind WSS handshake timed out".to_string());
+            self.mark_error(&error).await;
+            return Err(error);
         }
+        self.mark_connection_ready(started, opened).await;
         Ok(())
     }
 
@@ -557,6 +678,10 @@ impl WssTransport {
 
     pub async fn healthcheck(&self) -> TransportHealth {
         self.state.health.lock().await.clone()
+    }
+
+    pub async fn connection_info(&self) -> TransportConnectionInfo {
+        self.healthcheck().await.connection
     }
 
     pub async fn emit_bus(
@@ -611,6 +736,7 @@ impl WssTransport {
             let mut health = self.state.health.lock().await;
             health.handshake_complete = true;
             health.transport_alive = true;
+            self.state.handshake_notify.notify_waiters();
         }
         Ok(())
     }
@@ -632,11 +758,13 @@ impl WssTransport {
             .map_err(|err| ThalovantError::Connection(err.to_string()))
     }
 
-    async fn mark_error(&self, error: ThalovantError) {
+    async fn mark_error(&self, error: &ThalovantError) {
         let mut health = self.state.health.lock().await;
         health.connected = false;
         health.transport_alive = false;
         health.last_error = Some(error.to_string());
+        health.connection.phase = TransportConnectionPhase::Error;
+        health.connection.last_error = Some(error.to_string());
     }
 
     async fn mark_disconnected(&self) {
@@ -644,6 +772,21 @@ impl WssTransport {
         health.connected = false;
         health.handshake_complete = false;
         health.transport_alive = false;
+        health.connection.phase = TransportConnectionPhase::Closed;
+    }
+
+    async fn set_connection(&self, connection: TransportConnectionInfo) {
+        self.state.health.lock().await.connection = connection;
+    }
+
+    async fn mark_connection_ready(&self, started: Instant, opened: Instant) {
+        let now = Instant::now();
+        let mut health = self.state.health.lock().await;
+        health.connection.phase = TransportConnectionPhase::Ready;
+        health.connection.connected_at = Some(SystemTime::now());
+        health.connection.handshake_ms = Some(elapsed_ms(opened, now));
+        health.connection.connect_ms = Some(elapsed_ms(started, now));
+        health.connection.last_error = None;
     }
 }
 
@@ -666,6 +809,7 @@ struct MqttTransportState {
     bus_tx: broadcast::Sender<Event>,
     health: Mutex<TransportHealth>,
     event_task: Mutex<Option<JoinHandle<()>>>,
+    handshake_notify: Notify,
 }
 
 impl MqttTransport {
@@ -681,6 +825,7 @@ impl MqttTransport {
                 bus_tx,
                 health: Mutex::new(TransportHealth::default()),
                 event_task: Mutex::new(None),
+                handshake_notify: Notify::new(),
             }),
         })
     }
@@ -698,12 +843,27 @@ impl MqttTransport {
     }
 
     pub async fn connect(&self) -> Result<()> {
+        let started = Instant::now();
+        self.set_connection(connecting_connection()).await;
         let credentials = self.state.identity.mqtt.as_ref().ok_or_else(|| {
             ThalovantError::UnsupportedProtocol(
                 "identity does not include MQTT broker credentials".to_string(),
             )
-        })?;
-        let mut options = mqtt_options_for_identity(&self.state.identity)?;
+        });
+        let credentials = match credentials {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                self.mark_error(&error).await;
+                return Err(error);
+            }
+        };
+        let mut options = match mqtt_options_for_identity(&self.state.identity) {
+            Ok(options) => options,
+            Err(error) => {
+                self.mark_error(&error).await;
+                return Err(error);
+            }
+        };
         options.set_keep_alive(Duration::from_secs(60));
         options.set_clean_session(true);
         options.set_credentials(credentials.username.clone(), credentials.password.clone());
@@ -724,25 +884,28 @@ impl MqttTransport {
                             .handle_raw_mqtt_payload(publish.payload.to_vec())
                             .await
                         {
-                            transport.mark_error(error).await;
+                            transport.mark_error(&error).await;
                             break;
                         }
                     }
                     Ok(_) => {}
                     Err(error) => {
-                        transport
-                            .mark_error(ThalovantError::Connection(error.to_string()))
-                            .await;
+                        let error = ThalovantError::Connection(error.to_string());
+                        transport.mark_error(&error).await;
                         break;
                     }
                 }
             }
         }));
-        client
+        if let Err(error) = client
             .subscribe(self.state.topics.s2c.clone(), qos(credentials.qos))
             .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()))?;
-        client
+            .map_err(|err| ThalovantError::Connection(err.to_string()))
+        {
+            self.mark_error(&error).await;
+            return Err(error);
+        }
+        if let Err(error) = client
             .publish(
                 self.state.topics.status.clone(),
                 QoS::AtLeastOnce,
@@ -750,27 +913,41 @@ impl MqttTransport {
                 "online",
             )
             .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()))?;
+            .map_err(|err| ThalovantError::Connection(err.to_string()))
+        {
+            self.mark_error(&error).await;
+            return Err(error);
+        }
         {
             let mut health = self.state.health.lock().await;
             health.connected = true;
             health.transport_alive = true;
+            health.connection.phase = TransportConnectionPhase::Handshake;
+            health.connection.transport_open_ms = Some(elapsed_ms(started, Instant::now()));
         }
-        self.send_hive_message(
-            hello_hive_message(&self.state.identity, "thalovant-rust-mqtt-"),
-            true,
-        )
-        .await?;
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while !self.is_handshake_complete().await && Instant::now() < deadline {
-            sleep(Duration::from_millis(100)).await;
+        let opened = Instant::now();
+        if let Err(error) = self
+            .send_hive_message(
+                hello_hive_message(&self.state.identity, "thalovant-rust-mqtt-"),
+                true,
+            )
+            .await
+        {
+            self.mark_error(&error).await;
+            return Err(error);
+        }
+        let notified = self.state.handshake_notify.notified();
+        tokio::pin!(notified);
+        if !self.is_handshake_complete().await {
+            let _ = timeout(Duration::from_secs(6), &mut notified).await;
         }
         if !self.is_handshake_complete().await {
             self.disconnect().await?;
-            return Err(ThalovantError::Timeout(
-                "HiveMind MQTT handshake timed out".to_string(),
-            ));
+            let error = ThalovantError::Timeout("HiveMind MQTT handshake timed out".to_string());
+            self.mark_error(&error).await;
+            return Err(error);
         }
+        self.mark_connection_ready(started, opened).await;
         Ok(())
     }
 
@@ -795,6 +972,10 @@ impl MqttTransport {
 
     pub async fn healthcheck(&self) -> TransportHealth {
         self.state.health.lock().await.clone()
+    }
+
+    pub async fn connection_info(&self) -> TransportConnectionInfo {
+        self.healthcheck().await.connection
     }
 
     pub async fn emit_bus(
@@ -857,6 +1038,7 @@ impl MqttTransport {
             let mut health = self.state.health.lock().await;
             health.handshake_complete = true;
             health.transport_alive = true;
+            self.state.handshake_notify.notify_waiters();
         }
         Ok(())
     }
@@ -889,11 +1071,13 @@ impl MqttTransport {
             .map_err(|err| ThalovantError::Connection(err.to_string()))
     }
 
-    async fn mark_error(&self, error: ThalovantError) {
+    async fn mark_error(&self, error: &ThalovantError) {
         let mut health = self.state.health.lock().await;
         health.connected = false;
         health.transport_alive = false;
         health.last_error = Some(error.to_string());
+        health.connection.phase = TransportConnectionPhase::Error;
+        health.connection.last_error = Some(error.to_string());
     }
 
     async fn mark_disconnected(&self) {
@@ -901,6 +1085,21 @@ impl MqttTransport {
         health.connected = false;
         health.handshake_complete = false;
         health.transport_alive = false;
+        health.connection.phase = TransportConnectionPhase::Closed;
+    }
+
+    async fn set_connection(&self, connection: TransportConnectionInfo) {
+        self.state.health.lock().await.connection = connection;
+    }
+
+    async fn mark_connection_ready(&self, started: Instant, opened: Instant) {
+        let now = Instant::now();
+        let mut health = self.state.health.lock().await;
+        health.connection.phase = TransportConnectionPhase::Ready;
+        health.connection.connected_at = Some(SystemTime::now());
+        health.connection.handshake_ms = Some(elapsed_ms(opened, now));
+        health.connection.connect_ms = Some(elapsed_ms(started, now));
+        health.connection.last_error = None;
     }
 }
 
@@ -910,6 +1109,18 @@ struct PollResponse {
     error: Option<String>,
     #[serde(default)]
     messages: Vec<Value>,
+}
+
+fn connecting_connection() -> TransportConnectionInfo {
+    TransportConnectionInfo {
+        phase: TransportConnectionPhase::Connecting,
+        started_at: Some(SystemTime::now()),
+        ..Default::default()
+    }
+}
+
+fn elapsed_ms(start: Instant, end: Instant) -> f64 {
+    end.saturating_duration_since(start).as_micros() as f64 / 1000.0
 }
 
 fn truthy(value: Option<&Value>) -> bool {
@@ -1257,5 +1468,13 @@ mod tests {
         assert!(mqtt_tls_enabled(&credentials, "mqtt"));
         assert_eq!(mqtt_default_port(true), 8883);
         assert_eq!(mqtt_default_port(false), 1883);
+    }
+
+    #[test]
+    fn transport_health_defaults_to_idle_connection() {
+        let health = TransportHealth::default();
+
+        assert_eq!(health.connection.phase, TransportConnectionPhase::Idle);
+        assert!(health.connection.connect_ms.is_none());
     }
 }

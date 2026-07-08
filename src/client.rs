@@ -10,7 +10,7 @@ use crate::{
     },
     identity::Identity,
     protocols::{HubProtocol, DEFAULT_PROTOCOL_PREFERENCE},
-    transport::{RuntimeTransport, TransportHealth},
+    transport::{RuntimeTransport, TransportConnectionInfo, TransportHealth},
 };
 use serde_json::{Map, Value};
 use std::{path::Path, time::Duration};
@@ -108,6 +108,15 @@ impl Client {
             return Ok(());
         }
         self.transport.connect().await
+    }
+
+    pub async fn connect_with_info(&self) -> Result<TransportConnectionInfo> {
+        self.connect().await?;
+        Ok(self.connection_info().await)
+    }
+
+    pub async fn connection_info(&self) -> TransportConnectionInfo {
+        self.transport.connection_info().await
     }
 
     pub async fn close(&self) -> Result<()> {

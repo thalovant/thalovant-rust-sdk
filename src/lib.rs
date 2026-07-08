@@ -39,6 +39,6 @@ pub use protocols::{
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
 pub use transport::{
     mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport, RuntimeTransport,
-    TransportHealth, WssTransport,
+    TransportConnectionInfo, TransportConnectionPhase, TransportHealth, WssTransport,
 };
 pub use wire::{decode_hive_binary_frame, encode_hive_binary_frame};
