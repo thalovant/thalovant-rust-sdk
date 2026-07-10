@@ -135,6 +135,14 @@ impl RuntimeTransport {
         }
     }
 
+    pub fn subscribe_hive(&self) -> broadcast::Receiver<HiveMessage> {
+        match self {
+            Self::Http(transport) => transport.subscribe_hive(),
+            Self::Wss(transport) => transport.subscribe_hive(),
+            Self::Mqtt(transport) => transport.subscribe_hive(),
+        }
+    }
+
     pub async fn connect(&self) -> Result<()> {
         match self {
             Self::Http(transport) => transport.connect().await,
@@ -175,6 +183,14 @@ impl RuntimeTransport {
             Self::Mqtt(transport) => transport.emit_bus(event_type, data, context).await,
         }
     }
+
+    pub async fn send_hive_message(&self, message: HiveMessage, encrypt: bool) -> Result<()> {
+        match self {
+            Self::Http(transport) => transport.send_hive_message(message, encrypt).await,
+            Self::Wss(transport) => transport.send_hive_message(message, encrypt).await,
+            Self::Mqtt(transport) => transport.send_hive_message(message, encrypt).await,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -188,6 +204,7 @@ struct HttpTransportState {
     poll_interval: Duration,
     http_client: reqwest::Client,
     bus_tx: broadcast::Sender<Event>,
+    hive_tx: broadcast::Sender<HiveMessage>,
     health: Mutex<TransportHealth>,
     poll_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -204,6 +221,7 @@ impl HttpTransport {
     ) -> Self {
         ensure_rustls_provider();
         let (bus_tx, _) = broadcast::channel(64);
+        let (hive_tx, _) = broadcast::channel(64);
         Self {
             state: Arc::new(HttpTransportState {
                 identity,
@@ -211,6 +229,7 @@ impl HttpTransport {
                 poll_interval,
                 http_client: reqwest::Client::new(),
                 bus_tx,
+                hive_tx,
                 health: Mutex::new(TransportHealth::default()),
                 poll_task: Mutex::new(None),
             }),
@@ -223,6 +242,10 @@ impl HttpTransport {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.state.bus_tx.subscribe()
+    }
+
+    pub fn subscribe_hive(&self) -> broadcast::Receiver<HiveMessage> {
+        self.state.hive_tx.subscribe()
     }
 
     pub fn base_url(&self) -> String {
@@ -411,6 +434,10 @@ impl HttpTransport {
                 let _ = self.state.bus_tx.send(event);
                 Ok(())
             }
+            "query" | "cascade" => {
+                let _ = self.state.hive_tx.send(message);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -468,7 +495,7 @@ impl HttpTransport {
         ))
     }
 
-    async fn send_hive_message(&self, message: HiveMessage, encrypt: bool) -> Result<()> {
+    pub async fn send_hive_message(&self, message: HiveMessage, encrypt: bool) -> Result<()> {
         let serialized = serde_json::to_string(&message)?;
         let payload = if encrypt && self.is_handshake_complete().await {
             if let Some(key) = self.state.identity.crypto_key.as_deref() {
@@ -539,6 +566,7 @@ struct WssTransportState {
     identity: Identity,
     user_agent: String,
     bus_tx: broadcast::Sender<Event>,
+    hive_tx: broadcast::Sender<HiveMessage>,
     health: Mutex<TransportHealth>,
     writer: Mutex<Option<WssWriter>>,
     read_task: Mutex<Option<JoinHandle<()>>>,
@@ -549,11 +577,13 @@ impl WssTransport {
     pub fn new(identity: Identity) -> Self {
         ensure_rustls_provider();
         let (bus_tx, _) = broadcast::channel(64);
+        let (hive_tx, _) = broadcast::channel(64);
         Self {
             state: Arc::new(WssTransportState {
                 identity,
                 user_agent: DEFAULT_USER_AGENT.to_string(),
                 bus_tx,
+                hive_tx,
                 health: Mutex::new(TransportHealth::default()),
                 writer: Mutex::new(None),
                 read_task: Mutex::new(None),
@@ -568,6 +598,10 @@ impl WssTransport {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.state.bus_tx.subscribe()
+    }
+
+    pub fn subscribe_hive(&self) -> broadcast::Receiver<HiveMessage> {
+        self.state.hive_tx.subscribe()
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -725,6 +759,7 @@ impl WssTransport {
         let completed = handle_runtime_message(
             &self.state.identity,
             &self.state.bus_tx,
+            &self.state.hive_tx,
             raw,
             |message, encrypt| {
                 let transport = self.clone();
@@ -741,7 +776,7 @@ impl WssTransport {
         Ok(())
     }
 
-    async fn send_hive_message(&self, message: HiveMessage, encrypt: bool) -> Result<()> {
+    pub async fn send_hive_message(&self, message: HiveMessage, encrypt: bool) -> Result<()> {
         let payload = serialize_hive_message(
             &self.state.identity,
             self.is_handshake_complete().await,
@@ -807,6 +842,7 @@ struct MqttTransportState {
     topics: MqttTopicSet,
     client: Mutex<Option<AsyncClient>>,
     bus_tx: broadcast::Sender<Event>,
+    hive_tx: broadcast::Sender<HiveMessage>,
     health: Mutex<TransportHealth>,
     event_task: Mutex<Option<JoinHandle<()>>>,
     handshake_notify: Notify,
@@ -817,12 +853,14 @@ impl MqttTransport {
         ensure_rustls_provider();
         let topics = mqtt_topics_for_identity(&identity)?;
         let (bus_tx, _) = broadcast::channel(64);
+        let (hive_tx, _) = broadcast::channel(64);
         Ok(Self {
             state: Arc::new(MqttTransportState {
                 identity,
                 topics,
                 client: Mutex::new(None),
                 bus_tx,
+                hive_tx,
                 health: Mutex::new(TransportHealth::default()),
                 event_task: Mutex::new(None),
                 handshake_notify: Notify::new(),
@@ -840,6 +878,10 @@ impl MqttTransport {
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.state.bus_tx.subscribe()
+    }
+
+    pub fn subscribe_hive(&self) -> broadcast::Receiver<HiveMessage> {
+        self.state.hive_tx.subscribe()
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -1032,6 +1074,10 @@ impl MqttTransport {
                 let _ = self.state.bus_tx.send(event);
                 return Ok(());
             }
+            "query" | "cascade" => {
+                let _ = self.state.hive_tx.send(message);
+                return Ok(());
+            }
             _ => return Ok(()),
         }
         {
@@ -1043,7 +1089,7 @@ impl MqttTransport {
         Ok(())
     }
 
-    async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
+    pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
         let mut payload = encode_hive_binary_frame(&message)?;
         if let Some(key) = self.state.identity.crypto_key.as_deref() {
             if !key.trim().is_empty() {
@@ -1130,6 +1176,7 @@ fn truthy(value: Option<&Value>) -> bool {
 async fn handle_runtime_message<F, Fut>(
     identity: &Identity,
     bus_tx: &broadcast::Sender<Event>,
+    hive_tx: &broadcast::Sender<HiveMessage>,
     raw: Value,
     send: F,
 ) -> Result<bool>
@@ -1175,6 +1222,10 @@ where
         "bus" => {
             let event = event_from_bus_payload(&message.payload, Some(decoded));
             let _ = bus_tx.send(event);
+            Ok(false)
+        }
+        "query" | "cascade" => {
+            let _ = hive_tx.send(message);
             Ok(false)
         }
         _ => Ok(false),

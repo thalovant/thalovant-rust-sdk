@@ -1,11 +1,16 @@
-pub const DEFAULT_USER_AGENT: &str = "thalovant-rust-sdk/0.2.14";
+pub const DEFAULT_USER_AGENT: &str = "thalovant-rust-sdk/0.2.15";
 
 pub const EVENT_RECOGNIZER_LOOP_UTTERANCE: &str = "recognizer_loop:utterance";
 pub const EVENT_UTTERANCE_HANDLED: &str = "ovos.utterance.handled";
 pub const EVENT_SPEAK: &str = "speak";
+pub const EVENT_OVOS_UTTERANCE_SPEAK: &str = "ovos.utterance.speak";
 pub const EVENT_INTENT_FAILURE: &str = "complete_intent_failure";
 pub const EVENT_POLICY_DENIED: &str = "hive.policy.denied";
+pub const EVENT_QUERY_TIMEOUT: &str = "hive.query.timeout";
 
 pub fn is_failure_event(name: &str) -> bool {
-    matches!(name, EVENT_INTENT_FAILURE | EVENT_POLICY_DENIED)
+    matches!(
+        name,
+        EVENT_INTENT_FAILURE | EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT
+    )
 }

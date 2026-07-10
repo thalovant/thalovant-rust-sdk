@@ -241,6 +241,14 @@ Use `client.connect_with_info().await` when you need connection telemetry for
 benchmarks or health dashboards. The returned snapshot includes phase,
 socket/open time, handshake time, total connect time, and last error.
 
+Use `client.query(...).await` for the direct HiveMind query frame path when the
+hub supports it. It avoids broad bus fanout and is the preferred request/reply
+API for low-latency app integrations.
+
+```rust
+let reply = client.query("What time is it in Toronto?", QueryOptions::default()).await?;
+```
+
 MQTT identities include a broker endpoint, username, password, TLS flag, and
 topic prefix. The broker credentials are scoped to that client and should be
 treated like a password. Public identities should use `mqtts://`; the SDK also
@@ -382,6 +390,7 @@ for item in items {
 - `Client::with_protocol(identity, protocol)`
 - `client.connect_with_info()`
 - `client.connection_info()`
+- `client.query(text, options)`
 - `client.ask(text, options)`
 - `client.send_utterance(text, options)`
 - `client.send_action(payload, options)`

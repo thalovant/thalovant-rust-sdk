@@ -15,7 +15,8 @@ pub mod transport;
 pub mod wire;
 
 pub use client::{
-    ActionOptions, Client, CodeOptions, Conversation, ConversationOptions, RequestOptions,
+    ActionOptions, Client, CodeOptions, Conversation, ConversationOptions, QueryOptions,
+    RequestOptions,
 };
 pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
