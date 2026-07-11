@@ -22,7 +22,7 @@ pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
 pub use control::{
     AnalyticsOverviewOptions, BootstrapIdentityOptions, BootstrapIdentityResult, ControlPlane,
-    MemoryListOptions, DEFAULT_CONTROL_API_URL,
+    MemoryListOptions, OperationResource, OperationStatus, DEFAULT_CONTROL_API_URL,
 };
 pub use crypto::{
     decrypt_binary, decrypt_from_json, encrypt_as_binary, encrypt_as_json, runtime_crypto_key,

@@ -10,11 +10,44 @@ use crate::{
 use base64::{engine::general_purpose, Engine as _};
 use rand::{rngs::OsRng, RngCore};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.12";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.16";
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    Requested,
+    Committed,
+    Applied,
+    Ready,
+    Failed,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct OperationResource {
+    pub id: String,
+    pub kind: String,
+    pub aggregate_type: String,
+    pub aggregate_id: Option<String>,
+    pub status: OperationStatus,
+    pub details: Map<String, Value>,
+    pub git_commit_sha: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub committed_at: Option<String>,
+    pub applied_at: Option<String>,
+    pub ready_at: Option<String>,
+    pub terminal_at: Option<String>,
+    pub links: HashMap<String, Option<String>>,
+}
 
 #[derive(Clone)]
 pub struct ControlPlane {
@@ -161,6 +194,19 @@ impl ControlPlane {
             false,
         )
         .await
+    }
+
+    pub async fn get_operation(&self, operation_id: &str) -> Result<OperationResource> {
+        let value = self
+            .request(
+                "GET",
+                &format!("/v1/operations/{}", urlencoding::encode(operation_id)),
+                None,
+                None,
+                true,
+            )
+            .await?;
+        Ok(serde_json::from_value(value)?)
     }
 
     pub async fn list_memory_items(&self, opts: MemoryListOptions) -> Result<Value> {
@@ -705,6 +751,44 @@ mod tests {
 
         assert_eq!(page["data"][0]["slug"].as_str(), Some("joke-garden"));
         assert_eq!(hub["title"].as_str(), Some("Joke Garden"));
+        server.join().expect("test server finished");
+    }
+
+    #[tokio::test]
+    async fn gets_typed_durable_operation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 4096];
+            let size = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..size]);
+            assert!(request.starts_with("GET /v1/operations/operation-1 "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("\r\nauthorization: bearer token\r\n"),
+                "operation requests must send Authorization: {request}"
+            );
+            let body = r#"{"id":"operation-1","kind":"gitops.commit","aggregate_type":"gitops","aggregate_id":null,"status":"committed","details":{"git_commit_created":true},"git_commit_sha":"abc123","error_code":null,"error_message":null,"created_at":"2026-07-11T00:00:00Z","updated_at":"2026-07-11T00:00:01Z","committed_at":"2026-07-11T00:00:01Z","applied_at":null,"ready_at":null,"terminal_at":null,"links":{"self":"/api/v1/operations/operation-1"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let operation = control
+            .get_operation("operation-1")
+            .await
+            .expect("get operation");
+
+        assert_eq!(operation.status, OperationStatus::Committed);
+        assert_eq!(operation.git_commit_sha.as_deref(), Some("abc123"));
+        assert_eq!(operation.details["git_commit_created"], Value::Bool(true));
         server.join().expect("test server finished");
     }
 
