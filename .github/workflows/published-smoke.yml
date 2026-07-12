@@ -1,0 +1,25 @@
+name: Published crate smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published crates.io version to verify
+        required: true
+        default: 0.2.15
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve the immutable crate and compile a clean consumer
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        run: |
+          cargo add --manifest-path smoke/published/Cargo.toml "thalovant@=$PACKAGE_VERSION"
+          cargo check --manifest-path smoke/published/Cargo.toml
