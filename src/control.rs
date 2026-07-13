@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.16";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.17";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
