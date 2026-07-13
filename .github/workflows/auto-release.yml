@@ -25,11 +25,11 @@ jobs:
     env:
       CARGO_REGISTRY_TOKEN_FROM_SECRET: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy, rustfmt
 
@@ -162,7 +162,7 @@ jobs:
       - name: Authenticate with crates.io trusted publishing
         if: ${{ steps.plan.outputs.release_needed == 'true' && steps.registry.outputs.exists == 'false' && env.CARGO_REGISTRY_TOKEN_FROM_SECRET == '' }}
         id: crates-auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
 
       - name: Publish to crates.io dry run
         if: steps.plan.outputs.release_needed == 'true' && steps.registry.outputs.exists == 'false'
