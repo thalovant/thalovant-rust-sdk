@@ -6,7 +6,7 @@ on:
       version:
         description: Published crates.io version to verify
         required: true
-        default: 0.2.15
+        default: 0.2.17
 
 permissions:
   contents: read

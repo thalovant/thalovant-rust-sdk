@@ -12,7 +12,10 @@ use crate::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use rumqttc::{AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, QoS, Transport};
+use rumqttc::{
+    AsyncClient, Event as MqttEvent, LastWill, MqttOptions, Packet, QoS, TlsConfiguration,
+    Transport,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
@@ -1448,9 +1451,13 @@ fn mqtt_options_for_identity(identity: &Identity) -> Result<MqttOptions> {
         port,
     );
     if tls_enabled {
-        options.set_transport(Transport::tls_with_default_config());
+        options.set_transport(default_mqtt_tls_transport());
     }
     Ok(options)
+}
+
+fn default_mqtt_tls_transport() -> Transport {
+    Transport::tls_with_config(TlsConfiguration::Native)
 }
 
 fn mqtt_tls_enabled(credentials: &MqttBrokerCredentials, scheme: &str) -> bool {
@@ -1519,6 +1526,14 @@ mod tests {
         assert!(mqtt_tls_enabled(&credentials, "mqtt"));
         assert_eq!(mqtt_default_port(true), 8883);
         assert_eq!(mqtt_default_port(false), 1883);
+    }
+
+    #[test]
+    fn mqtt_tls_uses_the_native_security_backend() {
+        assert!(matches!(
+            default_mqtt_tls_transport(),
+            Transport::Tls(TlsConfiguration::Native)
+        ));
     }
 
     #[test]
