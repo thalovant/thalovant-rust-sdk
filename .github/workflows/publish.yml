@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable release tag to check out and attach evidence to
+        required: true
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -11,26 +16,53 @@ env:
 
 permissions:
   contents: read
-  id-token: write
+
+concurrency:
+  group: publish-crates-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   publish:
+    name: Build and publish
     runs-on: ubuntu-latest
     environment:
       name: crates
       url: https://crates.io/crates/thalovant
     env:
       CARGO_REGISTRY_TOKEN_FROM_SECRET: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag || '' }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Check out the immutable release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy, rustfmt
+
       - name: Read package version
         id: version
         run: |
           VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release tag and checkout
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          test -n "$RELEASE_TAG"
+          test "$RELEASE_TAG" = "v$PACKAGE_VERSION"
+          test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$(git rev-parse HEAD)"
+
       - name: Check whether version is already on crates.io
         id: registry
         env:
@@ -42,35 +74,120 @@ jobs:
             404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
             *) echo "Unexpected crates.io status: $STATUS"; exit 1 ;;
           esac
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-features
+
+      - name: Build deterministic crate and CycloneDX SBOM
+        id: artifacts
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export SOURCE_DATE_EPOCH
+          mkdir -p target/release-artifacts
+          rm -rf target/package
+          cargo package --locked
+          crate="target/package/thalovant-$PACKAGE_VERSION.crate"
+          test -f "$crate"
+          cp "$crate" "$RUNNER_TEMP/thalovant-first.crate"
+          cargo package --locked
+          cmp "$crate" "$RUNNER_TEMP/thalovant-first.crate"
+          cp "$crate" "target/release-artifacts/thalovant-$PACKAGE_VERSION.crate"
+
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --format json --spec-version 1.5 --all-features \
+            --target all --override-filename "thalovant-$PACKAGE_VERSION.cdx"
+          mv "thalovant-$PACKAGE_VERSION.cdx.json" target/release-artifacts/
+
+          sbom="target/release-artifacts/thalovant-$PACKAGE_VERSION.cdx.json"
+          jq -e --arg version "$PACKAGE_VERSION" '
+            .bomFormat == "CycloneDX" and
+            .specVersion == "1.5" and
+            .metadata.component.name == "thalovant" and
+            .metadata.component.version == $version
+          ' "$sbom"
+          echo "crate=$GITHUB_WORKSPACE/target/release-artifacts/thalovant-$PACKAGE_VERSION.crate" >> "$GITHUB_OUTPUT"
+          echo "sbom=$GITHUB_WORKSPACE/$sbom" >> "$GITHUB_OUTPUT"
+
+      - name: Attest crate provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.artifacts.outputs.crate }}
+
+      - name: Attest crate SBOM
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.artifacts.outputs.crate }}
+          sbom-path: ${{ steps.artifacts.outputs.sbom }}
+
       - name: Publish skipped
         if: steps.registry.outputs.exists == 'true'
         run: echo "thalovant ${{ steps.version.outputs.version }} is already published on crates.io."
+
       - name: Authenticate with crates.io trusted publishing
         if: ${{ steps.registry.outputs.exists == 'false' && env.CARGO_REGISTRY_TOKEN_FROM_SECRET == '' }}
         id: crates-auth
         uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
-      - run: cargo publish --dry-run
+
+      - name: Publish to crates.io dry run
         if: steps.registry.outputs.exists == 'false'
+        run: cargo publish --dry-run --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
-      - run: cargo publish
+
+      - name: Publish to crates.io
         if: steps.registry.outputs.exists == 'false'
+        run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
-      - name: Verify crates.io version
+
+      - name: Verify crates.io artifact matches the attested crate
         env:
           PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          ATTESTED_CRATE: ${{ steps.artifacts.outputs.crate }}
         run: |
           for attempt in $(seq 1 12); do
-            STATUS="$(curl -sS -o /dev/null -w '%{http_code}' -A 'thalovant-release-check' "https://crates.io/api/v1/crates/thalovant/$PACKAGE_VERSION")"
-            if [ "$STATUS" = "200" ]; then
-              echo "Verified thalovant $PACKAGE_VERSION on crates.io."
-              exit 0
+            echo "Registry download attempt $attempt of 12."
+            if curl -fsSL -A 'thalovant-release-verifier' \
+              "https://crates.io/api/v1/crates/thalovant/$PACKAGE_VERSION/download" \
+              -o "$RUNNER_TEMP/thalovant-registry.crate"; then
+              if cmp "$ATTESTED_CRATE" "$RUNNER_TEMP/thalovant-registry.crate"; then
+                sha256sum "$ATTESTED_CRATE"
+                echo "Verified the crates.io artifact is byte-for-byte identical to the attested crate."
+                exit 0
+              fi
+              echo "The crates.io artifact differs from the attested crate."
+              sha256sum "$ATTESTED_CRATE" "$RUNNER_TEMP/thalovant-registry.crate"
+              exit 1
             fi
             sleep 10
           done
-          echo "thalovant $PACKAGE_VERSION was not visible on crates.io after waiting."
+          echo "thalovant $PACKAGE_VERSION was not downloadable from crates.io after waiting."
           exit 1
+
+      - name: Attach crate and SBOM to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CRATE: ${{ steps.artifacts.outputs.crate }}
+          SBOM: ${{ steps.artifacts.outputs.sbom }}
+        run: |
+          asset_dir="$RUNNER_TEMP/existing-release-assets"
+          mkdir -p "$asset_dir"
+          EXISTING_ASSETS="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for artifact in "$CRATE" "$SBOM"; do
+            name="$(basename "$artifact")"
+            if grep -Fxq "$name" <<< "$EXISTING_ASSETS"; then
+              gh release download "$RELEASE_TAG" --pattern "$name" --dir "$asset_dir"
+              cmp "$artifact" "$asset_dir/$name"
+              echo "$name is already attached to $RELEASE_TAG with the expected digest."
+            else
+              gh release upload "$RELEASE_TAG" "$artifact"
+            fi
+          done
