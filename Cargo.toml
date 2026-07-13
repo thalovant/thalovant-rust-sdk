@@ -13,7 +13,7 @@ categories = ["api-bindings", "network-programming"]
 rust-version = "1.75"
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 base64 = "0.22"
 futures-util = { version = "0.3", features = ["sink"] }
 flate2 = "1"
