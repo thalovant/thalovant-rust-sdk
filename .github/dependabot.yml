@@ -6,9 +6,9 @@ updates:
     open-pull-requests-limit: 5
     allow:
       - dependency-name: "*"
-        update-types: [version-update:semver-minor, version-update:semver-patch]
+        update-types: [version-update:semver-patch]
     groups:
-      rust-routine-updates: {applies-to: version-updates, patterns: ["*"], update-types: [minor, patch]}
+      rust-routine-updates: {applies-to: version-updates, patterns: ["*"], update-types: [patch]}
       rust-security-updates: {applies-to: security-updates, patterns: ["*"]}
 
   - package-ecosystem: github-actions
