@@ -75,6 +75,32 @@ async fn main() -> thalovant::Result<()> {
 `ControlPlane::default()` uses `https://api.thalovant.com`. Use
 `ControlPlane::new(...)` only for local development or a self-hosted control plane.
 
+## MFA Login
+
+Accounts with multi-factor authentication enabled reject a plain
+`control.login(...)` with HTTP 401 and `"code": "mfa_required"`. Pass the
+current TOTP code, or a recovery code, with `login_with_options`:
+
+```rust
+use thalovant::LoginOptions;
+
+control
+    .login_with_options(
+        "you@example.com",
+        "password",
+        LoginOptions {
+            otp_code: Some("123456".into()),
+            ..Default::default()
+        },
+    )
+    .await?;
+```
+
+Use `recovery_code: Some(...)` instead of `otp_code` when the authenticator
+device is unavailable. Both fields are only sent when set, so
+`login_with_options` with a default `LoginOptions` behaves exactly like
+`login` without a scope.
+
 Keep `result.identity` secret. It contains the client credentials used by the
 hub. Do not log `result.as_value(true)`.
 
@@ -370,6 +396,7 @@ for item in items {
 - `ControlPlane::default()`
 - `ControlPlane::new(api_url, access_token)` for local or self-hosted control planes
 - `control.login(email, password, scope)`
+- `control.login_with_options(email, password, options)` for MFA (`otp_code`, `recovery_code`)
 - `control.list_public_hubs(limit, cursor)`
 - `control.get_public_hub(hub_ref)`
 - `control.list_hubs(limit, cursor, owner_id)`

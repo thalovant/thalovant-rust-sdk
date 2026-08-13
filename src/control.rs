@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.17";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.19";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +66,13 @@ pub struct BootstrapIdentityOptions {
     pub active: Option<bool>,
     pub preferred_protocols: Vec<HubProtocol>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct LoginOptions {
+    pub scope: Option<String>,
+    pub otp_code: Option<String>,
+    pub recovery_code: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -128,12 +135,35 @@ impl ControlPlane {
         password: impl Into<String>,
         scope: Option<String>,
     ) -> Result<Value> {
+        self.login_with_options(
+            email,
+            password,
+            LoginOptions {
+                scope,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn login_with_options(
+        &mut self,
+        email: impl Into<String>,
+        password: impl Into<String>,
+        opts: LoginOptions,
+    ) -> Result<Value> {
         let mut body = Map::from_iter([
             ("email".to_string(), Value::String(email.into())),
             ("password".to_string(), Value::String(password.into())),
         ]);
-        if let Some(scope) = scope.filter(|value| !value.trim().is_empty()) {
+        if let Some(scope) = opts.scope.filter(|value| !value.trim().is_empty()) {
             body.insert("scope".to_string(), Value::String(scope));
+        }
+        if let Some(otp_code) = opts.otp_code.filter(|value| !value.trim().is_empty()) {
+            body.insert("otp_code".to_string(), Value::String(otp_code));
+        }
+        if let Some(recovery_code) = opts.recovery_code.filter(|value| !value.trim().is_empty()) {
+            body.insert("recovery_code".to_string(), Value::String(recovery_code));
         }
         let token = self
             .request(
@@ -708,6 +738,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn user_agents_match_crate_version() {
+        let expected = format!("thalovant-rust-sdk/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(DEFAULT_CONTROL_USER_AGENT, expected);
+        assert_eq!(crate::constants::DEFAULT_USER_AGENT, expected);
+        assert_eq!(ControlPlane::default().user_agent, expected);
+    }
+
+    #[tokio::test]
+    async fn login_sends_mfa_fields_only_when_provided() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            for turn in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0_u8; 8192];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(
+                    request.starts_with("POST /v1/auth/token "),
+                    "unexpected request: {request}"
+                );
+                assert!(
+                    request.to_ascii_lowercase().contains(&format!(
+                        "\r\nuser-agent: thalovant-rust-sdk/{}\r\n",
+                        env!("CARGO_PKG_VERSION")
+                    )),
+                    "login must send the crate user agent: {request}"
+                );
+                assert!(request.contains(r#""email":"you@example.com""#));
+                assert!(request.contains(r#""password":"hunter2""#));
+                if turn == 0 {
+                    assert!(
+                        !request.contains("otp_code") && !request.contains("recovery_code"),
+                        "plain login must omit MFA fields: {request}"
+                    );
+                    assert!(
+                        !request.contains("scope"),
+                        "plain login must omit scope: {request}"
+                    );
+                } else {
+                    assert!(
+                        request.contains(r#""scope":"admin""#),
+                        "missing scope: {request}"
+                    );
+                    assert!(
+                        request.contains(r#""otp_code":"123456""#),
+                        "missing otp_code: {request}"
+                    );
+                    assert!(
+                        request.contains(r#""recovery_code":"rc-1""#),
+                        "missing recovery_code: {request}"
+                    );
+                }
+                let body = r#"{"access_token":"token-1","token_type":"bearer","expires_in":3600}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("write response");
+            }
+        });
+
+        let mut control = ControlPlane::new(format!("http://{address}"), None);
+        let token = control
+            .login("you@example.com", "hunter2", None)
+            .await
+            .expect("login without MFA");
+        assert_eq!(token["access_token"].as_str(), Some("token-1"));
+        assert_eq!(control.access_token.as_deref(), Some("token-1"));
+
+        let token = control
+            .login_with_options(
+                "you@example.com",
+                "hunter2",
+                LoginOptions {
+                    scope: Some("admin".to_string()),
+                    otp_code: Some("123456".to_string()),
+                    recovery_code: Some("rc-1".to_string()),
+                },
+            )
+            .await
+            .expect("login with MFA");
+        assert_eq!(token["access_token"].as_str(), Some("token-1"));
+        server.join().expect("test server finished");
+    }
+
     #[tokio::test]
     async fn public_hub_discovery_does_not_send_auth() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -770,7 +889,7 @@ mod tests {
                     .contains("\r\nauthorization: bearer token\r\n"),
                 "operation requests must send Authorization: {request}"
             );
-            let body = r#"{"id":"operation-1","kind":"gitops.commit","aggregate_type":"gitops","aggregate_id":null,"status":"committed","details":{"git_commit_created":true},"git_commit_sha":"abc123","error_code":null,"error_message":null,"created_at":"2026-07-11T00:00:00Z","updated_at":"2026-07-11T00:00:01Z","committed_at":"2026-07-11T00:00:01Z","applied_at":null,"ready_at":null,"terminal_at":null,"links":{"self":"/api/v1/operations/operation-1"}}"#;
+            let body = r#"{"id":"operation-1","kind":"gitops.commit","aggregate_type":"gitops","aggregate_id":null,"status":"committed","details":{"git_commit_created":true},"git_commit_sha":"abc123","error_code":null,"error_message":null,"created_at":"2026-07-11T00:00:00Z","updated_at":"2026-07-11T00:00:01Z","committed_at":"2026-07-11T00:00:01Z","applied_at":null,"ready_at":null,"terminal_at":null,"links":{"self":"/v1/operations/operation-1"}}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
