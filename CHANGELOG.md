@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.20
+
+- Add browser device-flow sign-in: `ControlPlane::login_with_browser(DeviceLoginOptions)` requests a device authorization from `/v1/auth/device/authorize`, shows the verification URI and user code (override with `DeviceLoginOptions::prompt`), best-effort opens the browser at `verification_uri_complete` (`xdg-open`/`open`, never fatal), and polls `/v1/auth/device/token` honoring the server `interval` and `slow_down` back-pressure until approval. On approval the durable scoped API token is stored on `access_token` exactly like `login`.
+- New public types `DeviceLoginOptions`, `DeviceAuthorization`, `DevicePrompt`, constant `DEFAULT_DEVICE_POLL_INTERVAL`, and error variants `ThalovantError::DeviceAuthorizationDenied` and `ThalovantError::DeviceAuthorizationExpired` (a wait past `DeviceLoginOptions::timeout` fails with the existing `ThalovantError::Timeout`).
+- Document direct API-token auth for CI (`ControlPlane::with_access_token` / `ControlPlane::new` with a pre-provisioned token such as `THALOVANT_API_TOKEN`); no code change, the constructors already accepted a token.
+
 ## 0.2.19
 
 - Add MFA login support: `ControlPlane::login_with_options` and `LoginOptions` send optional `otp_code` and `recovery_code` fields to `/v1/auth/token` for accounts that require multi-factor authentication. `ControlPlane::login` is unchanged.

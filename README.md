@@ -101,6 +101,59 @@ device is unavailable. Both fields are only sent when set, so
 `login_with_options` with a default `LoginOptions` behaves exactly like
 `login` without a scope.
 
+## Browser (Device) Login
+
+Accounts without a password (for example Google sign-in) sign in through the
+browser device flow. `login_with_browser` prints a verification URI and a
+short user code, opens the browser (best effort, override with
+`open_browser: false`), and waits until the request is approved in the
+browser:
+
+```rust
+use thalovant::DeviceLoginOptions;
+
+let token = control
+    .login_with_browser(DeviceLoginOptions {
+        scopes: vec!["hubs:read".into(), "clients:write".into()],
+        client_name: Some("my-tool".into()),
+        ..Default::default()
+    })
+    .await?;
+println!("signed in, token scopes: {}", token["scopes"]);
+```
+
+On approval the returned `access_token` is a durable scoped API token stored
+on `control.access_token`, exactly like `login`. Leave `scopes` empty to let
+the server apply its defaults; the server may normalize or expand the scopes
+it echoes back. Pass `prompt: Some(Box::new(|grant| ...))` to present the
+`DeviceAuthorization` (verification URI, user code) yourself instead of the
+stdout print, and `timeout: Duration::from_secs(...)` to change the default
+15-minute wait.
+
+Failures are typed: `ThalovantError::DeviceAuthorizationDenied` when the
+request is rejected in the browser, `ThalovantError::DeviceAuthorizationExpired`
+when the code expires first (call `login_with_browser` again for a new code),
+and `ThalovantError::Timeout` when `timeout` elapses.
+
+## CI: Direct API Token Auth
+
+Non-interactive environments should skip login entirely and construct the
+control plane with a pre-provisioned API token (for example one issued through
+the device flow or the dashboard) kept in a secret such as
+`THALOVANT_API_TOKEN`:
+
+```rust
+use thalovant::ControlPlane;
+
+let token = std::env::var("THALOVANT_API_TOKEN").expect("THALOVANT_API_TOKEN is set");
+let control = ControlPlane::with_access_token(token);
+// Ready for authenticated calls, no login step needed.
+let hubs = control.list_hubs(Some(50), None, None).await?;
+```
+
+Use `ControlPlane::new(api_url, Some(token))` instead when targeting a local
+or self-hosted control plane.
+
 Keep `result.identity` secret. It contains the client credentials used by the
 hub. Do not log `result.as_value(true)`.
 
@@ -395,8 +448,10 @@ for item in items {
 
 - `ControlPlane::default()`
 - `ControlPlane::new(api_url, access_token)` for local or self-hosted control planes
+- `ControlPlane::with_access_token(token)` for CI and other pre-provisioned-token environments
 - `control.login(email, password, scope)`
 - `control.login_with_options(email, password, options)` for MFA (`otp_code`, `recovery_code`)
+- `control.login_with_browser(options)` for the browser device flow (`DeviceLoginOptions`)
 - `control.list_public_hubs(limit, cursor)`
 - `control.get_public_hub(hub_ref)`
 - `control.list_hubs(limit, cursor, owner_id)`

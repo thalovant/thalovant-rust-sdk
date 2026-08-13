@@ -16,6 +16,10 @@ pub enum ThalovantError {
     Runtime(String),
     #[error("api error: {0}")]
     Api(String),
+    #[error("device authorization denied: the sign-in request was denied in the browser")]
+    DeviceAuthorizationDenied,
+    #[error("device authorization expired: the code expired before it was approved; call login_with_browser again to request a new code")]
+    DeviceAuthorizationExpired,
     #[error("unsupported protocol: {0}")]
     UnsupportedProtocol(String),
     #[error("crypto error: {0}")]

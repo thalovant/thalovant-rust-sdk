@@ -12,11 +12,13 @@ use rand::{rngs::OsRng, RngCore};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt, future::Future, time::Duration};
 use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.19";
+pub const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.20";
+const DEFAULT_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +75,90 @@ pub struct LoginOptions {
     pub scope: Option<String>,
     pub otp_code: Option<String>,
     pub recovery_code: Option<String>,
+}
+
+/// A pending device authorization grant returned by
+/// `POST /v1/auth/device/authorize`.
+///
+/// The user completes the sign-in by visiting `verification_uri` and entering
+/// `user_code` (or by opening `verification_uri_complete`, which has the code
+/// pre-filled). `raw` keeps the full response payload for custom prompts.
+#[derive(Clone, Debug)]
+pub struct DeviceAuthorization {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub verification_uri_complete: Option<String>,
+    pub expires_in: Option<u64>,
+    pub interval: Option<u64>,
+    pub raw: Map<String, Value>,
+}
+
+impl DeviceAuthorization {
+    fn from_value(value: Value) -> Result<Self> {
+        let raw = value.as_object().cloned().ok_or_else(|| {
+            ThalovantError::Api("device authorization response was not a JSON object".to_string())
+        })?;
+        Ok(Self {
+            device_code: required_device_field(&raw, "device_code")?,
+            user_code: required_device_field(&raw, "user_code")?,
+            verification_uri: required_device_field(&raw, "verification_uri")?,
+            verification_uri_complete: raw.get("verification_uri_complete").and_then(json_string),
+            expires_in: raw.get("expires_in").and_then(Value::as_u64),
+            interval: raw.get("interval").and_then(Value::as_u64),
+            raw,
+        })
+    }
+
+    /// The polling interval requested by the server, or the protocol default.
+    pub fn poll_interval(&self) -> Duration {
+        self.interval
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_DEVICE_POLL_INTERVAL)
+    }
+}
+
+/// Callback used to present a [`DeviceAuthorization`] to the user instead of
+/// the default plain-text prompt on stdout.
+pub type DevicePrompt = Box<dyn Fn(&DeviceAuthorization) + Send + Sync>;
+
+/// Options for [`ControlPlane::login_with_browser`].
+///
+/// The default requests no explicit scopes (the server applies its defaults),
+/// opens the verification page in the local browser, prints the plain
+/// verification URI and user code on stdout, and waits up to 15 minutes for
+/// the sign-in to be approved.
+pub struct DeviceLoginOptions {
+    pub scopes: Vec<String>,
+    pub client_name: Option<String>,
+    pub open_browser: bool,
+    pub timeout: Duration,
+    pub prompt: Option<DevicePrompt>,
+}
+
+impl Default for DeviceLoginOptions {
+    fn default() -> Self {
+        Self {
+            scopes: Vec::new(),
+            client_name: None,
+            open_browser: true,
+            timeout: DEFAULT_DEVICE_LOGIN_TIMEOUT,
+            prompt: None,
+        }
+    }
+}
+
+impl fmt::Debug for DeviceLoginOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceLoginOptions")
+            .field("scopes", &self.scopes)
+            .field("client_name", &self.client_name)
+            .field("open_browser", &self.open_browser)
+            .field("timeout", &self.timeout)
+            .field("prompt", &self.prompt.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -182,6 +268,153 @@ impl ControlPlane {
             })?;
         self.access_token = Some(access_token);
         Ok(token)
+    }
+
+    /// Sign in through the browser device flow and store the API token.
+    ///
+    /// This is the sign-in path for accounts without a password (for example
+    /// Google sign-in). It requests a device authorization, tells the user to
+    /// visit `verification_uri` and enter the short `user_code` (set
+    /// `options.prompt` to present the [`DeviceAuthorization`] yourself),
+    /// optionally opens the browser at `verification_uri_complete`, and polls
+    /// until the request is approved, denied, expired, or `options.timeout`
+    /// elapses.
+    ///
+    /// On approval the returned `access_token` is a durable scoped API token
+    /// and is stored on `self.access_token` exactly like [`ControlPlane::login`].
+    ///
+    /// Errors: [`ThalovantError::DeviceAuthorizationDenied`],
+    /// [`ThalovantError::DeviceAuthorizationExpired`], and
+    /// [`ThalovantError::Timeout`] when the wait exceeds `options.timeout`.
+    pub async fn login_with_browser(&mut self, options: DeviceLoginOptions) -> Result<Value> {
+        let DeviceLoginOptions {
+            scopes,
+            client_name,
+            open_browser,
+            timeout,
+            prompt,
+        } = options;
+        let mut body = Map::new();
+        if !scopes.is_empty() {
+            body.insert(
+                "scopes".to_string(),
+                Value::Array(scopes.into_iter().map(Value::String).collect()),
+            );
+        }
+        if let Some(client_name) = client_name.filter(|value| !value.trim().is_empty()) {
+            body.insert("client_name".to_string(), Value::String(client_name));
+        }
+        let grant = self
+            .request(
+                "POST",
+                "/v1/auth/device/authorize",
+                Some(Value::Object(body)),
+                None,
+                false,
+            )
+            .await?;
+        let grant = DeviceAuthorization::from_value(grant)?;
+        match prompt.as_ref() {
+            Some(prompt) => prompt(&grant),
+            None => println!(
+                "To sign in, visit {} and enter the code {}",
+                grant.verification_uri, grant.user_code
+            ),
+        }
+        if open_browser {
+            if let Some(uri) = grant.verification_uri_complete.as_deref() {
+                open_url_in_browser(uri);
+            }
+        }
+        let token = self
+            .poll_device_token(&grant.device_code, grant.poll_interval(), timeout)
+            .await?;
+        let access_token = token
+            .get("access_token")
+            .and_then(json_string)
+            .ok_or_else(|| {
+                ThalovantError::Api("token response did not include access_token".to_string())
+            })?;
+        self.access_token = Some(access_token);
+        Ok(token)
+    }
+
+    async fn poll_device_token(
+        &self,
+        device_code: &str,
+        interval: Duration,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let start = std::time::Instant::now();
+        self.poll_device_token_with(
+            device_code,
+            interval,
+            timeout,
+            tokio::time::sleep,
+            move || start.elapsed(),
+        )
+        .await
+    }
+
+    /// Poll the device token endpoint until approval or a terminal state.
+    ///
+    /// `sleep` and `elapsed` are injectable so tests can drive the loop
+    /// without real waiting.
+    async fn poll_device_token_with<SleepFut>(
+        &self,
+        device_code: &str,
+        interval: Duration,
+        timeout: Duration,
+        mut sleep: impl FnMut(Duration) -> SleepFut,
+        mut elapsed: impl FnMut() -> Duration,
+    ) -> Result<Value>
+    where
+        SleepFut: Future<Output = ()>,
+    {
+        let body = json!({ "device_code": device_code });
+        let mut wait = interval;
+        loop {
+            let (status, text) = self
+                .send_request(
+                    "POST",
+                    "/v1/auth/device/token",
+                    Some(body.clone()),
+                    None,
+                    false,
+                )
+                .await?;
+            if status.is_success() {
+                if text.trim().is_empty() {
+                    return Err(ThalovantError::Api(
+                        "device token response was empty".to_string(),
+                    ));
+                }
+                return serde_json::from_str::<Value>(&text).map_err(ThalovantError::from);
+            }
+            let parsed = serde_json::from_str::<Value>(&text).ok();
+            let error = (status == reqwest::StatusCode::BAD_REQUEST)
+                .then(|| {
+                    parsed
+                        .as_ref()
+                        .and_then(|value| value.get("error"))
+                        .and_then(Value::as_str)
+                })
+                .flatten();
+            match error {
+                Some("authorization_pending") => {}
+                Some("slow_down") => wait += Duration::from_secs(5),
+                Some("access_denied") => return Err(ThalovantError::DeviceAuthorizationDenied),
+                Some("expired_token") => return Err(ThalovantError::DeviceAuthorizationExpired),
+                _ => return Err(ThalovantError::Api(format!("HTTP {status}: {text}"))),
+            }
+            let remaining = timeout.saturating_sub(elapsed());
+            if remaining.is_zero() {
+                return Err(ThalovantError::Timeout(
+                    "timed out waiting for the device sign-in to be approved".to_string(),
+                ));
+            }
+            sleep(wait.min(remaining)).await;
+        }
     }
 
     pub async fn list_hubs(
@@ -509,6 +742,24 @@ impl ControlPlane {
         headers: Option<HeaderMap>,
         auth: bool,
     ) -> Result<Value> {
+        let (status, body) = self.send_request(method, path, body, headers, auth).await?;
+        if !status.is_success() {
+            return Err(ThalovantError::Api(format!("HTTP {status}: {body}")));
+        }
+        if body.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        serde_json::from_str::<Value>(&body).map_err(ThalovantError::from)
+    }
+
+    async fn send_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: Option<HeaderMap>,
+        auth: bool,
+    ) -> Result<(reqwest::StatusCode, String)> {
         let mut request_headers = HeaderMap::new();
         request_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         request_headers.insert(
@@ -549,18 +800,15 @@ impl ControlPlane {
             .await
             .map_err(|err| ThalovantError::Api(err.to_string()))?;
         let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(ThalovantError::Api(format!("HTTP {status}: {body}")));
-        }
-        let body = response
-            .text()
-            .await
-            .map_err(|err| ThalovantError::Api(err.to_string()))?;
-        if body.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_str::<Value>(&body).map_err(ThalovantError::from)
+        let body = if status.is_success() {
+            response
+                .text()
+                .await
+                .map_err(|err| ThalovantError::Api(err.to_string()))?
+        } else {
+            response.text().await.unwrap_or_default()
+        };
+        Ok((status, body))
     }
 }
 
@@ -627,6 +875,30 @@ impl BootstrapIdentityResult {
             "selected_protocol": self.selected_protocol(),
             "selected_endpoint": self.endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone()),
         })
+    }
+}
+
+fn required_device_field(raw: &Map<String, Value>, key: &str) -> Result<String> {
+    raw.get(key).and_then(json_string).ok_or_else(|| {
+        ThalovantError::Api(format!(
+            "device authorization response did not include {key}"
+        ))
+    })
+}
+
+/// Best-effort attempt to open `url` in the local browser. Failure to launch a
+/// browser is never fatal; the plain verification prompt already covers it.
+fn open_url_in_browser(url: &str) {
+    for command in ["xdg-open", "open"] {
+        let launched = std::process::Command::new(command)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if launched.is_ok() {
+            return;
+        }
     }
 }
 
@@ -824,6 +1096,287 @@ mod tests {
             .await
             .expect("login with MFA");
         assert_eq!(token["access_token"].as_str(), Some("token-1"));
+        server.join().expect("test server finished");
+    }
+
+    const DEVICE_GRANT_BODY: &str = r#"{"device_code":"device-code-1","user_code":"WDJB-MJHT","verification_uri":"https://dash.thalovant.com/activate","verification_uri_complete":"https://dash.thalovant.com/activate?user_code=WDJB-MJHT","expires_in":900,"interval":0}"#;
+    const DEVICE_TOKEN_BODY: &str = r#"{"access_token":"device-token","token_type":"bearer","scopes":["hubs:read","clients:write"],"expires_at":"2027-08-13T00:00:00Z","token_id":"token-1"}"#;
+
+    fn write_json_response(stream: &mut std::net::TcpStream, status: &str, body: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
+    }
+
+    /// Serves one device-authorize grant, then the scripted `(status, body)`
+    /// responses for each `/v1/auth/device/token` poll.
+    fn spawn_device_flow_server(
+        listener: TcpListener,
+        token_responses: Vec<(&'static str, &'static str)>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            for turn in 0..=token_responses.len() {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0_u8; 8192];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(
+                    !request.to_ascii_lowercase().contains("\r\nauthorization:"),
+                    "device flow requests must not send Authorization: {request}"
+                );
+                if turn == 0 {
+                    assert!(
+                        request.starts_with("POST /v1/auth/device/authorize "),
+                        "unexpected request: {request}"
+                    );
+                    write_json_response(&mut stream, "200 OK", DEVICE_GRANT_BODY);
+                } else {
+                    assert!(
+                        request.starts_with("POST /v1/auth/device/token "),
+                        "unexpected request: {request}"
+                    );
+                    assert!(
+                        request.contains(r#""device_code":"device-code-1""#),
+                        "missing device_code: {request}"
+                    );
+                    let (status, body) = token_responses[turn - 1];
+                    write_json_response(&mut stream, status, body);
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn login_with_browser_polls_until_token_and_stores_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            for turn in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0_u8; 8192];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(
+                    !request.to_ascii_lowercase().contains("\r\nauthorization:"),
+                    "device flow requests must not send Authorization: {request}"
+                );
+                if turn == 0 {
+                    assert!(
+                        request.starts_with("POST /v1/auth/device/authorize "),
+                        "unexpected request: {request}"
+                    );
+                    assert!(
+                        request.contains(r#""scopes":["hubs:read"]"#),
+                        "missing scopes: {request}"
+                    );
+                    assert!(
+                        request.contains(r#""client_name":"rust-test""#),
+                        "missing client_name: {request}"
+                    );
+                    write_json_response(&mut stream, "200 OK", DEVICE_GRANT_BODY);
+                } else if turn < 3 {
+                    assert!(
+                        request.starts_with("POST /v1/auth/device/token "),
+                        "unexpected request: {request}"
+                    );
+                    write_json_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        r#"{"error":"authorization_pending"}"#,
+                    );
+                } else {
+                    write_json_response(&mut stream, "200 OK", DEVICE_TOKEN_BODY);
+                }
+            }
+        });
+
+        let mut control = ControlPlane::new(format!("http://{address}"), None);
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = prompts.clone();
+        let token = control
+            .login_with_browser(DeviceLoginOptions {
+                scopes: vec!["hubs:read".to_string()],
+                client_name: Some("rust-test".to_string()),
+                open_browser: false,
+                prompt: Some(Box::new(move |grant: &DeviceAuthorization| {
+                    captured.lock().expect("record prompt").push(grant.clone());
+                })),
+                ..Default::default()
+            })
+            .await
+            .expect("device login");
+
+        assert_eq!(token["access_token"].as_str(), Some("device-token"));
+        assert_eq!(token["token_id"].as_str(), Some("token-1"));
+        assert_eq!(control.access_token.as_deref(), Some("device-token"));
+        let prompts = prompts.lock().expect("read prompts");
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].user_code, "WDJB-MJHT");
+        assert_eq!(
+            prompts[0].verification_uri,
+            "https://dash.thalovant.com/activate"
+        );
+        assert_eq!(
+            prompts[0].verification_uri_complete.as_deref(),
+            Some("https://dash.thalovant.com/activate?user_code=WDJB-MJHT")
+        );
+        assert_eq!(prompts[0].raw["expires_in"].as_u64(), Some(900));
+        server.join().expect("test server finished");
+    }
+
+    #[tokio::test]
+    async fn device_poll_slow_down_grows_interval() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            let responses = [
+                ("400 Bad Request", r#"{"error":"authorization_pending"}"#),
+                ("400 Bad Request", r#"{"error":"slow_down"}"#),
+                ("400 Bad Request", r#"{"error":"authorization_pending"}"#),
+                ("200 OK", DEVICE_TOKEN_BODY),
+            ];
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0_u8; 8192];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(
+                    request.starts_with("POST /v1/auth/device/token "),
+                    "unexpected request: {request}"
+                );
+                write_json_response(&mut stream, status, body);
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), None);
+        let sleeps = std::sync::Mutex::new(Vec::new());
+        let token = control
+            .poll_device_token_with(
+                "device-code-1",
+                Duration::from_secs(5),
+                Duration::from_secs(900),
+                |wait| {
+                    sleeps.lock().expect("record sleep").push(wait);
+                    std::future::ready(())
+                },
+                || Duration::ZERO,
+            )
+            .await
+            .expect("device token");
+
+        assert_eq!(token["access_token"].as_str(), Some("device-token"));
+        assert_eq!(
+            *sleeps.lock().expect("read sleeps"),
+            vec![
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            ]
+        );
+        server.join().expect("test server finished");
+    }
+
+    #[tokio::test]
+    async fn login_with_browser_fails_on_access_denied() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = spawn_device_flow_server(
+            listener,
+            vec![("400 Bad Request", r#"{"error":"access_denied"}"#)],
+        );
+
+        let mut control = ControlPlane::new(format!("http://{address}"), None);
+        let error = control
+            .login_with_browser(DeviceLoginOptions {
+                open_browser: false,
+                prompt: Some(Box::new(|_| {})),
+                ..Default::default()
+            })
+            .await
+            .expect_err("denied sign-in must fail");
+
+        assert!(
+            matches!(error, ThalovantError::DeviceAuthorizationDenied),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(control.access_token, None);
+        server.join().expect("test server finished");
+    }
+
+    #[tokio::test]
+    async fn login_with_browser_fails_on_expired_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = spawn_device_flow_server(
+            listener,
+            vec![("400 Bad Request", r#"{"error":"expired_token"}"#)],
+        );
+
+        let mut control = ControlPlane::new(format!("http://{address}"), None);
+        let error = control
+            .login_with_browser(DeviceLoginOptions {
+                open_browser: false,
+                prompt: Some(Box::new(|_| {})),
+                ..Default::default()
+            })
+            .await
+            .expect_err("expired sign-in must fail");
+
+        assert!(
+            matches!(error, ThalovantError::DeviceAuthorizationExpired),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(control.access_token, None);
+        server.join().expect("test server finished");
+    }
+
+    #[tokio::test]
+    async fn device_poll_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0_u8; 8192];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                assert!(
+                    request.starts_with("POST /v1/auth/device/token "),
+                    "unexpected request: {request}"
+                );
+                write_json_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    r#"{"error":"authorization_pending"}"#,
+                );
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), None);
+        let now = std::cell::Cell::new(Duration::ZERO);
+        let error = control
+            .poll_device_token_with(
+                "device-code-1",
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+                |wait| {
+                    now.set(now.get() + wait);
+                    std::future::ready(())
+                },
+                || now.get(),
+            )
+            .await
+            .expect_err("poll must time out");
+
+        assert!(
+            matches!(error, ThalovantError::Timeout(_)),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(now.get(), Duration::from_secs(10));
         server.join().expect("test server finished");
     }
 
