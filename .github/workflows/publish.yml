@@ -107,9 +107,16 @@ jobs:
           mv "thalovant-$PACKAGE_VERSION.cdx.json" target/release-artifacts/
 
           sbom="target/release-artifacts/thalovant-$PACKAGE_VERSION.cdx.json"
+          # cargo-cyclonedx omits serialNumber, but the attest action requires it
+          # to recognize CycloneDX JSON. Derive one from the crate digest so the
+          # SBOM stays deterministic for a given release artifact.
+          serial="$(sha256sum "$crate" | cut -c1-32 | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/')"
+          jq --arg serial "urn:uuid:$serial" '.serialNumber = $serial' "$sbom" > "$sbom.tmp"
+          mv "$sbom.tmp" "$sbom"
           jq -e --arg version "$PACKAGE_VERSION" '
             .bomFormat == "CycloneDX" and
             .specVersion == "1.5" and
+            (.serialNumber | startswith("urn:uuid:")) and
             .metadata.component.name == "thalovant" and
             .metadata.component.version == $version
           ' "$sbom"
