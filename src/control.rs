@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
 pub const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.20";
+const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.21";
 const DEFAULT_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
