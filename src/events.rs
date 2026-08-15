@@ -1,12 +1,17 @@
 use crate::constants::{is_failure_event, EVENT_RECOGNIZER_LOOP_UTTERANCE};
+use crate::redact::{redact_map, redact_value};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::fmt;
 use uuid::Uuid;
 
 pub type Context = Map<String, Value>;
 pub type Data = Map<String, Value>;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+// `Debug` is hand-written (below) to redact secret keys (e.g. `auth_token`,
+// `auth.token`) carried in `data`/`context`/`raw`; `Serialize`/`Deserialize`
+// stay derived so the wire protocol keeps round-tripping real values.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub name: String,
     #[serde(default)]
@@ -17,7 +22,9 @@ pub struct Event {
     pub raw: Option<Value>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+// `Debug` is hand-written (below); a `Reply` nests `Event`s whose contexts carry
+// the end-user bearer token, so `{:?}` must route through `Event`'s redaction.
+#[derive(Clone, PartialEq)]
 pub struct Reply {
     pub text: String,
     pub utterances: Vec<String>,
@@ -76,6 +83,35 @@ impl Event {
 
     pub fn is_failure(&self) -> bool {
         is_failure_event(&self.name)
+    }
+}
+
+impl fmt::Debug for Event {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Event")
+            .field("name", &self.name)
+            .field("data", &redact_map(&self.data))
+            .field("context", &redact_map(&self.context))
+            .field("raw", &self.raw.as_ref().map(redact_value))
+            .finish()
+    }
+}
+
+impl fmt::Debug for Reply {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Reply")
+            .field("text", &self.text)
+            .field("utterances", &self.utterances)
+            .field("handled", &self.handled)
+            .field("ok", &self.ok)
+            .field("session_id", &self.session_id)
+            .field("request_id", &self.request_id)
+            // `events`/`failure_event` route through `Event`'s redacting Debug.
+            .field("events", &self.events)
+            .field("failure_event", &self.failure_event)
+            .finish()
     }
 }
 
@@ -244,5 +280,56 @@ mod tests {
         assert_eq!(event.session_id().as_deref(), Some("session-1"));
         assert_eq!(event.request_id().as_deref(), Some("request-1"));
         assert!(event_matches_context(&event, Some(&context)));
+    }
+
+    #[test]
+    fn event_and_reply_debug_redact_bearer_token_but_event_serialize_roundtrips() {
+        // The bearer token is duplicated by `build_client_context` into both
+        // `context.auth.token` and top-level `context.auth_token`.
+        let mut auth = Map::new();
+        auth.insert(
+            "token".to_string(),
+            Value::String("bearer-LIVE-SECRET".to_string()),
+        );
+        let mut context = Context::new();
+        context.insert("auth".to_string(), Value::Object(auth));
+        context.insert(
+            "auth_token".to_string(),
+            Value::String("bearer-LIVE-SECRET".to_string()),
+        );
+        let raw = serde_json::json!({"context": {"auth_token": "bearer-LIVE-SECRET"}});
+        let event = Event::new("recognizer_loop:utterance", Data::new(), context, Some(raw));
+
+        let debug = format!("{event:?}");
+        assert!(
+            !debug.contains("bearer-LIVE-SECRET"),
+            "Event Debug leaked token: {debug}"
+        );
+        assert!(debug.contains("<redacted>"));
+
+        // Serialize/Deserialize is the wire protocol and MUST keep the real token.
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(serialized["context"]["auth_token"], "bearer-LIVE-SECRET");
+        assert_eq!(serialized["context"]["auth"]["token"], "bearer-LIVE-SECRET");
+        let restored: Event = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, event);
+
+        // `{:?}` on a Reply is a central use case; it must redact too.
+        let reply = Reply {
+            text: "hello".to_string(),
+            utterances: vec!["hello".to_string()],
+            handled: true,
+            ok: true,
+            session_id: None,
+            request_id: None,
+            events: vec![event.clone()],
+            failure_event: Some(event),
+        };
+        let reply_debug = format!("{reply:?}");
+        assert!(
+            !reply_debug.contains("bearer-LIVE-SECRET"),
+            "Reply Debug leaked token: {reply_debug}"
+        );
+        assert!(reply_debug.contains("<redacted>"));
     }
 }

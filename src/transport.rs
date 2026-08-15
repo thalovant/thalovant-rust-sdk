@@ -271,7 +271,9 @@ impl HttpTransport {
             .post(self.endpoint("/connect"))
             .send()
             .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()));
+            // `endpoint(..)` carries the access key in a `?authorization=`
+            // query; strip the URL so it never reaches `last_error`.
+            .map_err(|err| ThalovantError::Connection(err.without_url().to_string()));
         let response = match response {
             Ok(response) => response,
             Err(error) => {
@@ -377,7 +379,8 @@ impl HttpTransport {
             .get(self.endpoint("/get_messages"))
             .send()
             .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()))?;
+            // Strip the `?authorization=` URL before it reaches `last_error`.
+            .map_err(|err| ThalovantError::Connection(err.without_url().to_string()))?;
         let body: PollResponse = response.json().await?;
         if let Some(error) = body.error.filter(|value| !value.is_empty()) {
             return Err(ThalovantError::Runtime(error));
@@ -516,7 +519,8 @@ impl HttpTransport {
             .form(&[("message", payload)])
             .send()
             .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()))?;
+            // Strip the `?authorization=` URL before it reaches `last_error`.
+            .map_err(|err| ThalovantError::Connection(err.without_url().to_string()))?;
         if !response.status().is_success() {
             return Err(ThalovantError::Connection(format!(
                 "HiveMind HTTP send status {}",
@@ -1534,6 +1538,35 @@ mod tests {
             default_mqtt_tls_transport(),
             Transport::Tls(TlsConfiguration::Native)
         ));
+    }
+
+    #[tokio::test]
+    async fn http_transport_last_error_omits_authorization_url() {
+        // `default_master` points at a closed port; the data-plane request URL is
+        // `http://127.0.0.1:1/connect?authorization=<base64(user_agent:access_key)>`.
+        let identity = Identity::from_value(serde_json::json!({
+            "access_key": "access",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "http://127.0.0.1:1"
+        }))
+        .unwrap();
+        let transport = HttpTransport::new(identity);
+        assert!(transport.connect().await.is_err());
+
+        let last_error = transport
+            .healthcheck()
+            .await
+            .last_error
+            .expect("a failed connect must record last_error");
+        assert!(
+            !last_error.contains("authorization"),
+            "last_error leaked the authorization query: {last_error}"
+        );
+        assert!(
+            !last_error.contains("127.0.0.1"),
+            "last_error leaked the request URL: {last_error}"
+        );
     }
 
     #[test]

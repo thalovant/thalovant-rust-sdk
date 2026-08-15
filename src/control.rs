@@ -78,11 +78,29 @@ pub struct BootstrapIdentityOptions {
     pub idempotency_key: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+// `Debug` is hand-written (below) to redact the MFA `otp_code`/`recovery_code`.
+#[derive(Clone, Default)]
 pub struct LoginOptions {
     pub scope: Option<String>,
     pub otp_code: Option<String>,
     pub recovery_code: Option<String>,
+}
+
+impl fmt::Debug for LoginOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoginOptions")
+            .field("scope", &self.scope)
+            .field(
+                "otp_code",
+                &self.otp_code.as_ref().map(|_| crate::redact::REDACTED),
+            )
+            .field(
+                "recovery_code",
+                &self.recovery_code.as_ref().map(|_| crate::redact::REDACTED),
+            )
+            .finish()
+    }
 }
 
 /// A pending device authorization grant returned by
@@ -91,7 +109,9 @@ pub struct LoginOptions {
 /// The user completes the sign-in by visiting `verification_uri` and entering
 /// `user_code` (or by opening `verification_uri_complete`, which has the code
 /// pre-filled). `raw` keeps the full response payload for custom prompts.
-#[derive(Clone, Debug)]
+// `Debug` is hand-written (below) to redact `device_code` (a bearer-grade
+// secret) and any secret keys the raw response body carries.
+#[derive(Clone)]
 pub struct DeviceAuthorization {
     pub device_code: String,
     pub user_code: String,
@@ -100,6 +120,21 @@ pub struct DeviceAuthorization {
     pub expires_in: Option<u64>,
     pub interval: Option<u64>,
     pub raw: Map<String, Value>,
+}
+
+impl fmt::Debug for DeviceAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceAuthorization")
+            .field("device_code", &crate::redact::REDACTED)
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("verification_uri_complete", &self.verification_uri_complete)
+            .field("expires_in", &self.expires_in)
+            .field("interval", &self.interval)
+            .field("raw", &crate::redact::redact_map(&self.raw))
+            .finish()
+    }
 }
 
 impl DeviceAuthorization {
@@ -171,7 +206,6 @@ impl fmt::Debug for DeviceLoginOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct AnalyticsOverviewOptions {
-    pub admin: bool,
     pub range: Option<String>,
     pub bucket: Option<String>,
     pub owner_id: Option<String>,
@@ -253,12 +287,28 @@ impl Default for SkillInstallOptions {
     }
 }
 
-#[derive(Clone, Debug)]
+// `Debug` is hand-written (below) to redact the client credentials carried by
+// the `identity`, `hub`, and `client` fields (`client` holds the raw
+// `POST /v1/clients` body with apiKey/password/cryptoKey).
+#[derive(Clone)]
 pub struct BootstrapIdentityResult {
     pub identity: Identity,
     pub hub: Value,
     pub client: Value,
     pub endpoint: Option<SelectedHubEndpoint>,
+}
+
+impl fmt::Debug for BootstrapIdentityResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapIdentityResult")
+            // Identity has its own redacting Debug.
+            .field("identity", &self.identity)
+            .field("hub", &crate::redact::redact_value(&self.hub))
+            .field("client", &crate::redact::redact_value(&self.client))
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
 }
 
 impl ControlPlane {
@@ -466,7 +516,12 @@ impl ControlPlane {
                 Some("slow_down") => wait += Duration::from_secs(5),
                 Some("access_denied") => return Err(ThalovantError::DeviceAuthorizationDenied),
                 Some("expired_token") => return Err(ThalovantError::DeviceAuthorizationExpired),
-                _ => return Err(ThalovantError::Api(format!("HTTP {status}: {text}"))),
+                _ => {
+                    return Err(ThalovantError::Api(format!(
+                        "HTTP {status}: {}",
+                        server_error_detail(&text)
+                    )))
+                }
             }
             let remaining = timeout.saturating_sub(elapsed());
             if remaining.is_zero() {
@@ -612,17 +667,12 @@ impl ControlPlane {
     }
 
     pub async fn get_analytics_overview(&self, opts: AnalyticsOverviewOptions) -> Result<Value> {
-        let endpoint = if opts.admin {
-            "/v1/admin/analytics/overview"
-        } else {
-            "/v1/analytics/overview"
-        };
         let mut params = Vec::new();
         push_query_param(&mut params, "range", opts.range.as_deref());
         push_query_param(&mut params, "bucket", opts.bucket.as_deref());
-        if opts.admin {
-            push_query_param(&mut params, "owner_id", opts.owner_id.as_deref());
-        }
+        // `owner_id` is honored only for admin tokens; the API silently scopes a
+        // non-admin caller to their own tenant, so it is always safe to send.
+        push_query_param(&mut params, "owner_id", opts.owner_id.as_deref());
         push_query_param(&mut params, "hub_id", opts.hub_id.as_deref());
         push_query_param(&mut params, "client_id", opts.client_id.as_deref());
         push_query_param(&mut params, "country", opts.country.as_deref());
@@ -638,9 +688,9 @@ impl ControlPlane {
             params.push(format!("hour={hour}"));
         }
         let path = if params.is_empty() {
-            endpoint.to_string()
+            "/v1/analytics/overview".to_string()
         } else {
-            format!("{}?{}", endpoint, params.join("&"))
+            format!("/v1/analytics/overview?{}", params.join("&"))
         };
         self.request("GET", &path, None, None, true).await
     }
@@ -1278,7 +1328,10 @@ impl ControlPlane {
     ) -> Result<Value> {
         let (status, body) = self.send_request(method, path, body, headers, auth).await?;
         if !status.is_success() {
-            return Err(ThalovantError::Api(format!("HTTP {status}: {body}")));
+            return Err(ThalovantError::Api(format!(
+                "HTTP {status}: {}",
+                server_error_detail(&body)
+            )));
         }
         if body.trim().is_empty() {
             return Ok(Value::Null);
@@ -1402,10 +1455,21 @@ impl BootstrapIdentityResult {
         if let Some(mqtt) = self.identity.mqtt.as_ref() {
             identity.insert("mqtt".to_string(), mqtt.as_value(include_secrets));
         }
+        // The hub and (especially) client resources carry the credentials minted
+        // by `POST /v1/clients` (apiKey/password/cryptoKey). Gate their secret
+        // subkeys behind `include_secrets`, exactly like the identity block above.
+        let (hub, client) = if include_secrets {
+            (self.hub.clone(), self.client.clone())
+        } else {
+            (
+                crate::redact::redact_value(&self.hub),
+                crate::redact::redact_value(&self.client),
+            )
+        };
         json!({
             "identity": identity,
-            "hub": self.hub,
-            "client": self.client,
+            "hub": hub,
+            "client": client,
             "selected_protocol": self.selected_protocol(),
             "selected_endpoint": self.endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone()),
         })
@@ -1551,6 +1615,27 @@ fn json_string(value: &Value) -> Option<String> {
         }
         Value::Null => None,
         other => Some(other.to_string().trim_matches('"').to_string()),
+    }
+}
+
+/// Reduce a raw HTTP response body to a short detail that is safe to embed in an
+/// error message. When the body is JSON its secret-keyed fields are redacted
+/// (the `POST /v1/clients`, `/v1/auth/token`, and `/v1/auth/device/token` routes
+/// are *sent* credentials that an error response may echo); whitespace is then
+/// collapsed and the result is length-bounded so a large or multi-line body
+/// never lands verbatim in `last_error`, logs, or a bug report.
+fn server_error_detail(body: &str) -> String {
+    let rendered = match serde_json::from_str::<Value>(body) {
+        Ok(value) => crate::redact::redact_value(&value).to_string(),
+        Err(_) => body.to_string(),
+    };
+    let collapsed = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_DETAIL: usize = 200;
+    if collapsed.chars().count() > MAX_DETAIL {
+        let truncated: String = collapsed.chars().take(MAX_DETAIL).collect();
+        format!("{truncated}...")
+    } else {
+        collapsed
     }
 }
 
@@ -2178,7 +2263,7 @@ mod tests {
             let size = stream.read(&mut buffer).expect("read request");
             let request = String::from_utf8_lossy(&buffer[..size]);
             assert!(
-                request.starts_with("GET /v1/admin/analytics/overview?"),
+                request.starts_with("GET /v1/analytics/overview?"),
                 "unexpected request: {request}"
             );
             assert!(
@@ -2203,7 +2288,7 @@ mod tests {
             ] {
                 assert!(request.contains(fragment), "missing {fragment}: {request}");
             }
-            let body = r#"{"meta":{"scope":"admin"},"totals":{"utterances":7}}"#;
+            let body = r#"{"meta":{"scope":"tenant"},"totals":{"utterances":7}}"#;
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -2216,7 +2301,6 @@ mod tests {
         let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
         let overview = control
             .get_analytics_overview(AnalyticsOverviewOptions {
-                admin: true,
                 range: Some("30d".to_string()),
                 bucket: Some("1d".to_string()),
                 owner_id: Some("owner-1".to_string()),
@@ -2234,7 +2318,7 @@ mod tests {
             .await
             .expect("analytics overview");
 
-        assert_eq!(overview["meta"]["scope"].as_str(), Some("admin"));
+        assert_eq!(overview["meta"]["scope"].as_str(), Some("tenant"));
         assert_eq!(overview["totals"]["utterances"].as_i64(), Some(7));
         server.join().expect("test server finished");
     }
@@ -2822,5 +2906,112 @@ mod tests {
                 "expected HTTP {status} and {detail:?}: {message}"
             );
         }
+    }
+
+    fn bootstrap_result_with_secrets() -> BootstrapIdentityResult {
+        let identity = Identity::from_value(json!({
+            "access_key": "ak-LIVE",
+            "password": "pw-LIVE",
+            "site_id": "site",
+            "default_master": "https://hub.example.com"
+        }))
+        .unwrap();
+        BootstrapIdentityResult {
+            identity,
+            hub: json!({"id": "hub-1", "spec": {"broker_password": "hub-LIVE-SECRET"}}),
+            client: json!({
+                "id": "client-1",
+                "spec": {"apiKey": "api-LIVE", "password": "cpw-LIVE", "cryptoKey": "ck-LIVE"}
+            }),
+            endpoint: None,
+        }
+    }
+
+    #[test]
+    fn bootstrap_summary_redacts_hub_and_client_secrets_unless_requested() {
+        let result = bootstrap_result_with_secrets();
+
+        // Non-secret view keeps structure but redacts every credential subkey.
+        let public = result.as_value(false);
+        assert_eq!(public["client"]["id"], "client-1");
+        assert_eq!(public["client"]["spec"]["apiKey"], "<redacted>");
+        assert_eq!(public["client"]["spec"]["password"], "<redacted>");
+        assert_eq!(public["client"]["spec"]["cryptoKey"], "<redacted>");
+        assert_eq!(public["hub"]["spec"]["broker_password"], "<redacted>");
+
+        // Explicit secret view keeps the real values (persistence path).
+        let full = result.as_value(true);
+        assert_eq!(full["client"]["spec"]["apiKey"], "api-LIVE");
+        assert_eq!(full["client"]["spec"]["password"], "cpw-LIVE");
+        assert_eq!(full["client"]["spec"]["cryptoKey"], "ck-LIVE");
+        assert_eq!(full["hub"]["spec"]["broker_password"], "hub-LIVE-SECRET");
+    }
+
+    #[test]
+    fn bootstrap_result_debug_never_leaks_client_credentials() {
+        let debug = format!("{:?}", bootstrap_result_with_secrets());
+        for secret in [
+            "ak-LIVE",
+            "pw-LIVE",
+            "api-LIVE",
+            "cpw-LIVE",
+            "ck-LIVE",
+            "hub-LIVE-SECRET",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn login_options_debug_redacts_mfa_codes() {
+        let opts = LoginOptions {
+            scope: Some("hubs:read".to_string()),
+            otp_code: Some("123456".to_string()),
+            recovery_code: Some("recovery-LIVE-SECRET".to_string()),
+        };
+        let debug = format!("{opts:?}");
+        assert!(debug.contains("hubs:read"));
+        assert!(!debug.contains("123456"), "Debug leaked otp: {debug}");
+        assert!(
+            !debug.contains("recovery-LIVE-SECRET"),
+            "Debug leaked recovery: {debug}"
+        );
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn device_authorization_debug_redacts_device_code_and_raw() {
+        let auth = DeviceAuthorization::from_value(json!({
+            "device_code": "dc-LIVE-SECRET",
+            "user_code": "WDJB-MJHT",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 5
+        }))
+        .unwrap();
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("dc-LIVE-SECRET"), "Debug leaked code: {debug}");
+        // The user code is meant to be shown to the end user.
+        assert!(debug.contains("WDJB-MJHT"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn server_error_detail_redacts_secret_keys_and_bounds_length() {
+        // Secret keys an error body might echo are redacted; other detail stays.
+        let redacted =
+            server_error_detail(r#"{"detail":"bad request","password":"pw-LIVE-SECRET"}"#);
+        assert!(redacted.contains("bad request"));
+        assert!(
+            !redacted.contains("pw-LIVE-SECRET"),
+            "detail leaked secret: {redacted}"
+        );
+
+        // Multi-line / oversized bodies are collapsed to one bounded line.
+        let big = format!("line-one\nline-two\n{}", "x".repeat(500));
+        let bounded = server_error_detail(&big);
+        assert!(!bounded.contains('\n'), "detail kept newlines: {bounded}");
+        assert!(bounded.chars().count() <= 203, "detail not bounded: {bounded}");
     }
 }
