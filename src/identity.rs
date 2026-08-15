@@ -115,7 +115,10 @@ impl fmt::Debug for MqttBrokerCredentials {
             // own Debug redacts; keep them consistent so `{:?}` never exposes it.
             .field("username", &crate::redact::REDACTED)
             .field("password", &crate::redact::REDACTED)
-            .field("topic_prefix", &self.topic_prefix)
+            // Since the MQTT migration `topic_prefix` is
+            // `hivemind/<hub-id>/<access-key>`, which embeds the access key too;
+            // redact it so `{:?}` never exposes it.
+            .field("topic_prefix", &crate::redact::REDACTED)
             .field("qos", &self.qos)
             .field("tls", &self.tls)
             .finish()
@@ -955,6 +958,44 @@ profiles:
         assert_eq!(
             serde_json::to_value(&mqtt).unwrap()["password"],
             "broker-LIVE-SECRET"
+        );
+    }
+
+    #[test]
+    fn mqtt_credentials_debug_redacts_topic_prefix_access_key() {
+        // Since the MQTT migration `topic_prefix` is `hivemind/<hub-id>/<access-key>`,
+        // so it embeds the account access key; `{:?}` must not leak it.
+        let mqtt = Identity::from_value(json!({
+            "access_key": "ACCESS-LIVE-SECRET",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "https://hub.example.com",
+            "mqtt": {
+                "endpoint": "mqtts://mqtt.example.com:8883",
+                "username": "ACCESS-LIVE-SECRET",
+                "password": "broker-secret",
+                "topic_prefix": "hivemind/hub-1/ACCESS-LIVE-SECRET"
+            }
+        }))
+        .unwrap()
+        .mqtt
+        .expect("mqtt credentials");
+
+        let debug = format!("{mqtt:?}");
+        assert!(
+            !debug.contains("ACCESS-LIVE-SECRET"),
+            "Debug leaked the access key via topic_prefix: {debug}"
+        );
+        assert!(
+            !debug.contains("hivemind/hub-1"),
+            "Debug leaked the raw topic_prefix: {debug}"
+        );
+        assert!(debug.contains("<redacted>"));
+
+        // Serialize must keep the real topic_prefix (persistence/wire).
+        assert_eq!(
+            serde_json::to_value(&mqtt).unwrap()["topic_prefix"],
+            "hivemind/hub-1/ACCESS-LIVE-SECRET"
         );
     }
 

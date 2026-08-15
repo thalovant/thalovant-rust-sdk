@@ -1351,11 +1351,23 @@ pub fn mqtt_topics_for_identity(identity: &Identity) -> Result<MqttTopicSet> {
     let base = credentials
         .topic_prefix
         .as_deref()
-        .map(|value| value.trim_matches('/'))
+        .map(|value| value.trim().trim_matches('/').trim())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             ThalovantError::Connection("MQTT credentials must include topic_prefix.".to_string())
         })?;
+    // Reject MQTT wildcards (`#`/`+`) and ASCII control chars (`< 0x20`, incl.
+    // NUL) so a malformed prefix can't smuggle a wildcard subscription or a
+    // control byte into the derived topic paths.
+    if base
+        .chars()
+        .any(|character| matches!(character, '#' | '+') || (character as u32) < 0x20)
+    {
+        return Err(ThalovantError::Connection(
+            "MQTT topic_prefix contains characters that are not valid in an MQTT topic."
+                .to_string(),
+        ));
+    }
     Ok(MqttTopicSet {
         inbound: format!("{base}/in"),
         outbound: format!("{base}/out"),
@@ -1442,6 +1454,73 @@ mod tests {
             topic_prefix: Some("hivemind/hub".to_string()),
             qos: 1,
             tls,
+        }
+    }
+
+    fn identity_with_topic_prefix(topic_prefix: &str) -> Identity {
+        Identity::from_value(serde_json::json!({
+            "access_key": "access",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "https://hub.example.com",
+            "mqtt": {
+                "endpoint": "mqtts://mqtt.example.com:8883",
+                "username": "access",
+                "password": "broker-password",
+                "topic_prefix": topic_prefix
+            }
+        }))
+        .expect("identity builds")
+    }
+
+    #[test]
+    fn mqtt_topics_trim_surrounding_whitespace_and_slashes() {
+        // Whitespace hugging the slashes must be trimmed, not baked into the
+        // derived topics.
+        let identity = identity_with_topic_prefix("/ hivemind/hub /");
+        let topics = mqtt_topics_for_identity(&identity).expect("valid prefix");
+
+        assert_eq!(topics.inbound, "hivemind/hub/in");
+        assert_eq!(topics.outbound, "hivemind/hub/out");
+        assert_eq!(topics.status, "hivemind/hub/status");
+    }
+
+    #[test]
+    fn mqtt_topics_reject_whitespace_only_prefix() {
+        // `"/ \t/"` survives the identity parser's outer trim (it is slash-bounded)
+        // but is empty once slashes and inner whitespace are stripped.
+        let identity = identity_with_topic_prefix("/ \t/");
+        let message = mqtt_topics_for_identity(&identity).unwrap_err().to_string();
+
+        assert!(
+            message.contains("must include topic_prefix"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn mqtt_topics_reject_wildcard_prefix() {
+        for prefix in ["hivemind/hub/#", "hivemind/+/hub"] {
+            let identity = identity_with_topic_prefix(prefix);
+            let message = mqtt_topics_for_identity(&identity).unwrap_err().to_string();
+
+            assert!(
+                message.contains("not valid in an MQTT topic"),
+                "prefix {prefix:?} should be rejected, got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn mqtt_topics_reject_control_char_prefix() {
+        for prefix in ["hivemind/hub/\u{0}", "hivemind/\u{1}hub"] {
+            let identity = identity_with_topic_prefix(prefix);
+            let message = mqtt_topics_for_identity(&identity).unwrap_err().to_string();
+
+            assert!(
+                message.contains("not valid in an MQTT topic"),
+                "prefix {prefix:?} should be rejected, got: {message}"
+            );
         }
     }
 
