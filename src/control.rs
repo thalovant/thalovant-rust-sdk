@@ -2445,9 +2445,11 @@ mod tests {
                 || request.starts_with("GET /v1/runtime-groups?")
             {
                 ("200 OK", r#"{"data":[{"id":"rg-1","name":"kiosks"}]}"#)
-            } else if request.starts_with("GET /v1/runtime-groups/rg-1/config ") {
-                ("200 OK", RUNTIME_GROUP_CONFIG_BODY)
-            } else if request.starts_with("PATCH /v1/runtime-groups/rg-1/config ") {
+            } else if request.starts_with("GET /v1/runtime-groups/rg-1/config ")
+                || request.starts_with("PATCH /v1/runtime-groups/rg-1/config ")
+            {
+                // Both config routes answer with the same document; the test
+                // asserts the verb and body from the recorded request instead.
                 ("200 OK", RUNTIME_GROUP_CONFIG_BODY)
             } else if request.starts_with("POST /v1/runtime-groups/rg-1/release ") {
                 ("200 OK", RUNTIME_GROUP_BODY)
