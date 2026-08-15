@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.22
+
+- Add the hub-provisioning surface: `create_hub`, `update_hub`, `delete_hub`, `release_hub`, `set_hub_rating`, `clear_hub_rating`, and `get_hub_runtime_capabilities`. `create_hub` sends a generated `Idempotency-Key` unless the caller supplies one. `update_hub` and `delete_hub` take `etag` as a **required** argument, not an option, because the API enforces optimistic locking on both routes and rejects a stale *or missing* `If-Match` with HTTP 412; the etag is read from the hub resource's `etag` body field, as the API emits no `ETag` response header.
+- Add runtime-group management: `list_runtime_groups`, `get_runtime_group`, `create_runtime_group`, `update_runtime_group`, `get_runtime_group_config`, `update_runtime_group_config`, `release_runtime_group`, and `delete_runtime_group`. These routes read no `If-Match` and no idempotency header, so concurrent writes are last-write-wins. `update_runtime_group_config` merges rather than replaces, and sends `personas` only when it is `Some(..)`.
+- Add skill discovery and installation: `list_marketplace_skills`, `list_runtime_group_marketplace`, `list_runtime_group_inventory`, `install_runtime_group_skill`, and `uninstall_runtime_group_skill`.
+- New public types `ReleaseOptions`, `MarketplaceSkillsOptions`, `SkillInstallOptions`, and constant `DEFAULT_SKILL_SOURCE_TYPE`. No existing signature changed and no `ThalovantError` variant was added: HTTP failures on these routes keep the crate's existing mapping to `ThalovantError::Api` carrying the status and response body.
+- Scope and plan notes now documented on each method: the provisioning writes require a paid plan and `hubs:write` (HTTP 402 on the free plan, HTTP 403 without the scope); the rating routes require `hubs:write` but are **not** paid-gated; `list_marketplace_skills` needs only `hubs:read` and is not paid-gated, with `owner_id` and `include_inactive` silently ignored for non-admin callers; and `get_hub_runtime_capabilities`, `list_runtime_group_marketplace`, and `list_runtime_group_inventory` require `hubs:inspect`. Only `get_hub_runtime_capabilities` answers HTTP 409 when no client is connected — the two runtime-group reads return an empty `data` list with a pending `source` of `ovos-runtime-operator-pending`.
+- Derive both user-agent constants from `CARGO_PKG_VERSION` instead of repeating the version literal, so a release bump can no longer leave them stale.
+
 ## 0.2.21
 
 - Document the two HTTP 429 responses the control plane returns for token-authenticated calls: `token_rate_limited` (the plan's per-minute request rate, 60 requests per minute on the free plan) and `token_quota_exceeded` (the plan's daily or monthly call quota, reported in `quota`, `limit`, and `used`). Both carry a `Retry-After` header and a matching `retry_after_seconds`, both surface as `ThalovantError::Api`, `Retry-After` is authoritative, and the SDK does not retry automatically.

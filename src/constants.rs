@@ -1,4 +1,4 @@
-pub const DEFAULT_USER_AGENT: &str = "thalovant-rust-sdk/0.2.21";
+pub const DEFAULT_USER_AGENT: &str = concat!("thalovant-rust-sdk/", env!("CARGO_PKG_VERSION"));
 
 pub const EVENT_RECOGNIZER_LOOP_UTTERANCE: &str = "recognizer_loop:utterance";
 pub const EVENT_UTTERANCE_HANDLED: &str = "ovos.utterance.handled";

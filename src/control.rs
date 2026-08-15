@@ -12,12 +12,20 @@ use rand::{rngs::OsRng, RngCore};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::{collections::HashMap, fmt, future::Future, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fmt,
+    future::Future,
+    time::Duration,
+};
 use uuid::Uuid;
 
 pub const DEFAULT_CONTROL_API_URL: &str = "https://api.thalovant.com";
 pub const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const DEFAULT_CONTROL_USER_AGENT: &str = "thalovant-rust-sdk/0.2.21";
+/// Source type [`SkillInstallOptions`] uses by default: install from the
+/// marketplace catalog rather than from a git repository.
+pub const DEFAULT_SKILL_SOURCE_TYPE: &str = "catalog";
+const DEFAULT_CONTROL_USER_AGENT: &str = concat!("thalovant-rust-sdk/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(900);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -190,6 +198,59 @@ pub struct MemoryListOptions {
     pub include_expired: bool,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+/// Options for [`ControlPlane::release_hub`] and
+/// [`ControlPlane::release_runtime_group`].
+///
+/// Every field is optional and only the ones you set are sent; omitted fields
+/// fall back to the workspace release policy. Setting `images` switches the
+/// target to `custom` mode unless you also set `mode`.
+#[derive(Clone, Debug, Default)]
+pub struct ReleaseOptions {
+    pub channel: Option<String>,
+    pub mode: Option<String>,
+    pub version: Option<String>,
+    pub images: Option<BTreeMap<String, String>>,
+    pub reason: Option<String>,
+}
+
+/// Options for [`ControlPlane::list_marketplace_skills`].
+///
+/// `owner_id` and `include_inactive` are honored for admin tokens only; the API
+/// silently scopes a non-admin caller to their own tenant and to active entries
+/// instead of failing.
+#[derive(Clone, Debug, Default)]
+pub struct MarketplaceSkillsOptions {
+    pub owner_id: Option<String>,
+    pub include_inactive: bool,
+    pub force_refresh: bool,
+}
+
+/// Options for [`ControlPlane::install_runtime_group_skill`].
+///
+/// The default installs an active skill from the marketplace catalog
+/// (`source_type` of `catalog`). A `git` install needs `source_ref` set to the
+/// repository URL.
+#[derive(Clone, Debug)]
+pub struct SkillInstallOptions {
+    pub marketplace_skill_id: Option<String>,
+    pub source_type: String,
+    pub source_ref: Option<String>,
+    pub version_pin: Option<String>,
+    pub active: bool,
+}
+
+impl Default for SkillInstallOptions {
+    fn default() -> Self {
+        Self {
+            marketplace_skill_id: None,
+            source_type: DEFAULT_SKILL_SOURCE_TYPE.to_string(),
+            source_ref: None,
+            version_pin: None,
+            active: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -606,19 +667,492 @@ impl ControlPlane {
         .await
     }
 
+    /// Create a hub.
+    ///
+    /// `payload` mirrors the API's hub create body: `name` and `spec` are
+    /// required, and `slug`, `namespace`, `runtime_group_id`, `domain`,
+    /// `active`, `visibility`, `capacity_profile`, and `owner_id` are optional.
+    ///
+    /// The request is idempotent: a generated `Idempotency-Key` is sent unless
+    /// you pass your own, so a create retried after a timeout returns the first
+    /// hub instead of making a second one.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope. A
+    /// free-plan token fails with HTTP 402 and a token without the scope with
+    /// HTTP 403, both surfaced as [`ThalovantError::Api`].
+    pub async fn create_hub(
+        &self,
+        payload: Value,
+        idempotency_key: Option<String>,
+    ) -> Result<Value> {
+        let key = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
+        self.request(
+            "POST",
+            "/v1/hubs",
+            Some(payload),
+            Some(single_header("Idempotency-Key", &key)?),
+            true,
+        )
+        .await
+    }
+
+    /// Partially update a hub.
+    ///
+    /// The API enforces optimistic locking on this route, so `etag` is
+    /// required, not optional: pass the `etag` from the hub resource you read
+    /// and the SDK sends it as `If-Match`. A stale or missing value fails the
+    /// request with HTTP 412 and changes nothing; re-read the hub with
+    /// [`ControlPlane::get_hub`] and retry with the new `etag`.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn update_hub(&self, hub_id: &str, payload: Value, etag: &str) -> Result<Value> {
+        self.request(
+            "PATCH",
+            &format!("/v1/hubs/{}", urlencoding::encode(hub_id)),
+            Some(payload),
+            Some(single_header("If-Match", etag)?),
+            true,
+        )
+        .await
+    }
+
+    /// Delete a hub along with its dependent clients and ACLs.
+    ///
+    /// Like [`ControlPlane::update_hub`] this route requires the hub's current
+    /// `etag`, sent as `If-Match`; a stale or missing value fails with HTTP
+    /// 412.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn delete_hub(&self, hub_id: &str, etag: &str) -> Result<()> {
+        let _ = self
+            .request(
+                "DELETE",
+                &format!("/v1/hubs/{}", urlencoding::encode(hub_id)),
+                None,
+                Some(single_header("If-Match", etag)?),
+                true,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Apply a hub release policy and return the updated hub.
+    ///
+    /// Every option is optional; omitted fields fall back to the workspace
+    /// release policy. Passing `images` switches the hub to `custom` mode
+    /// unless you also pass `mode`.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn release_hub(&self, hub_id: &str, opts: ReleaseOptions) -> Result<Value> {
+        self.request(
+            "POST",
+            &format!("/v1/hubs/{}/release", urlencoding::encode(hub_id)),
+            Some(release_payload(opts)),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Rate a public hub from 1 to 5 and return the updated hub.
+    ///
+    /// Only public hubs can be rated, and owners cannot rate their own hubs.
+    /// Requires a token with the `hubs:write` scope; unlike the provisioning
+    /// routes this one is **not** paid-gated, so a free-plan token works.
+    pub async fn set_hub_rating(&self, hub_id: &str, rating: u8) -> Result<Value> {
+        self.request(
+            "PUT",
+            &format!("/v1/hubs/{}/rating", urlencoding::encode(hub_id)),
+            Some(json!({ "rating": rating })),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Remove the caller's rating from a public hub and return the hub.
+    ///
+    /// Requires a token with the `hubs:write` scope; not paid-gated.
+    pub async fn clear_hub_rating(&self, hub_id: &str) -> Result<Value> {
+        self.request(
+            "DELETE",
+            &format!("/v1/hubs/{}/rating", urlencoding::encode(hub_id)),
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Read the live skill and intent inventory a hub runtime exposes.
+    ///
+    /// Requires a token with the `hubs:inspect` scope. This is the one
+    /// discovery route that fails when nothing is reporting: the API answers
+    /// HTTP 409 when the hub has no connected client that can report
+    /// inventory. The runtime-group reads
+    /// ([`ControlPlane::list_runtime_group_inventory`],
+    /// [`ControlPlane::list_runtime_group_marketplace`]) return empty data with
+    /// a pending `source` instead.
+    pub async fn get_hub_runtime_capabilities(&self, hub_id: &str) -> Result<Value> {
+        self.request(
+            "GET",
+            &format!(
+                "/v1/hubs/{}/runtime-capabilities",
+                urlencoding::encode(hub_id)
+            ),
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// List runtime groups visible to the authenticated user.
+    ///
+    /// Requires a token with the `hubs:read` scope.
+    pub async fn list_runtime_groups(&self, owner_id: Option<&str>) -> Result<Value> {
+        let mut params = Vec::new();
+        push_query_param(&mut params, "owner_id", owner_id);
+        let path = if params.is_empty() {
+            "/v1/runtime-groups".to_string()
+        } else {
+            format!("/v1/runtime-groups?{}", params.join("&"))
+        };
+        self.request("GET", &path, None, None, true).await
+    }
+
+    /// Fetch one runtime group.
+    ///
+    /// Requires a token with the `hubs:read` scope.
+    pub async fn get_runtime_group(&self, runtime_group_id: &str) -> Result<Value> {
+        self.request(
+            "GET",
+            &format!(
+                "/v1/runtime-groups/{}",
+                urlencoding::encode(runtime_group_id)
+            ),
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Create a runtime group.
+    ///
+    /// `payload` takes the API's create body: `name` is required, and
+    /// `description`, `environment`, `owner_id`, and `clone_from_default` are
+    /// optional. This route reads no `Idempotency-Key`.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn create_runtime_group(&self, payload: Value) -> Result<Value> {
+        self.request("POST", "/v1/runtime-groups", Some(payload), None, true)
+            .await
+    }
+
+    /// Update a runtime group's `name`, `description`, or `spec`.
+    ///
+    /// `spec` patches `replicas` and container `resources`. Unlike the hub
+    /// routes this one does **not** use `If-Match`.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn update_runtime_group(
+        &self,
+        runtime_group_id: &str,
+        payload: Value,
+    ) -> Result<Value> {
+        self.request(
+            "PATCH",
+            &format!(
+                "/v1/runtime-groups/{}",
+                urlencoding::encode(runtime_group_id)
+            ),
+            Some(payload),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Read a runtime group's runtime configuration and personas.
+    ///
+    /// Requires a token with the `hubs:read` scope.
+    pub async fn get_runtime_group_config(&self, runtime_group_id: &str) -> Result<Value> {
+        self.request(
+            "GET",
+            &format!(
+                "/v1/runtime-groups/{}/config",
+                urlencoding::encode(runtime_group_id)
+            ),
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Merge runtime configuration into a runtime group.
+    ///
+    /// The API merges `config` into the stored configuration rather than
+    /// replacing it, and marks the group pending so the runtime operator
+    /// reconciles the change. `personas` is sent, and therefore replaced, only
+    /// when you pass `Some(..)`.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn update_runtime_group_config(
+        &self,
+        runtime_group_id: &str,
+        config: Value,
+        personas: Option<Value>,
+    ) -> Result<Value> {
+        let mut body = Map::from_iter([("config".to_string(), config)]);
+        if let Some(personas) = personas {
+            body.insert("personas".to_string(), personas);
+        }
+        self.request(
+            "PATCH",
+            &format!(
+                "/v1/runtime-groups/{}/config",
+                urlencoding::encode(runtime_group_id)
+            ),
+            Some(Value::Object(body)),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Apply a runtime image policy and return the updated runtime group.
+    ///
+    /// Options behave like [`ControlPlane::release_hub`].
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn release_runtime_group(
+        &self,
+        runtime_group_id: &str,
+        opts: ReleaseOptions,
+    ) -> Result<Value> {
+        self.request(
+            "POST",
+            &format!(
+                "/v1/runtime-groups/{}/release",
+                urlencoding::encode(runtime_group_id)
+            ),
+            Some(release_payload(opts)),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Delete a runtime group.
+    ///
+    /// The API answers HTTP 409 for the workspace default group and for a
+    /// group that still has hubs attached.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn delete_runtime_group(&self, runtime_group_id: &str) -> Result<()> {
+        let _ = self
+            .request(
+                "DELETE",
+                &format!(
+                    "/v1/runtime-groups/{}",
+                    urlencoding::encode(runtime_group_id)
+                ),
+                None,
+                None,
+                true,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Install (or re-install) a skill in a runtime group.
+    ///
+    /// The default [`SkillInstallOptions::source_type`] of `catalog` installs a
+    /// marketplace skill and requires the skill to exist in the catalog; `git`
+    /// installs need a `source_ref` repository URL. Installing a skill that is
+    /// already present updates the existing entry.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope. Paid
+    /// marketplace skills also need marketplace access on the tenant plan.
+    pub async fn install_runtime_group_skill(
+        &self,
+        runtime_group_id: &str,
+        skill_id: &str,
+        opts: SkillInstallOptions,
+    ) -> Result<Value> {
+        let mut body = Map::from_iter([
+            ("skill_id".to_string(), Value::String(skill_id.to_string())),
+            ("source_type".to_string(), Value::String(opts.source_type)),
+            ("active".to_string(), Value::Bool(opts.active)),
+        ]);
+        if let Some(marketplace_skill_id) = opts.marketplace_skill_id {
+            body.insert(
+                "marketplace_skill_id".to_string(),
+                Value::String(marketplace_skill_id),
+            );
+        }
+        if let Some(source_ref) = opts.source_ref {
+            body.insert("source_ref".to_string(), Value::String(source_ref));
+        }
+        if let Some(version_pin) = opts.version_pin {
+            body.insert("version_pin".to_string(), Value::String(version_pin));
+        }
+        self.request(
+            "POST",
+            &format!(
+                "/v1/runtime-groups/{}/skills",
+                urlencoding::encode(runtime_group_id)
+            ),
+            Some(Value::Object(body)),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Remove a skill from a runtime group.
+    ///
+    /// Requires a paid plan and a token with the `hubs:write` scope.
+    pub async fn uninstall_runtime_group_skill(
+        &self,
+        runtime_group_id: &str,
+        skill_id: &str,
+    ) -> Result<()> {
+        let _ = self
+            .request(
+                "DELETE",
+                &format!(
+                    "/v1/runtime-groups/{}/skills/{}",
+                    urlencoding::encode(runtime_group_id),
+                    urlencoding::encode(skill_id)
+                ),
+                None,
+                None,
+                true,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// List the marketplace skill catalog visible to the authenticated user.
+    ///
+    /// Returns `{"data": [...]}` where each entry carries the catalog fields an
+    /// install needs — `skill_id`, `source_type`, `source_ref`,
+    /// `package_name`, `version` compatibility, `config_schema` and
+    /// `secret_schema` — alongside presentation and access fields such as
+    /// `category`, `tags`, `verified`, `access_tier` and `billing_sku`. Global
+    /// catalog entries and the caller's own tenant entries are both included.
+    ///
+    /// [`MarketplaceSkillsOptions::owner_id`] and
+    /// [`MarketplaceSkillsOptions::include_inactive`] are honored for admin
+    /// tokens only; the API silently scopes a non-admin caller to their own
+    /// tenant and to active entries rather than failing.
+    /// [`MarketplaceSkillsOptions::force_refresh`] re-syncs the global catalog
+    /// from its source before answering, which is slower.
+    ///
+    /// Requires a token with the `hubs:read` scope. Unlike the provisioning
+    /// routes this catalog is **not** paid-gated, so free-plan callers can
+    /// browse the marketplace before upgrading — only the install itself needs
+    /// a paid plan.
+    pub async fn list_marketplace_skills(&self, opts: MarketplaceSkillsOptions) -> Result<Value> {
+        let mut params = Vec::new();
+        push_query_param(&mut params, "owner_id", opts.owner_id.as_deref());
+        if opts.include_inactive {
+            params.push("include_inactive=true".to_string());
+        }
+        if opts.force_refresh {
+            params.push("force_refresh=true".to_string());
+        }
+        let path = if params.is_empty() {
+            "/v1/marketplace/skills".to_string()
+        } else {
+            format!("/v1/marketplace/skills?{}", params.join("&"))
+        };
+        self.request("GET", &path, None, None, true).await
+    }
+
+    /// List the marketplace catalog resolved against one runtime group.
+    ///
+    /// This is the discovery view to use before installing: every catalog entry
+    /// is returned with the group's own state folded in — whether the skill is
+    /// desired (`active`, `version_pin`, `source_type`), whether it was
+    /// observed running (`observed_source`, `observed_at`, intent counts),
+    /// operator status fields, and the access verdict for the tenant plan
+    /// (`purchase_required`, `installable`, `access_message`). The envelope
+    /// also carries `runtime_group_id`, `observed_at`, `source`,
+    /// `operator_phase` and `operator_message`.
+    ///
+    /// `refresh_inventory` forces a live read from the runtime operator instead
+    /// of answering from the cached inventory snapshot.
+    ///
+    /// Requires a token with the `hubs:inspect` scope; no paid plan is needed
+    /// to browse. The API answers HTTP 404 for an unknown group and HTTP 403
+    /// when the caller does not own it, and returns empty data with a pending
+    /// `source` — never HTTP 409 — when no client is connected.
+    pub async fn list_runtime_group_marketplace(
+        &self,
+        runtime_group_id: &str,
+        refresh_inventory: bool,
+    ) -> Result<Value> {
+        let mut path = format!(
+            "/v1/runtime-groups/{}/marketplace",
+            urlencoding::encode(runtime_group_id)
+        );
+        if refresh_inventory {
+            path.push_str("?refresh_inventory=true");
+        }
+        self.request("GET", &path, None, None, true).await
+    }
+
+    /// List the skills a runtime group is actually observed running.
+    ///
+    /// Where [`ControlPlane::list_runtime_group_marketplace`] answers "what
+    /// could be installed here", this answers "what is loaded right now": each
+    /// entry carries `skill_id`, `version`, `source`, `active`,
+    /// `adapt_intents`, `padatious_intents`, `total_intents` and
+    /// `observed_at`. The envelope reports `source` — the observation's
+    /// provenance, one of `ovos-runtime-operator`, `runtime-group-cache` or
+    /// `ovos-runtime-operator-pending` — plus `operator_phase` and
+    /// `operator_message`.
+    ///
+    /// `refresh` forces a live operator read; the API also refreshes on its own
+    /// when it holds no cached snapshot. Unlike
+    /// [`ControlPlane::get_hub_runtime_capabilities`] this route does not answer
+    /// HTTP 409 when nothing is reporting — it returns an empty `data` list
+    /// with a pending `source` instead.
+    ///
+    /// Requires a token with the `hubs:inspect` scope; no paid plan is needed.
+    pub async fn list_runtime_group_inventory(
+        &self,
+        runtime_group_id: &str,
+        refresh: bool,
+    ) -> Result<Value> {
+        let mut path = format!(
+            "/v1/runtime-groups/{}/inventory",
+            urlencoding::encode(runtime_group_id)
+        );
+        if refresh {
+            path.push_str("?refresh=true");
+        }
+        self.request("GET", &path, None, None, true).await
+    }
+
     pub async fn create_client(
         &self,
         payload: Value,
         idempotency_key: Option<String>,
     ) -> Result<Value> {
-        let mut headers = HeaderMap::new();
         let key = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
-        headers.insert(
-            "Idempotency-Key",
-            HeaderValue::from_str(&key).map_err(|err| ThalovantError::Api(err.to_string()))?,
-        );
-        self.request("POST", "/v1/clients", Some(payload), Some(headers), true)
-            .await
+        self.request(
+            "POST",
+            "/v1/clients",
+            Some(payload),
+            Some(single_header("Idempotency-Key", &key)?),
+            true,
+        )
+        .await
     }
 
     pub async fn create_client_identity_for_hub_id(
@@ -876,6 +1410,45 @@ impl BootstrapIdentityResult {
             "selected_endpoint": self.endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone()),
         })
     }
+}
+
+/// Build a one-entry header map, failing on a value HTTP cannot carry.
+fn single_header(name: &'static str, value: &str) -> Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        name,
+        HeaderValue::from_str(value).map_err(|err| ThalovantError::Api(err.to_string()))?,
+    );
+    Ok(headers)
+}
+
+/// Build a release-apply body, omitting the options the caller left unset.
+fn release_payload(opts: ReleaseOptions) -> Value {
+    let mut body = Map::new();
+    if let Some(channel) = opts.channel {
+        body.insert("channel".to_string(), Value::String(channel));
+    }
+    if let Some(mode) = opts.mode {
+        body.insert("mode".to_string(), Value::String(mode));
+    }
+    if let Some(version) = opts.version {
+        body.insert("version".to_string(), Value::String(version));
+    }
+    if let Some(images) = opts.images {
+        body.insert(
+            "images".to_string(),
+            Value::Object(
+                images
+                    .into_iter()
+                    .map(|(key, value)| (key, Value::String(value)))
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(reason) = opts.reason {
+        body.insert("reason".to_string(), Value::String(reason));
+    }
+    Value::Object(body)
 }
 
 fn required_device_field(raw: &Map<String, Value>, key: &str) -> Result<String> {
@@ -1664,5 +2237,590 @@ mod tests {
         assert_eq!(overview["meta"]["scope"].as_str(), Some("admin"));
         assert_eq!(overview["totals"]["utterances"].as_i64(), Some(7));
         server.join().expect("test server finished");
+    }
+
+    const HUB_BODY: &str = r#"{"id":"hub-1","name":"joke-garden","slug":"joke-garden","runtime_group_id":"rg-1","active":true,"etag":"etag-2"}"#;
+    const RUNTIME_GROUP_BODY: &str =
+        r#"{"id":"rg-1","name":"kiosks","description":"Lobby kiosks","status":"ready"}"#;
+    const RUNTIME_GROUP_CONFIG_BODY: &str = r#"{"runtime_group_id":"rg-1","config":{"lang":"en-us"},"personas":{"default":"assistant"}}"#;
+    const DESIRED_SKILL_BODY: &str = r#"{"id":"desired-1","runtime_group_id":"rg-1","skill_id":"skill-weather","source_type":"catalog","active":true}"#;
+
+    /// Serve `count` requests, answering each from `route` and recording the
+    /// raw request text so assertions can run after the server has stopped.
+    fn spawn_recording_server(
+        listener: TcpListener,
+        count: usize,
+        route: impl Fn(&str) -> (&'static str, &'static str) + Send + 'static,
+    ) -> (
+        thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let handle = thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buffer = [0_u8; 16384];
+                let size = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let (status, body) = route(&request);
+                write_json_response(&mut stream, status, body);
+                recorded.lock().expect("record request").push(request);
+            }
+        });
+        (handle, requests)
+    }
+
+    fn recorded(requests: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, index: usize) -> String {
+        requests.lock().expect("read requests")[index].clone()
+    }
+
+    #[tokio::test]
+    async fn hub_provisioning_sends_paths_bodies_and_conditional_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (server, requests) = spawn_recording_server(listener, 5, |request| {
+            if request.starts_with("POST /v1/hubs ") {
+                ("201 Created", HUB_BODY)
+            } else if request.starts_with("PATCH /v1/hubs/hub-1 ") {
+                ("200 OK", HUB_BODY)
+            } else if request.starts_with("DELETE /v1/hubs/hub-1 ") {
+                ("204 No Content", "")
+            } else if request.starts_with("POST /v1/hubs/hub-1/release ") {
+                ("200 OK", HUB_BODY)
+            } else {
+                panic!("unexpected request: {request}");
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let created = control
+            .create_hub(json!({"name": "joke-garden", "spec": {}}), None)
+            .await
+            .expect("create hub");
+        control
+            .create_hub(
+                json!({"name": "joke-garden", "spec": {}}),
+                Some("caller-key-1".to_string()),
+            )
+            .await
+            .expect("create hub with caller key");
+        let updated = control
+            .update_hub("hub-1", json!({"active": false}), "etag-1")
+            .await
+            .expect("update hub");
+        control
+            .delete_hub("hub-1", "etag-2")
+            .await
+            .expect("delete hub");
+        let released = control
+            .release_hub(
+                "hub-1",
+                ReleaseOptions {
+                    channel: Some("stable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("release hub");
+        server.join().expect("test server finished");
+
+        assert_eq!(created["id"].as_str(), Some("hub-1"));
+        assert_eq!(updated["id"].as_str(), Some("hub-1"));
+        assert_eq!(released["id"].as_str(), Some("hub-1"));
+
+        // create_hub generates an Idempotency-Key when the caller omits one.
+        let generated = recorded(&requests, 0);
+        let lowered = generated.to_ascii_lowercase();
+        let key = lowered
+            .split("\r\nidempotency-key: ")
+            .nth(1)
+            .and_then(|rest| rest.split("\r\n").next())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(key.len(), 36, "expected a generated UUID key: {generated}");
+        assert!(
+            generated.contains(r#""name":"joke-garden""#),
+            "missing create body: {generated}"
+        );
+        assert!(
+            !lowered.contains("\r\nif-match:"),
+            "hub create must not send If-Match: {generated}"
+        );
+
+        // A caller-supplied Idempotency-Key is sent verbatim.
+        assert!(
+            recorded(&requests, 1)
+                .to_ascii_lowercase()
+                .contains("\r\nidempotency-key: caller-key-1\r\n"),
+            "missing caller key: {}",
+            recorded(&requests, 1)
+        );
+
+        // PATCH and DELETE both carry the required If-Match precondition.
+        let update = recorded(&requests, 2);
+        assert!(
+            update
+                .to_ascii_lowercase()
+                .contains("\r\nif-match: etag-1\r\n"),
+            "hub update must send If-Match: {update}"
+        );
+        assert!(
+            update.contains(r#""active":false"#),
+            "missing update body: {update}"
+        );
+        let delete = recorded(&requests, 3);
+        assert!(
+            delete
+                .to_ascii_lowercase()
+                .contains("\r\nif-match: etag-2\r\n"),
+            "hub delete must send If-Match: {delete}"
+        );
+
+        // The release body carries only the options the caller set.
+        let release = recorded(&requests, 4);
+        assert!(
+            release.ends_with(r#"{"channel":"stable"}"#),
+            "release must omit unset options: {release}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hub_rating_and_runtime_capabilities_use_their_own_verbs() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (server, requests) = spawn_recording_server(listener, 3, |request| {
+            if request.starts_with("PUT /v1/hubs/hub-1/rating ")
+                || request.starts_with("DELETE /v1/hubs/hub-1/rating ")
+            {
+                ("200 OK", HUB_BODY)
+            } else if request.starts_with("GET /v1/hubs/hub-1/runtime-capabilities ") {
+                (
+                    "200 OK",
+                    r#"{"hub_id":"hub-1","source":"ovos-runtime","skills":[],"intents":[],"counts":{"skills":0,"total_intents":3}}"#,
+                )
+            } else {
+                panic!("unexpected request: {request}");
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let rated = control
+            .set_hub_rating("hub-1", 5)
+            .await
+            .expect("set rating");
+        let cleared = control
+            .clear_hub_rating("hub-1")
+            .await
+            .expect("clear rating");
+        let capabilities = control
+            .get_hub_runtime_capabilities("hub-1")
+            .await
+            .expect("runtime capabilities");
+        server.join().expect("test server finished");
+
+        assert_eq!(rated["id"].as_str(), Some("hub-1"));
+        assert_eq!(cleared["id"].as_str(), Some("hub-1"));
+        assert_eq!(capabilities["counts"]["total_intents"].as_i64(), Some(3));
+        assert!(
+            recorded(&requests, 0).ends_with(r#"{"rating":5}"#),
+            "missing rating body: {}",
+            recorded(&requests, 0)
+        );
+        // Rating is not an optimistic-locking route.
+        assert!(
+            !recorded(&requests, 1)
+                .to_ascii_lowercase()
+                .contains("\r\nif-match:"),
+            "clear rating must not send If-Match"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_group_crud_sends_paths_params_and_bodies() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (server, requests) = spawn_recording_server(listener, 10, |request| {
+            if request.starts_with("GET /v1/runtime-groups ")
+                || request.starts_with("GET /v1/runtime-groups?")
+            {
+                ("200 OK", r#"{"data":[{"id":"rg-1","name":"kiosks"}]}"#)
+            } else if request.starts_with("GET /v1/runtime-groups/rg-1/config ")
+                || request.starts_with("PATCH /v1/runtime-groups/rg-1/config ")
+            {
+                // Both config routes answer with the same document; the test
+                // asserts the verb and body from the recorded request instead.
+                ("200 OK", RUNTIME_GROUP_CONFIG_BODY)
+            } else if request.starts_with("POST /v1/runtime-groups/rg-1/release ") {
+                ("200 OK", RUNTIME_GROUP_BODY)
+            } else if request.starts_with("DELETE /v1/runtime-groups/rg-1 ") {
+                ("204 No Content", "")
+            } else if request.starts_with("GET /v1/runtime-groups/rg-1 ")
+                || request.starts_with("PATCH /v1/runtime-groups/rg-1 ")
+            {
+                ("200 OK", RUNTIME_GROUP_BODY)
+            } else if request.starts_with("POST /v1/runtime-groups ") {
+                ("201 Created", RUNTIME_GROUP_BODY)
+            } else {
+                panic!("unexpected request: {request}");
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let page = control
+            .list_runtime_groups(None)
+            .await
+            .expect("list runtime groups");
+        control
+            .list_runtime_groups(Some("owner-1"))
+            .await
+            .expect("list runtime groups for owner");
+        let fetched = control
+            .get_runtime_group("rg-1")
+            .await
+            .expect("get runtime group");
+        let created = control
+            .create_runtime_group(json!({"name": "kiosks", "clone_from_default": true}))
+            .await
+            .expect("create runtime group");
+        let updated = control
+            .update_runtime_group(
+                "rg-1",
+                json!({"name": "kiosks-eu", "spec": {"replicas": 2}}),
+            )
+            .await
+            .expect("update runtime group");
+        let config = control
+            .get_runtime_group_config("rg-1")
+            .await
+            .expect("get config");
+        control
+            .update_runtime_group_config(
+                "rg-1",
+                json!({"lang": "en-us"}),
+                Some(json!({"default": "assistant"})),
+            )
+            .await
+            .expect("update config with personas");
+        control
+            .update_runtime_group_config("rg-1", json!({"lang": "fr-fr"}), None)
+            .await
+            .expect("update config without personas");
+        control
+            .release_runtime_group(
+                "rg-1",
+                ReleaseOptions {
+                    channel: Some("beta".to_string()),
+                    mode: Some("custom".to_string()),
+                    version: Some("1.2.3".to_string()),
+                    images: Some(BTreeMap::from([(
+                        "core".to_string(),
+                        "ghcr.io/thalovant/core:1".to_string(),
+                    )])),
+                    reason: Some("pin the core image".to_string()),
+                },
+            )
+            .await
+            .expect("release runtime group");
+        control
+            .delete_runtime_group("rg-1")
+            .await
+            .expect("delete runtime group");
+        server.join().expect("test server finished");
+
+        assert_eq!(page["data"][0]["id"].as_str(), Some("rg-1"));
+        assert_eq!(fetched["id"].as_str(), Some("rg-1"));
+        assert_eq!(created["name"].as_str(), Some("kiosks"));
+        assert_eq!(updated["id"].as_str(), Some("rg-1"));
+        assert_eq!(config["config"]["lang"].as_str(), Some("en-us"));
+
+        // owner_id is omitted entirely when unset.
+        assert!(
+            recorded(&requests, 0).starts_with("GET /v1/runtime-groups "),
+            "unfiltered list must not send a query string: {}",
+            recorded(&requests, 0)
+        );
+        assert!(
+            recorded(&requests, 1).starts_with("GET /v1/runtime-groups?owner_id=owner-1 "),
+            "missing owner filter: {}",
+            recorded(&requests, 1)
+        );
+
+        // Runtime-group writes carry neither If-Match nor an idempotency key.
+        for index in [3, 4, 6, 8, 9] {
+            let request = recorded(&requests, index).to_ascii_lowercase();
+            assert!(
+                !request.contains("\r\nif-match:") && !request.contains("\r\nidempotency-key:"),
+                "runtime-group writes must send no precondition headers: {request}"
+            );
+        }
+
+        // personas is sent only when provided; config is always wrapped.
+        let with_personas = recorded(&requests, 6);
+        assert!(
+            with_personas
+                .ends_with(r#"{"config":{"lang":"en-us"},"personas":{"default":"assistant"}}"#),
+            "unexpected config body: {with_personas}"
+        );
+        let without_personas = recorded(&requests, 7);
+        assert!(
+            without_personas.ends_with(r#"{"config":{"lang":"fr-fr"}}"#),
+            "personas must be omitted when unset: {without_personas}"
+        );
+
+        let release = recorded(&requests, 8);
+        for fragment in [
+            r#""channel":"beta""#,
+            r#""mode":"custom""#,
+            r#""version":"1.2.3""#,
+            r#""images":{"core":"ghcr.io/thalovant/core:1"}"#,
+            r#""reason":"pin the core image""#,
+        ] {
+            assert!(release.contains(fragment), "missing {fragment}: {release}");
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_group_skill_install_maps_options_to_the_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (server, requests) = spawn_recording_server(listener, 3, |request| {
+            if request.starts_with("POST /v1/runtime-groups/rg-1/skills ") {
+                ("200 OK", DESIRED_SKILL_BODY)
+            } else if request.starts_with("DELETE /v1/runtime-groups/rg-1/skills/skill-weather ") {
+                ("204 No Content", "")
+            } else {
+                panic!("unexpected request: {request}");
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let installed = control
+            .install_runtime_group_skill("rg-1", "skill-weather", SkillInstallOptions::default())
+            .await
+            .expect("install skill");
+        control
+            .install_runtime_group_skill(
+                "rg-1",
+                "skill-weather",
+                SkillInstallOptions {
+                    marketplace_skill_id: Some("marketplace-1".to_string()),
+                    source_type: "git".to_string(),
+                    source_ref: Some("https://github.com/example/skill".to_string()),
+                    version_pin: Some("1.4.0".to_string()),
+                    active: false,
+                },
+            )
+            .await
+            .expect("install git skill");
+        control
+            .uninstall_runtime_group_skill("rg-1", "skill-weather")
+            .await
+            .expect("uninstall skill");
+        server.join().expect("test server finished");
+
+        assert_eq!(installed["skill_id"].as_str(), Some("skill-weather"));
+
+        // The default install is an active catalog install with no extra keys.
+        let default_install = recorded(&requests, 0);
+        assert!(
+            default_install
+                .ends_with(r#"{"active":true,"skill_id":"skill-weather","source_type":"catalog"}"#),
+            "unexpected default install body: {default_install}"
+        );
+
+        let git_install = recorded(&requests, 1);
+        for fragment in [
+            r#""skill_id":"skill-weather""#,
+            r#""source_type":"git""#,
+            r#""active":false"#,
+            r#""marketplace_skill_id":"marketplace-1""#,
+            r#""source_ref":"https://github.com/example/skill""#,
+            r#""version_pin":"1.4.0""#,
+        ] {
+            assert!(
+                git_install.contains(fragment),
+                "missing {fragment}: {git_install}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_discovery_reads_send_optional_params_only_when_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (server, requests) = spawn_recording_server(listener, 7, |request| {
+            if request.starts_with("GET /v1/marketplace/skills") {
+                (
+                    "200 OK",
+                    r#"{"data":[{"skill_id":"skill-weather","access_tier":"free","source_type":"catalog"}]}"#,
+                )
+            } else if request.starts_with("GET /v1/runtime-groups/rg-1/marketplace") {
+                (
+                    "200 OK",
+                    r#"{"runtime_group_id":"rg-1","source":"runtime-group-cache","operator_phase":"Ready","data":[{"skill_id":"skill-weather","installable":true,"active":false}]}"#,
+                )
+            } else if request.starts_with("GET /v1/runtime-groups/rg-1/inventory") {
+                (
+                    "200 OK",
+                    r#"{"runtime_group_id":"rg-1","source":"ovos-runtime-operator-pending","operator_phase":null,"data":[]}"#,
+                )
+            } else {
+                panic!("unexpected request: {request}");
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let catalog = control
+            .list_marketplace_skills(MarketplaceSkillsOptions::default())
+            .await
+            .expect("list marketplace skills");
+        control
+            .list_marketplace_skills(MarketplaceSkillsOptions {
+                owner_id: Some("owner-1".to_string()),
+                include_inactive: true,
+                force_refresh: true,
+            })
+            .await
+            .expect("list marketplace skills with params");
+        control
+            .list_marketplace_skills(MarketplaceSkillsOptions {
+                owner_id: Some("   ".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("list marketplace skills with a blank owner");
+        let view = control
+            .list_runtime_group_marketplace("rg-1", false)
+            .await
+            .expect("group marketplace");
+        control
+            .list_runtime_group_marketplace("rg-1", true)
+            .await
+            .expect("group marketplace refreshed");
+        let inventory = control
+            .list_runtime_group_inventory("rg-1", false)
+            .await
+            .expect("group inventory");
+        control
+            .list_runtime_group_inventory("rg-1", true)
+            .await
+            .expect("group inventory refreshed");
+        server.join().expect("test server finished");
+
+        assert_eq!(
+            catalog["data"][0]["skill_id"].as_str(),
+            Some("skill-weather")
+        );
+        assert_eq!(view["data"][0]["installable"], Value::Bool(true));
+        // Nothing reporting yet is an empty list with a pending source, not an error.
+        assert_eq!(
+            inventory["source"].as_str(),
+            Some("ovos-runtime-operator-pending")
+        );
+        assert_eq!(inventory["data"].as_array().map(Vec::len), Some(0));
+
+        assert!(
+            recorded(&requests, 0).starts_with("GET /v1/marketplace/skills "),
+            "defaults must send no query string: {}",
+            recorded(&requests, 0)
+        );
+        let all_params = recorded(&requests, 1);
+        for fragment in [
+            "owner_id=owner-1",
+            "include_inactive=true",
+            "force_refresh=true",
+        ] {
+            assert!(
+                all_params.contains(fragment),
+                "missing {fragment}: {all_params}"
+            );
+        }
+        assert!(
+            recorded(&requests, 2).starts_with("GET /v1/marketplace/skills "),
+            "a blank owner_id must be dropped: {}",
+            recorded(&requests, 2)
+        );
+        assert!(
+            recorded(&requests, 3).starts_with("GET /v1/runtime-groups/rg-1/marketplace "),
+            "unexpected request: {}",
+            recorded(&requests, 3)
+        );
+        assert!(
+            recorded(&requests, 4)
+                .starts_with("GET /v1/runtime-groups/rg-1/marketplace?refresh_inventory=true "),
+            "unexpected request: {}",
+            recorded(&requests, 4)
+        );
+        assert!(
+            recorded(&requests, 5).starts_with("GET /v1/runtime-groups/rg-1/inventory "),
+            "unexpected request: {}",
+            recorded(&requests, 5)
+        );
+        assert!(
+            recorded(&requests, 6)
+                .starts_with("GET /v1/runtime-groups/rg-1/inventory?refresh=true "),
+            "unexpected request: {}",
+            recorded(&requests, 6)
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioning_errors_surface_status_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let (server, _requests) = spawn_recording_server(listener, 4, |request| {
+            if request.starts_with("POST /v1/hubs ") {
+                (
+                    "402 Payment Required",
+                    r#"{"detail":"API access requires a paid plan."}"#,
+                )
+            } else if request.starts_with("POST /v1/runtime-groups/rg-1/skills ") {
+                ("403 Forbidden", r#"{"detail":"Insufficient scopes"}"#)
+            } else if request.starts_with("PATCH /v1/hubs/hub-1 ") {
+                ("412 Precondition Failed", r#"{"detail":"ETag mismatch"}"#)
+            } else if request.starts_with("GET /v1/hubs/hub-1/runtime-capabilities ") {
+                (
+                    "409 Conflict",
+                    r#"{"detail":"Live skills and intents are not available for this hub yet."}"#,
+                )
+            } else {
+                panic!("unexpected request: {request}");
+            }
+        });
+
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".to_string()));
+        let free_plan = control
+            .create_hub(json!({"name": "joke-garden", "spec": {}}), None)
+            .await
+            .expect_err("free-plan create must fail");
+        let missing_scope = control
+            .install_runtime_group_skill("rg-1", "skill-weather", SkillInstallOptions::default())
+            .await
+            .expect_err("scopeless install must fail");
+        let stale_etag = control
+            .update_hub("hub-1", json!({"active": false}), "stale")
+            .await
+            .expect_err("stale etag must fail");
+        let not_connected = control
+            .get_hub_runtime_capabilities("hub-1")
+            .await
+            .expect_err("capabilities without a client must fail");
+        server.join().expect("test server finished");
+
+        for (error, status, detail) in [
+            (free_plan, "402", "API access requires a paid plan."),
+            (missing_scope, "403", "Insufficient scopes"),
+            (stale_etag, "412", "ETag mismatch"),
+            (not_connected, "409", "Live skills and intents"),
+        ] {
+            let ThalovantError::Api(message) = &error else {
+                panic!("unexpected error variant: {error:?}");
+            };
+            assert!(
+                message.contains(status) && message.contains(detail),
+                "expected HTTP {status} and {detail:?}: {message}"
+            );
+        }
     }
 }
