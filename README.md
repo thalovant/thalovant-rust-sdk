@@ -159,8 +159,10 @@ Keep `result.identity` secret: it holds the client credentials the hub uses.
 crypto key) *and* the raw `hub`/`client` bodies (which include the `apiKey`,
 `password`, and `cryptoKey` minted by `POST /v1/clients`), so never log it or
 write it anywhere world-readable. For diagnostics use `result.as_value(false)`,
-which redacts every credential in both the identity and the hub/client bodies,
-or `{:?}`, which redacts the same fields; neither exposes a secret.
+which redacts every credential in the identity (including secret-keyed
+`metadata` entries) and in the hub/client bodies (including the
+`initial_identify.key` access-key alias), or `{:?}`, which redacts the same
+fields; neither exposes a secret.
 
 ## List Your Hubs
 

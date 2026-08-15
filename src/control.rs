@@ -1434,9 +1434,15 @@ impl BootstrapIdentityResult {
             identity.insert("data_plane_endpoints".to_string(), Value::Object(endpoints));
         }
         if !self.identity.metadata.is_empty() {
+            // Metadata is arbitrary caller data that may carry secret-keyed
+            // entries; redact them in the non-secret view, keep them otherwise.
             identity.insert(
                 "metadata".to_string(),
-                Value::Object(self.identity.metadata.clone()),
+                Value::Object(if include_secrets {
+                    self.identity.metadata.clone()
+                } else {
+                    crate::redact::redact_map(&self.identity.metadata)
+                }),
             );
         }
         if include_secrets {
@@ -2961,6 +2967,57 @@ mod tests {
             assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
         }
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn bootstrap_summary_redacts_metadata_and_initial_identify_key_alias() {
+        let identity = Identity::from_value(json!({
+            "access_key": "access",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "https://hub.example.com",
+            "metadata": {"owner": "owner-1", "auth_token": "meta-LIVE-SECRET"}
+        }))
+        .unwrap();
+        let result = BootstrapIdentityResult {
+            identity,
+            hub: json!({"id": "hub-1"}),
+            client: json!({
+                "id": "client-1",
+                "initial_identify": {"key": "ak-LIVE-ALIAS", "password": "pw-LIVE"}
+            }),
+            endpoint: None,
+        };
+
+        // Non-secret view: metadata secrets and the `initial_identify.key` alias
+        // (which `Identity::from_value` reads as the access key) are redacted.
+        let public = result.as_value(false);
+        assert_eq!(public["identity"]["metadata"]["auth_token"], "<redacted>");
+        assert_eq!(public["identity"]["metadata"]["owner"], "owner-1");
+        assert_eq!(public["client"]["initial_identify"]["key"], "<redacted>");
+        assert_eq!(
+            public["client"]["initial_identify"]["password"],
+            "<redacted>"
+        );
+
+        // Explicit secret view keeps the real values (persistence path).
+        let full = result.as_value(true);
+        assert_eq!(
+            full["identity"]["metadata"]["auth_token"],
+            "meta-LIVE-SECRET"
+        );
+        assert_eq!(full["client"]["initial_identify"]["key"], "ak-LIVE-ALIAS");
+
+        // `{:?}` must not leak either secret.
+        let debug = format!("{result:?}");
+        assert!(
+            !debug.contains("meta-LIVE-SECRET"),
+            "Debug leaked metadata: {debug}"
+        );
+        assert!(
+            !debug.contains("ak-LIVE-ALIAS"),
+            "Debug leaked key alias: {debug}"
+        );
     }
 
     #[test]

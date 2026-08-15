@@ -327,7 +327,10 @@ fn replace_any_prefix(value: &str, replacements: &[(&str, &str)]) -> String {
     value.to_string()
 }
 
-fn redact_endpoint_credentials(endpoint: &str) -> String {
+/// Strip any `user:pass@` userinfo from a URL-shaped endpoint. Used by both the
+/// non-secret serializer (`as_map(true)`) and the redacting `Debug` impls so the
+/// two views never disagree about what counts as a secret.
+pub(crate) fn redact_endpoint_credentials(endpoint: &str) -> String {
     let Ok(mut url) = reqwest::Url::parse(endpoint) else {
         return endpoint.to_string();
     };
