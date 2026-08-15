@@ -154,8 +154,15 @@ let hubs = control.list_hubs(Some(50), None, None).await?;
 Use `ControlPlane::new(api_url, Some(token))` instead when targeting a local
 or self-hosted control plane.
 
-Keep `result.identity` secret. It contains the client credentials used by the
-hub. Do not log `result.as_value(true)`.
+Keep `result.identity` secret: it holds the client credentials the hub uses.
+`result.as_value(true)` embeds those real credentials (access key, password,
+crypto key) *and* the raw `hub`/`client` bodies (which include the `apiKey`,
+`password`, and `cryptoKey` minted by `POST /v1/clients`), so never log it or
+write it anywhere world-readable. For diagnostics use `result.as_value(false)`,
+which redacts every credential in the identity (including secret-keyed
+`metadata` entries) and in the hub/client bodies (including the
+`initial_identify.key` access-key alias), or `{:?}`, which redacts the same
+fields; neither exposes a secret.
 
 ## List Your Hubs
 

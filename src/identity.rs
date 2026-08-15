@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    env, fs,
+    env, fmt, fs,
     path::{Path, PathBuf},
 };
 
@@ -39,7 +39,10 @@ pub fn default_config_path() -> Result<PathBuf> {
         .join(DEFAULT_CONFIG_FILENAME))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+// `Debug` is hand-written (below) to redact `password` and `username` (the
+// account access key); `Serialize` stays derived so the identity file and wire
+// protocol keep the real values.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct MqttBrokerCredentials {
     pub endpoint: String,
     pub username: String,
@@ -136,7 +139,36 @@ impl MqttBrokerCredentials {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+impl fmt::Debug for MqttBrokerCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MqttBrokerCredentials")
+            // An endpoint may embed `user:pass@` userinfo; strip it as the
+            // non-secret serializer does.
+            .field(
+                "endpoint",
+                &crate::protocols::redact_endpoint_credentials(&self.endpoint),
+            )
+            // The broker username is the account access key, which the identity's
+            // own Debug redacts; keep them consistent so `{:?}` never exposes it.
+            .field("username", &crate::redact::REDACTED)
+            .field("password", &crate::redact::REDACTED)
+            .field("topic_prefix", &self.topic_prefix)
+            .field("hub_id", &self.hub_id)
+            .field("c2s_topic", &self.c2s_topic)
+            .field("s2c_topic", &self.s2c_topic)
+            .field("status_topic", &self.status_topic)
+            .field("hash_topics", &self.hash_topics)
+            .field("qos", &self.qos)
+            .field("tls", &self.tls)
+            .finish()
+    }
+}
+
+// `Debug` is hand-written (below) to redact `access_key`, `password`, and
+// `crypto_key`; `Serialize` stays derived so identity-file persistence and the
+// wire protocol keep emitting the real credential values.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Identity {
     pub access_key: String,
     pub password: String,
@@ -362,6 +394,42 @@ impl Identity {
 
     pub fn supports_protocol(&self, protocol: HubProtocol) -> bool {
         self.protocols.is_enabled(protocol)
+    }
+}
+
+impl fmt::Debug for Identity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Identity")
+            .field("access_key", &crate::redact::REDACTED)
+            .field("password", &crate::redact::REDACTED)
+            .field(
+                "crypto_key",
+                &self.crypto_key.as_ref().map(|_| crate::redact::REDACTED),
+            )
+            .field("site_id", &self.site_id)
+            // Endpoints may embed `user:pass@` userinfo; strip it in this
+            // non-secret view, matching `as_value(false)` / `as_map(true)`.
+            .field(
+                "default_master",
+                &crate::protocols::redact_endpoint_credentials(&self.default_master),
+            )
+            .field("default_port", &self.default_port)
+            .field("default_path", &self.default_path)
+            .field("public_key", &self.public_key)
+            // `metadata` is arbitrary caller data that may carry secret-keyed
+            // entries (e.g. `auth_token`); redact those without touching Serialize.
+            .field("metadata", &crate::redact::redact_map(&self.metadata))
+            .field("name", &self.name)
+            // Render endpoints through the userinfo-stripping projection.
+            .field(
+                "data_plane_endpoints",
+                &self.data_plane_endpoints.as_map(true),
+            )
+            .field("protocols", &self.protocols)
+            // MqttBrokerCredentials' own Debug redacts its password.
+            .field("mqtt", &self.mqtt)
+            .finish()
     }
 }
 
@@ -903,6 +971,145 @@ profiles:
         assert_eq!(
             result.as_value(true)["identity"]["mqtt"]["password"],
             Value::String("broker-password".to_string())
+        );
+    }
+
+    #[test]
+    fn identity_debug_redacts_secrets_but_serialize_roundtrips() {
+        let identity = Identity::from_value(json!({
+            "access_key": "ak-LIVE-SECRET",
+            "password": "pw-LIVE-SECRET",
+            "crypto_key": "ck-LIVE-SECRET",
+            "site_id": "site",
+            "default_master": "https://hub.example.com",
+            "default_port": 443,
+            "mqtt": {
+                "endpoint": "mqtts://mqtt.example.com:8883",
+                "username": "ak-LIVE-SECRET",
+                "password": "broker-LIVE-SECRET"
+            }
+        }))
+        .unwrap();
+
+        // `{:?}` must never leak a secret, but stays useful for non-secret fields.
+        let debug = format!("{identity:?}");
+        for secret in [
+            "ak-LIVE-SECRET",
+            "pw-LIVE-SECRET",
+            "ck-LIVE-SECRET",
+            "broker-LIVE-SECRET",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
+        }
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("site"));
+
+        // Serialize MUST keep the real values: identity-file persistence and the
+        // wire protocol depend on it, so redaction must never touch Serialize.
+        let serialized = serde_json::to_value(&identity).unwrap();
+        assert_eq!(serialized["access_key"], "ak-LIVE-SECRET");
+        assert_eq!(serialized["password"], "pw-LIVE-SECRET");
+        assert_eq!(serialized["crypto_key"], "ck-LIVE-SECRET");
+        assert_eq!(serialized["mqtt"]["password"], "broker-LIVE-SECRET");
+
+        // ...and a Serialize -> parse round-trip recovers the same secrets.
+        let restored = Identity::from_value(serialized).unwrap();
+        assert_eq!(restored.access_key, "ak-LIVE-SECRET");
+        assert_eq!(restored.password, "pw-LIVE-SECRET");
+        assert_eq!(restored.crypto_key.as_deref(), Some("ck-LIVE-SECRET"));
+        assert_eq!(
+            restored.mqtt.as_ref().map(|mqtt| mqtt.password.as_str()),
+            Some("broker-LIVE-SECRET")
+        );
+    }
+
+    #[test]
+    fn mqtt_credentials_debug_redacts_password_but_serialize_keeps_it() {
+        let mqtt = Identity::from_value(json!({
+            "access_key": "access",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "https://hub.example.com",
+            "mqtt": {
+                "endpoint": "mqtts://mqtt.example.com:8883",
+                "username": "access",
+                "password": "broker-LIVE-SECRET"
+            }
+        }))
+        .unwrap()
+        .mqtt
+        .expect("mqtt credentials");
+
+        let debug = format!("{mqtt:?}");
+        assert!(
+            !debug.contains("broker-LIVE-SECRET"),
+            "Debug leaked: {debug}"
+        );
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("mqtts://mqtt.example.com:8883"));
+        assert_eq!(
+            serde_json::to_value(&mqtt).unwrap()["password"],
+            "broker-LIVE-SECRET"
+        );
+    }
+
+    #[test]
+    fn identity_debug_redacts_secret_keyed_metadata_but_serialize_keeps_it() {
+        let identity = Identity::from_value(json!({
+            "access_key": "access",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "https://hub.example.com",
+            "metadata": {"thalovant_owner_id": "owner-1", "auth_token": "meta-LIVE-SECRET"}
+        }))
+        .unwrap();
+
+        let debug = format!("{identity:?}");
+        assert!(
+            !debug.contains("meta-LIVE-SECRET"),
+            "Debug leaked metadata secret: {debug}"
+        );
+        // Non-secret metadata stays visible for debuggability.
+        assert!(debug.contains("owner-1"));
+
+        // Serialize must keep the real metadata value (persistence/wire).
+        assert_eq!(
+            serde_json::to_value(&identity).unwrap()["metadata"]["auth_token"],
+            "meta-LIVE-SECRET"
+        );
+    }
+
+    #[test]
+    fn identity_debug_strips_endpoint_userinfo() {
+        let identity = Identity::from_value(json!({
+            "access_key": "access",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "https://user:pw-URL-SECRET@hub.example.com",
+            "data_plane_endpoints": {
+                "https": "https://user:pw-URL-SECRET@hub.example.com",
+                "wss": "wss://user:pw-URL-SECRET@hub.example.com"
+            },
+            "mqtt": {
+                "endpoint": "mqtts://user:pw-URL-SECRET@mqtt.example.com:8883",
+                "username": "access",
+                "password": "broker-secret"
+            }
+        }))
+        .unwrap();
+
+        let debug = format!("{identity:?}");
+        assert!(
+            !debug.contains("pw-URL-SECRET"),
+            "Debug leaked endpoint userinfo: {debug}"
+        );
+        // The host stays visible for debuggability.
+        assert!(debug.contains("hub.example.com"));
+
+        // Serialize still emits the real endpoints (persistence/wire).
+        assert_eq!(
+            serde_json::to_value(&identity).unwrap()["default_master"],
+            "https://user:pw-URL-SECRET@hub.example.com"
         );
     }
 }

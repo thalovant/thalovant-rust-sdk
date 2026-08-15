@@ -9,6 +9,7 @@ pub mod errors;
 pub mod events;
 pub mod identity;
 pub mod protocols;
+mod redact;
 pub mod rich;
 mod tls;
 pub mod transport;
