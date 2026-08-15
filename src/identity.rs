@@ -1025,7 +1025,10 @@ profiles:
         .expect("mqtt credentials");
 
         let debug = format!("{mqtt:?}");
-        assert!(!debug.contains("broker-LIVE-SECRET"), "Debug leaked: {debug}");
+        assert!(
+            !debug.contains("broker-LIVE-SECRET"),
+            "Debug leaked: {debug}"
+        );
         assert!(debug.contains("<redacted>"));
         assert!(debug.contains("mqtts://mqtt.example.com:8883"));
         assert_eq!(

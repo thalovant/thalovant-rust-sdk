@@ -54,13 +54,17 @@ mod tests {
         let url = format!("http://127.0.0.1:1/connect?authorization={secret}");
         let raw = reqwest::Client::new().get(&url).send().await.unwrap_err();
         assert!(
-            raw.url().is_some_and(|value| value.as_str().contains(secret)),
+            raw.url()
+                .is_some_and(|value| value.as_str().contains(secret)),
             "precondition: the raw reqwest error must carry the secret URL"
         );
 
         let converted: ThalovantError = raw.into();
         let rendered = converted.to_string();
-        assert!(!rendered.contains(secret), "converted error leaked secret: {rendered}");
+        assert!(
+            !rendered.contains(secret),
+            "converted error leaked secret: {rendered}"
+        );
         assert!(
             !rendered.contains("authorization"),
             "converted error leaked query: {rendered}"

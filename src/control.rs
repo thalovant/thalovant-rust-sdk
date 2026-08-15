@@ -2991,7 +2991,10 @@ mod tests {
         }))
         .unwrap();
         let debug = format!("{auth:?}");
-        assert!(!debug.contains("dc-LIVE-SECRET"), "Debug leaked code: {debug}");
+        assert!(
+            !debug.contains("dc-LIVE-SECRET"),
+            "Debug leaked code: {debug}"
+        );
         // The user code is meant to be shown to the end user.
         assert!(debug.contains("WDJB-MJHT"));
         assert!(debug.contains("<redacted>"));
@@ -3012,6 +3015,9 @@ mod tests {
         let big = format!("line-one\nline-two\n{}", "x".repeat(500));
         let bounded = server_error_detail(&big);
         assert!(!bounded.contains('\n'), "detail kept newlines: {bounded}");
-        assert!(bounded.chars().count() <= 203, "detail not bounded: {bounded}");
+        assert!(
+            bounded.chars().count() <= 203,
+            "detail not bounded: {bounded}"
+        );
     }
 }
