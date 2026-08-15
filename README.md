@@ -178,6 +178,160 @@ if let Some(items) = page.get("data").and_then(|value| value.as_array()) {
 }
 ```
 
+## Provision Hubs
+
+Hubs, runtime groups, and skills can be created and managed from code. These
+routes need a **paid plan** and a token with the **`hubs:write`** scope
+("Create and update your hubs" on the dashboard's API Tokens page). A free-plan
+token fails with HTTP 402 `API access requires a paid plan.`, and a token
+without the scope fails with HTTP 403 `Insufficient scopes`; both surface as
+`ThalovantError::Api` carrying the status and body.
+
+```rust
+use serde_json::json;
+use thalovant::{ControlPlane, MarketplaceSkillsOptions, ReleaseOptions, SkillInstallOptions};
+
+let control = ControlPlane::with_access_token(std::env::var("THALOVANT_API_TOKEN")?);
+
+// 1. Discover what is installable before provisioning anything. Browsing the
+//    catalog only needs `hubs:read` and is not paid-gated.
+let catalog = control
+    .list_marketplace_skills(MarketplaceSkillsOptions::default())
+    .await?;
+if let Some(skills) = catalog["data"].as_array() {
+    for skill in skills {
+        println!("{} {}", skill["skill_id"], skill["access_tier"]);
+    }
+}
+
+// 2. Create a runtime group to run the skills.
+let group = control
+    .create_runtime_group(json!({"name": "kiosks", "description": "Lobby kiosks"}))
+    .await?;
+let group_id = group["id"].as_str().unwrap_or_default().to_string();
+
+// 3. Create a hub attached to it.
+let hub = control
+    .create_hub(
+        json!({
+            "name": "joke-garden",
+            "runtime_group_id": group_id,
+            "spec": {"protocols": {"wss": {"enabled": true}}},
+        }),
+        None,
+    )
+    .await?;
+let hub_id = hub["id"].as_str().unwrap_or_default().to_string();
+
+// 4. Install a skill from the marketplace catalog.
+control
+    .install_runtime_group_skill(&group_id, "skill-weather", SkillInstallOptions::default())
+    .await?;
+
+// 5. Release: roll the runtime and the hub onto a release channel.
+let channel = || ReleaseOptions {
+    channel: Some("stable".into()),
+    ..Default::default()
+};
+control.release_runtime_group(&group_id, channel()).await?;
+control.release_hub(&hub_id, channel()).await?;
+```
+
+Creating a hub is idempotent. `create_hub` sends a generated `Idempotency-Key`
+header when you pass `None`, so a create retried after a timeout returns the
+hub that was already created instead of making a second one. Pass
+`Some(key)` to control the key yourself. No other provisioning route reads that
+header.
+
+Updating and deleting a hub use optimistic locking, so `etag` is a required
+argument rather than an option. Pass the `etag` from the hub resource you read
+— it lives in the JSON body, not in an `ETag` response header — and the SDK
+sends it as `If-Match`. The API rejects a stale *or missing* value with HTTP
+412 without changing anything:
+
+```rust
+let hub = control.get_hub(&hub_id).await?;
+let etag = hub["etag"].as_str().unwrap_or_default();
+let hub = control
+    .update_hub(&hub_id, json!({"active": false}), etag)
+    .await?;
+control
+    .delete_hub(&hub_id, hub["etag"].as_str().unwrap_or_default())
+    .await?;
+```
+
+Deleting a hub also deletes its clients and ACLs. Runtime groups have no
+`If-Match` requirement and read no idempotency header, but the API refuses to
+delete the workspace default group or a group that still has hubs attached
+(HTTP 409).
+
+Runtime configuration is merged, not replaced, and `personas` is sent only when
+you pass `Some(..)`:
+
+```rust
+control
+    .update_runtime_group_config(&group_id, json!({"lang": "en-us"}), None)
+    .await?;
+println!("{}", control.get_runtime_group_config(&group_id).await?["config"]);
+```
+
+Rating a public hub is the exception to the paid gate: `set_hub_rating` and
+`clear_hub_rating` need `hubs:write` but **no paid plan**. Only public hubs can
+be rated, and owners cannot rate their own.
+
+Reading what a hub is actually running needs the **`hubs:inspect`** scope
+instead:
+
+```rust
+let capabilities = control.get_hub_runtime_capabilities(&hub_id).await?;
+println!("{}", capabilities["counts"]["total_intents"]);
+```
+
+## Discover Skills
+
+The marketplace catalog is readable with the **`hubs:read`** scope and, unlike
+the provisioning routes above, is **not paid-gated** — a free-plan token can
+browse the whole catalog before upgrading, and only the install needs a paid
+plan.
+
+Each entry carries what an install needs (`skill_id`, `source_type`,
+`source_ref`, `config_schema`, `secret_schema`) next to presentation fields
+(`title`, `summary`, `tags`, `verified`). Admin tokens can additionally set
+`owner_id` to read another tenant's catalog and `include_inactive` to see
+retired entries; both are silently ignored for non-admin callers rather than
+rejected. `force_refresh` re-syncs the global catalog from source first, which
+is slower and is open to every caller.
+
+Two group-scoped reads need the **`hubs:inspect`** scope and are likewise not
+paid-gated. The first resolves the catalog against one runtime group, so each
+entry reports whether it is already desired, whether it was observed running,
+and whether the tenant plan allows installing it:
+
+```rust
+let view = control.list_runtime_group_marketplace(&group_id, false).await?;
+if let Some(entries) = view["data"].as_array() {
+    for entry in entries {
+        if entry["installable"] == json!(true) && entry["active"] != json!(true) {
+            println!("available: {}", entry["skill_id"]);
+        }
+    }
+}
+```
+
+The second answers what the group is actually running right now, rather than
+what could be installed:
+
+```rust
+let inventory = control.list_runtime_group_inventory(&group_id, true).await?;
+println!("{} {}", inventory["source"], inventory["data"].as_array().map_or(0, Vec::len));
+```
+
+Both answer from a cached inventory snapshot by default; pass `true` for
+`refresh_inventory` / `refresh` to force a live read from the runtime operator.
+When nothing is reporting yet these two return an empty `data` list with a
+pending `source` (`ovos-runtime-operator-pending`) rather than failing —
+`get_hub_runtime_capabilities` is the one that answers HTTP 409 in that case.
+
 ## Workspace Analytics
 
 Authenticated accounts can read the same overview used by the dashboard:
@@ -470,6 +624,26 @@ resending. Per-plan limits are listed in the dashboard and at
 - `control.get_public_hub(hub_ref)`
 - `control.list_hubs(limit, cursor, owner_id)`
 - `control.get_hub(hub_id)`
+- `control.create_hub(payload, idempotency_key)`
+- `control.update_hub(hub_id, payload, etag)` (sends `If-Match`; `etag` required)
+- `control.delete_hub(hub_id, etag)` (sends `If-Match`; `etag` required)
+- `control.release_hub(hub_id, options)` (`ReleaseOptions`)
+- `control.set_hub_rating(hub_id, rating)` (not paid-gated)
+- `control.clear_hub_rating(hub_id)` (not paid-gated)
+- `control.get_hub_runtime_capabilities(hub_id)` (`hubs:inspect`; 409 with no connected client)
+- `control.list_runtime_groups(owner_id)`
+- `control.get_runtime_group(runtime_group_id)`
+- `control.create_runtime_group(payload)`
+- `control.update_runtime_group(runtime_group_id, payload)`
+- `control.get_runtime_group_config(runtime_group_id)`
+- `control.update_runtime_group_config(runtime_group_id, config, personas)`
+- `control.release_runtime_group(runtime_group_id, options)` (`ReleaseOptions`)
+- `control.delete_runtime_group(runtime_group_id)`
+- `control.install_runtime_group_skill(runtime_group_id, skill_id, options)` (`SkillInstallOptions`)
+- `control.uninstall_runtime_group_skill(runtime_group_id, skill_id)`
+- `control.list_marketplace_skills(options)` (`MarketplaceSkillsOptions`; `hubs:read`, not paid-gated)
+- `control.list_runtime_group_marketplace(runtime_group_id, refresh_inventory)` (`hubs:inspect`)
+- `control.list_runtime_group_inventory(runtime_group_id, refresh)` (`hubs:inspect`)
 - `control.get_operation(operation_id)`
 - `control.get_analytics_overview(options)`
 - `control.list_memory_items(options)`

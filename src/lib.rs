@@ -22,8 +22,9 @@ pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
 pub use control::{
     AnalyticsOverviewOptions, BootstrapIdentityOptions, BootstrapIdentityResult, ControlPlane,
-    DeviceAuthorization, DeviceLoginOptions, DevicePrompt, LoginOptions, MemoryListOptions,
-    OperationResource, OperationStatus, DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL,
+    DeviceAuthorization, DeviceLoginOptions, DevicePrompt, LoginOptions, MarketplaceSkillsOptions,
+    MemoryListOptions, OperationResource, OperationStatus, ReleaseOptions, SkillInstallOptions,
+    DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_SKILL_SOURCE_TYPE,
 };
 pub use crypto::{
     decrypt_binary, decrypt_from_json, encrypt_as_binary, encrypt_as_json, runtime_crypto_key,
