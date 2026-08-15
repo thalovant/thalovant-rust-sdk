@@ -834,8 +834,8 @@ impl WssTransport {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MqttTopicSet {
-    pub c2s: String,
-    pub s2c: String,
+    pub inbound: String,
+    pub outbound: String,
     pub status: String,
 }
 
@@ -947,7 +947,7 @@ impl MqttTransport {
             }
         }));
         if let Err(error) = client
-            .subscribe(self.state.topics.s2c.clone(), qos(credentials.qos))
+            .subscribe(self.state.topics.outbound.clone(), qos(credentials.qos))
             .await
             .map_err(|err| ThalovantError::Connection(err.to_string()))
         {
@@ -1115,7 +1115,7 @@ impl MqttTransport {
             .unwrap_or(1);
         client
             .publish(
-                self.state.topics.c2s.clone(),
+                self.state.topics.inbound.clone(),
                 qos(publish_qos),
                 false,
                 payload,
@@ -1348,92 +1348,19 @@ pub fn mqtt_topics_for_identity(identity: &Identity) -> Result<MqttTopicSet> {
             "identity does not include MQTT broker credentials".to_string(),
         )
     })?;
-    let satellite_id = if credentials.hash_topics {
-        use sha2::Digest as _;
-        let digest = sha2::Sha256::digest(identity.access_key.as_bytes());
-        hex::encode(digest)[..16].to_string()
-    } else {
-        identity.access_key.clone()
-    };
-    if let (Some(c2s), Some(s2c)) = (&credentials.c2s_topic, &credentials.s2c_topic) {
-        return Ok(MqttTopicSet {
-            c2s: c2s.clone(),
-            s2c: s2c.clone(),
-            status: credentials
-                .status_topic
-                .clone()
-                .unwrap_or_else(|| sibling_mqtt_topic(c2s, "status")),
-        });
-    }
-    let raw = credentials
+    let base = credentials
         .topic_prefix
         .as_deref()
-        .map(|value| value.trim_matches('/').to_string())
-        .filter(|value| !value.is_empty());
-    let base = if let Some(raw) = raw {
-        if raw.contains("/c2s/") {
-            return Ok(MqttTopicSet {
-                c2s: raw.clone(),
-                s2c: sibling_mqtt_topic(&raw, "s2c"),
-                status: sibling_mqtt_topic(&raw, "status"),
-            });
-        }
-        if raw.contains("/s2c/") {
-            return Ok(MqttTopicSet {
-                c2s: sibling_mqtt_topic(&raw, "c2s"),
-                s2c: raw.clone(),
-                status: sibling_mqtt_topic(&raw, "status"),
-            });
-        }
-        if raw.contains("/status/") {
-            return Ok(MqttTopicSet {
-                c2s: sibling_mqtt_topic(&raw, "c2s"),
-                s2c: sibling_mqtt_topic(&raw, "s2c"),
-                status: raw.clone(),
-            });
-        }
-        let mut parts = raw.split('/').collect::<Vec<_>>();
-        let last = parts.last().copied().unwrap_or_default();
-        let mut base = if last == identity.access_key
-            || last == credentials.username
-            || last == satellite_id
-        {
-            parts.pop();
-            parts.join("/")
-        } else {
-            raw
-        };
-        if let Some(hub_id) = credentials
-            .hub_id
-            .as_deref()
-            .map(|value| value.trim_matches('/'))
-            .filter(|value| !value.is_empty())
-        {
-            if !base.split('/').any(|part| part == hub_id) {
-                base = format!("{base}/{hub_id}");
-            }
-        }
-        base
-    } else if let Some(hub_id) = credentials.hub_id.as_deref() {
-        format!("hivemind/{}", hub_id.trim_matches('/'))
-    } else {
-        return Err(ThalovantError::Connection(
-            "MQTT credentials must include topic_prefix, hub_id, or explicit c2s/s2c topics"
-                .to_string(),
-        ));
-    };
+        .map(|value| value.trim_matches('/'))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ThalovantError::Connection("MQTT credentials must include topic_prefix.".to_string())
+        })?;
     Ok(MqttTopicSet {
-        c2s: format!("{base}/c2s/{satellite_id}"),
-        s2c: format!("{base}/s2c/{satellite_id}"),
-        status: format!("{base}/status/{satellite_id}"),
+        inbound: format!("{base}/in"),
+        outbound: format!("{base}/out"),
+        status: format!("{base}/status"),
     })
-}
-
-fn sibling_mqtt_topic(topic: &str, segment: &str) -> String {
-    topic
-        .replacen("/c2s/", &format!("/{segment}/"), 1)
-        .replacen("/s2c/", &format!("/{segment}/"), 1)
-        .replacen("/status/", &format!("/{segment}/"), 1)
 }
 
 fn mqtt_options_for_identity(identity: &Identity) -> Result<MqttOptions> {
@@ -1513,11 +1440,6 @@ mod tests {
             username: "access".to_string(),
             password: "broker-password".to_string(),
             topic_prefix: Some("hivemind/hub".to_string()),
-            hub_id: None,
-            c2s_topic: None,
-            s2c_topic: None,
-            status_topic: None,
-            hash_topics: false,
             qos: 1,
             tls,
         }
