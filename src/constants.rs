@@ -4,13 +4,50 @@ pub const EVENT_RECOGNIZER_LOOP_UTTERANCE: &str = "recognizer_loop:utterance";
 pub const EVENT_UTTERANCE_HANDLED: &str = "ovos.utterance.handled";
 pub const EVENT_SPEAK: &str = "speak";
 pub const EVENT_OVOS_UTTERANCE_SPEAK: &str = "ovos.utterance.speak";
+/// Legacy Mycroft name for the "no intent matched" bus event.
 pub const EVENT_INTENT_FAILURE: &str = "complete_intent_failure";
+/// Current OVOS name for the "no intent matched" bus event (renamed from the
+/// legacy Mycroft `complete_intent_failure`).
+pub const EVENT_INTENT_UNMATCHED: &str = "ovos.intent.unmatched";
 pub const EVENT_POLICY_DENIED: &str = "hive.policy.denied";
 pub const EVENT_QUERY_TIMEOUT: &str = "hive.query.timeout";
 
 pub fn is_failure_event(name: &str) -> bool {
     matches!(
         name,
-        EVENT_INTENT_FAILURE | EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT
+        EVENT_INTENT_FAILURE | EVENT_INTENT_UNMATCHED | EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ovos_intent_unmatched_is_failure() {
+        // OVOS renamed the "no intent matched" event; the current name must be
+        // classified as a terminal failure so ask() fails promptly.
+        assert!(is_failure_event("ovos.intent.unmatched"));
+        assert!(is_failure_event(EVENT_INTENT_UNMATCHED));
+    }
+
+    #[test]
+    fn legacy_complete_intent_failure_is_still_failure() {
+        // The legacy Mycroft name must keep working for older stacks.
+        assert!(is_failure_event("complete_intent_failure"));
+        assert!(is_failure_event(EVENT_INTENT_FAILURE));
+    }
+
+    #[test]
+    fn policy_and_timeout_events_are_failures() {
+        assert!(is_failure_event(EVENT_POLICY_DENIED));
+        assert!(is_failure_event(EVENT_QUERY_TIMEOUT));
+    }
+
+    #[test]
+    fn matched_and_handler_events_are_not_failures() {
+        assert!(!is_failure_event(EVENT_UTTERANCE_HANDLED));
+        assert!(!is_failure_event(EVENT_SPEAK));
+        assert!(!is_failure_event("some.other.event"));
+    }
 }
