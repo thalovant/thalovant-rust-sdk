@@ -1,7 +1,8 @@
 use crate::{
     constants::{
-        EVENT_INTENT_FAILURE, EVENT_OVOS_UTTERANCE_SPEAK, EVENT_POLICY_DENIED, EVENT_QUERY_TIMEOUT,
-        EVENT_RECOGNIZER_LOOP_UTTERANCE, EVENT_SPEAK, EVENT_UTTERANCE_HANDLED,
+        EVENT_INTENT_FAILURE, EVENT_INTENT_UNMATCHED, EVENT_OVOS_UTTERANCE_SPEAK,
+        EVENT_POLICY_DENIED, EVENT_QUERY_TIMEOUT, EVENT_RECOGNIZER_LOOP_UTTERANCE, EVENT_SPEAK,
+        EVENT_UTTERANCE_HANDLED,
     },
     errors::{Result, ThalovantError},
     events::{
@@ -310,9 +311,10 @@ impl Client {
                             fragments.push(text);
                         }
                     }
-                    EVENT_INTENT_FAILURE | EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => {
-                        failure_event = Some(event)
-                    }
+                    EVENT_INTENT_FAILURE
+                    | EVENT_INTENT_UNMATCHED
+                    | EVENT_POLICY_DENIED
+                    | EVENT_QUERY_TIMEOUT => failure_event = Some(event),
                     EVENT_UTTERANCE_HANDLED => break,
                     _ => {}
                 }
@@ -427,7 +429,10 @@ impl Client {
                     EVENT_SPEAK | EVENT_OVOS_UTTERANCE_SPEAK => {
                         push_fragment(&mut fragments, &event.text());
                     }
-                    EVENT_INTENT_FAILURE | EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => {
+                    EVENT_INTENT_FAILURE
+                    | EVENT_INTENT_UNMATCHED
+                    | EVENT_POLICY_DENIED
+                    | EVENT_QUERY_TIMEOUT => {
                         failure_event = Some(event.clone());
                     }
                     _ => {}
