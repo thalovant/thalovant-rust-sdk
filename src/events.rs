@@ -189,44 +189,26 @@ pub fn context_with_correlation(
     next
 }
 
-/// True when a reply's session id is the one we asked for.
-///
-/// A hub rewrites a client-declared session id before the orchestrator sees
-/// it: hivemind-core derives a Layer-1 identity as `{conn_nonce}:{declared}`
-/// so two clients cannot collide on the same declared name
-/// (HIVEMIND-BRIDGE-1 §4), and only admin connections are exempt. Replies can
-/// therefore carry either form, and comparing for equality rejected every one
-/// of them -- `ask()` timed out while the hub had already answered and emitted
-/// `ovos.utterance.handled`.
-///
-/// Matching the part after the first `:` mirrors what the hub does on the way
-/// out. Deliberately not a bare `ends_with`: a declared id of `b` must not
-/// match a reply for `a:xb`.
-pub fn session_ids_match(expected: &str, actual: &str) -> bool {
-    if actual == expected {
-        return true;
-    }
-    match actual.split_once(':') {
-        Some((_, declared)) => declared == expected,
-        None => false,
-    }
-}
-
 pub fn event_matches_context(event: &Event, expected: Option<&Context>) -> bool {
     let Some(expected) = expected else {
         return true;
     };
-    if let (Some(expected_session), Some(event_session)) =
-        (session_id_from_context(expected), event.session_id())
-    {
-        if !session_ids_match(&expected_session, &event_session) {
-            return false;
-        }
-    }
+    // The request id decides, when both sides carry one. A hub does not echo a
+    // client-declared session id: it substitutes its own. Observed against a
+    // live hub on 2026-09-03 -- sent "observe-me", every reply came back as
+    // "71048b7f-e7b0-4360-8fb5-a03816f78617" -- so comparing session ids
+    // rejected replies the request id had already identified as ours.
     if let (Some(expected_request), Some(event_request)) =
         (request_id_from_context(expected), event.request_id())
     {
-        if expected_request != event_request {
+        return expected_request == event_request;
+    }
+    // No request id on one side or the other: fall back to the session, which
+    // is all a caller had before request ids existed.
+    if let (Some(expected_session), Some(event_session)) =
+        (session_id_from_context(expected), event.session_id())
+    {
+        if expected_session != event_session {
             return false;
         }
     }
@@ -359,39 +341,50 @@ mod tests {
 
 #[cfg(test)]
 mod session_nat_tests {
-    //! A hub rewrites a declared session id; replies must still be recognised.
+    //! A hub substitutes its own session id; the request id is what correlates.
     //!
-    //! hivemind-core derives a Layer-1 identity for every client-declared
-    //! session as `{conn_nonce}:{declared}` (HIVEMIND-BRIDGE-1 §4). Comparing
-    //! the returned id to the sent one for equality rejected every reply:
-    //! `ask()` timed out while the hub had already answered. Reproduced
-    //! against a live hub on 2026-09-03.
-    use super::session_ids_match;
+    //! Observed against a live hub on 2026-09-03: a client declaring
+    //! `session_id="observe-me"` gets every reply back carrying the hub's own
+    //! uuid. Comparing session ids rejected replies the request id had already
+    //! identified as ours, so `ask()` timed out while the hub had answered.
+    use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn a_nat_rewritten_reply_is_recognised() {
-        assert!(session_ids_match("my-session", "d41d8cd98f00b204:my-session"));
+    fn ctx(session: Option<&str>, request: Option<&str>) -> Context {
+        let mut m = serde_json::Map::new();
+        if let Some(s) = session {
+            m.insert("session".into(), json!({ "session_id": s }));
+        }
+        if let Some(r) = request {
+            m.insert("request_id".into(), json!(r));
+        }
+        m
+    }
+
+    fn event(session: Option<&str>, request: Option<&str>) -> Event {
+        Event::new(
+            "ovos.utterance.handled",
+            serde_json::Map::new(),
+            ctx(session, request),
+            None,
+        )
     }
 
     #[test]
-    fn an_unrewritten_reply_is_still_recognised() {
-        assert!(session_ids_match("my-session", "my-session"));
+    fn a_matching_request_id_wins_over_a_substituted_session() {
+        let e = event(Some("71048b7f-e7b0-4360-8fb5-a03816f78617"), Some("req-1"));
+        assert!(event_matches_context(&e, Some(&ctx(Some("observe-me"), Some("req-1")))));
     }
 
     #[test]
-    fn a_reply_for_a_different_session_is_rejected() {
-        assert!(!session_ids_match("my-session", "nonce:other"));
-        assert!(!session_ids_match("my-session", "other"));
+    fn a_wrong_request_id_is_rejected_even_if_sessions_agree() {
+        let e = event(Some("same"), Some("req-2"));
+        assert!(!event_matches_context(&e, Some(&ctx(Some("same"), Some("req-1")))));
     }
 
     #[test]
-    fn only_the_declared_half_after_the_first_colon_matches() {
-        // a bare ends_with would wrongly accept these
-        assert!(!session_ids_match("abc", "nonce:xabc"));
-        assert!(!session_ids_match("abc", "nonce:abc:def"));
-        // a declared id containing a colon still matches as a whole
-        assert!(session_ids_match("a:b", "nonce:a:b"));
-        assert!(!session_ids_match("abc", ""));
-        assert!(!session_ids_match("abc", "nonce:"));
+    fn without_request_ids_the_session_still_decides() {
+        assert!(event_matches_context(&event(Some("s1"), None), Some(&ctx(Some("s1"), None))));
+        assert!(!event_matches_context(&event(Some("s2"), None), Some(&ctx(Some("s1"), None))));
     }
 }
