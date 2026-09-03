@@ -373,18 +373,30 @@ mod session_nat_tests {
     #[test]
     fn a_matching_request_id_wins_over_a_substituted_session() {
         let e = event(Some("71048b7f-e7b0-4360-8fb5-a03816f78617"), Some("req-1"));
-        assert!(event_matches_context(&e, Some(&ctx(Some("observe-me"), Some("req-1")))));
+        assert!(event_matches_context(
+            &e,
+            Some(&ctx(Some("observe-me"), Some("req-1")))
+        ));
     }
 
     #[test]
     fn a_wrong_request_id_is_rejected_even_if_sessions_agree() {
         let e = event(Some("same"), Some("req-2"));
-        assert!(!event_matches_context(&e, Some(&ctx(Some("same"), Some("req-1")))));
+        assert!(!event_matches_context(
+            &e,
+            Some(&ctx(Some("same"), Some("req-1")))
+        ));
     }
 
     #[test]
     fn without_request_ids_the_session_still_decides() {
-        assert!(event_matches_context(&event(Some("s1"), None), Some(&ctx(Some("s1"), None))));
-        assert!(!event_matches_context(&event(Some("s2"), None), Some(&ctx(Some("s1"), None))));
+        assert!(event_matches_context(
+            &event(Some("s1"), None),
+            Some(&ctx(Some("s1"), None))
+        ));
+        assert!(!event_matches_context(
+            &event(Some("s2"), None),
+            Some(&ctx(Some("s1"), None))
+        ));
     }
 }
