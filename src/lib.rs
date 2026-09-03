@@ -33,6 +33,7 @@ pub use crypto::{
 pub use errors::{Result, ThalovantError};
 pub use events::{
     context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
+    session_ids_match,
     utterance_payload, Context, Data, Event, Reply,
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};

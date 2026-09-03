@@ -189,6 +189,29 @@ pub fn context_with_correlation(
     next
 }
 
+/// True when a reply's session id is the one we asked for.
+///
+/// A hub rewrites a client-declared session id before the orchestrator sees
+/// it: hivemind-core derives a Layer-1 identity as `{conn_nonce}:{declared}`
+/// so two clients cannot collide on the same declared name
+/// (HIVEMIND-BRIDGE-1 §4), and only admin connections are exempt. Replies can
+/// therefore carry either form, and comparing for equality rejected every one
+/// of them -- `ask()` timed out while the hub had already answered and emitted
+/// `ovos.utterance.handled`.
+///
+/// Matching the part after the first `:` mirrors what the hub does on the way
+/// out. Deliberately not a bare `ends_with`: a declared id of `b` must not
+/// match a reply for `a:xb`.
+pub fn session_ids_match(expected: &str, actual: &str) -> bool {
+    if actual == expected {
+        return true;
+    }
+    match actual.split_once(':') {
+        Some((_, declared)) => declared == expected,
+        None => false,
+    }
+}
+
 pub fn event_matches_context(event: &Event, expected: Option<&Context>) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -196,7 +219,7 @@ pub fn event_matches_context(event: &Event, expected: Option<&Context>) -> bool 
     if let (Some(expected_session), Some(event_session)) =
         (session_id_from_context(expected), event.session_id())
     {
-        if expected_session != event_session {
+        if !session_ids_match(&expected_session, &event_session) {
             return false;
         }
     }
@@ -331,5 +354,44 @@ mod tests {
             "Reply Debug leaked token: {reply_debug}"
         );
         assert!(reply_debug.contains("<redacted>"));
+    }
+}
+
+#[cfg(test)]
+mod session_nat_tests {
+    //! A hub rewrites a declared session id; replies must still be recognised.
+    //!
+    //! hivemind-core derives a Layer-1 identity for every client-declared
+    //! session as `{conn_nonce}:{declared}` (HIVEMIND-BRIDGE-1 §4). Comparing
+    //! the returned id to the sent one for equality rejected every reply:
+    //! `ask()` timed out while the hub had already answered. Reproduced
+    //! against a live hub on 2026-09-03.
+    use super::session_ids_match;
+
+    #[test]
+    fn a_nat_rewritten_reply_is_recognised() {
+        assert!(session_ids_match("my-session", "d41d8cd98f00b204:my-session"));
+    }
+
+    #[test]
+    fn an_unrewritten_reply_is_still_recognised() {
+        assert!(session_ids_match("my-session", "my-session"));
+    }
+
+    #[test]
+    fn a_reply_for_a_different_session_is_rejected() {
+        assert!(!session_ids_match("my-session", "nonce:other"));
+        assert!(!session_ids_match("my-session", "other"));
+    }
+
+    #[test]
+    fn only_the_declared_half_after_the_first_colon_matches() {
+        // a bare ends_with would wrongly accept these
+        assert!(!session_ids_match("abc", "nonce:xabc"));
+        assert!(!session_ids_match("abc", "nonce:abc:def"));
+        // a declared id containing a colon still matches as a whole
+        assert!(session_ids_match("a:b", "nonce:a:b"));
+        assert!(!session_ids_match("abc", ""));
+        assert!(!session_ids_match("abc", "nonce:"));
     }
 }
