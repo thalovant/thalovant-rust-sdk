@@ -401,10 +401,12 @@ println!("{}", serde_json::to_string_pretty(&inventory)?);
 
 Each intent carries the sentences a person says to reach it, per language, as
 the skill wrote them (`{location}` marks a slot); `examples` shows whole
-sentences before ones with a slot. The hub's connection must be allowed to
-publish `ovos.intent.list`, and `ovos.intent.describe` as well when the
-sentences are wanted (`describe: true`, the default); listing alone needs only
-`ovos.intent.list`. A hub that refuses answers `hive.policy.denied`, which the
+sentences before ones with a slot. The hub's connection must always be allowed
+to publish `ovos.intent.list`. `ovos.intent.describe` is needed only when the
+client has to ask for the definitions itself -- that is, `describe: true` (the
+default) *and* a runtime that did not attach each row's `definition` to the
+listing; a runtime that honours `include_definitions` is sent no describe at
+all. A hub that refuses answers `hive.policy.denied`, which the
 SDK returns at once as `ThalovantError::PolicyDenied` naming the type and the
 types the connection may publish. With the default `fallback: true`, a refused
 `ovos.intent.list` falls back to the engines' own manifests: the inventory then

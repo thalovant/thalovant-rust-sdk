@@ -488,9 +488,12 @@ impl Client {
     /// a person says to reach it, as the skill wrote them, `{slot}`
     /// placeholders included. `languages` defaults to `en-us` when empty.
     ///
-    /// The connection must be allowed to publish `ovos.intent.list`, and
-    /// `ovos.intent.describe` as well when the sentences are wanted (`describe`,
-    /// on by default); listing alone needs only the first.
+    /// The connection must always be allowed to publish `ovos.intent.list`.
+    /// `ovos.intent.describe` is needed only when the client has to ask for
+    /// the definitions itself: `describe` is on (the default) *and* the
+    /// runtime did not attach each row's `definition` to the listing. A
+    /// runtime that honours `include_definitions` is never sent a describe,
+    /// and `describe: false` never asks for the sentences at all.
     ///
     /// Fails with [`ThalovantError::PolicyDenied`] when the hub refuses the
     /// query and `fallback` is off; with it on (the default), a hub allowed for
