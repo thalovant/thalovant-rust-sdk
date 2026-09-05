@@ -671,9 +671,10 @@ type Wanted = (String, String, String);
 /// matched by that id, repeats dropped. A hub that does not echo the id is
 /// matched by the definition's own `skill_id`/`intent_name`/`lang`. The
 /// deadline covers each batch, so a hub that answers nothing fails after one
-/// batch rather than holding every request open; a batch the hub answers in
-/// part is still an answer, and the intents it did not describe in time are
-/// simply absent from the result. `batch` 0 sends them all at once.
+/// batch rather than holding every request open. A partial answer is still an
+/// answer, within a window and across them: the intents the hub did not
+/// describe in time are simply absent from the result, and only a call where
+/// no window answered at all is a timeout. `batch` 0 sends them all at once.
 pub(crate) async fn describe_many<L: HubLink>(
     link: &L,
     wanted: &[Wanted],
@@ -689,7 +690,22 @@ pub(crate) async fn describe_many<L: HubLink>(
     if batch > 0 && unique.len() > batch {
         let mut found: HashMap<Wanted, Vec<IntentDefinition>> = HashMap::new();
         for window in unique.chunks(batch) {
-            found.extend(describe_one_batch(link, window, deadline).await?);
+            match describe_one_batch(link, window, deadline).await {
+                Ok(described) => found.extend(described),
+                // A partial answer is an answer across windows as within one.
+                // Windows are contiguous slices of the work, so a skill that
+                // stops answering can own a whole one: without this, an
+                // unresponsive skill with more than `batch` intents would fail
+                // the whole inventory while the same skill with fewer intents
+                // only loses its sentences. A hub silent from the start still
+                // fails at the first window, having found nothing.
+                Err(ThalovantError::Timeout(message)) => {
+                    if found.is_empty() {
+                        return Err(ThalovantError::Timeout(message));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         }
         return Ok(found);
     }
@@ -1063,6 +1079,9 @@ mod tests {
         emitted: Mutex<Vec<Emitted>>,
         /// One entry per subscription window, counting the describes sent in it.
         windows: Mutex<Vec<usize>>,
+        /// Answer at most this many describes, then go quiet.
+        describe_answer_limit: Option<usize>,
+        answered_describes: Mutex<usize>,
     }
 
     impl Default for FakeHub {
@@ -1083,6 +1102,8 @@ mod tests {
                 tx: broadcast::channel(BUS_CAPACITY).0,
                 emitted: Mutex::new(Vec::new()),
                 windows: Mutex::new(Vec::new()),
+                describe_answer_limit: None,
+                answered_describes: Mutex::new(0),
             }
         }
     }
@@ -1223,6 +1244,13 @@ mod tests {
                     let intent_name = data["intent_name"].as_str().unwrap_or_default();
                     if self.deaf_to_describes_for == Some(skill_id) {
                         return Ok(());
+                    }
+                    if let Some(limit) = self.describe_answer_limit {
+                        let mut answered = self.answered_describes.lock().unwrap();
+                        if *answered >= limit {
+                            return Ok(());
+                        }
+                        *answered += 1;
                     }
                     let samples = self
                         .registered(&lang)
@@ -1824,6 +1852,41 @@ mod tests {
             DESCRIBE_BATCH,
             "one batch, not all 69 requests"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_goes_quiet_after_one_window_keeps_what_it_answered() {
+        // Windows are contiguous slices, so a skill that stops answering can
+        // own whole ones. The windows it did answer must survive: the intents
+        // behind the silent windows simply carry no sentences.
+        let hub = FakeHub {
+            registrations: many_registrations("en-us", 69),
+            describe_answer_limit: Some(DESCRIBE_BATCH),
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-us"], &options(Some(Duration::from_millis(200))))
+            .await
+            .expect("two silent windows must not fail the inventory");
+
+        assert_eq!(inventory.intents().count(), 69, "every intent is listed");
+        assert!(inventory.has_phrases());
+        for (index, intent) in inventory.intents().enumerate() {
+            let sentences = intent.phrases_for("en-us");
+            if index < DESCRIBE_BATCH {
+                assert_eq!(
+                    sentences,
+                    [format!("sentence number {index}")],
+                    "{} was answered and must keep its sentence",
+                    intent.id()
+                );
+            } else {
+                assert!(
+                    sentences.is_empty(),
+                    "{} was never described, so it has no sentences",
+                    intent.id()
+                );
+            }
+        }
     }
 
     #[tokio::test]
