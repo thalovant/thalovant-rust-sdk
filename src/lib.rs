@@ -40,7 +40,7 @@ pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use intents::{
     HubIntent, HubIntentInventory, HubSkillIntents, IntentDefinition, IntentDescribeOptions,
     IntentInventoryOptions, IntentInventorySource, IntentListOptions, IntentRegistration,
-    DEFAULT_INTENT_TIMEOUT,
+    DEFAULT_INTENT_TIMEOUT, DESCRIBE_BATCH,
 };
 pub use protocols::{
     endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,

@@ -413,7 +413,9 @@ naming the refused query.
 `list_intents(lang, IntentListOptions)` returns the manifest rows for one
 language and `describe_intent(skill_id, intent_name, lang, IntentDescribeOptions)`
 the registrations behind one intent, sentences included, for callers that want
-the two underlying queries.
+the two underlying queries. A large inventory is described in batches of
+`DESCRIBE_BATCH` (32) requests, so a hub with hundreds of intents neither
+outruns the bus channel nor receives the whole burst at once.
 
 ## Use An Existing Identity
 

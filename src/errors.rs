@@ -2,7 +2,12 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ThalovantError>;
 
+/// Every way an SDK call fails.
+///
+/// `#[non_exhaustive]`: a caller matching on this enum needs a wildcard arm,
+/// so a later release can name a new failure without breaking them.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ThalovantError {
     #[error("missing identity field: {0}")]
     MissingIdentityField(&'static str),

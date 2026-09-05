@@ -54,6 +54,17 @@ use tokio::{sync::broadcast, time::timeout};
 /// How long each intent query waits for its reply unless an option says otherwise.
 pub const DEFAULT_INTENT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many describes may be in flight at once.
+///
+/// A hub with 69 intents in two languages is 138 requests and, with every
+/// reply delivered twice, 276 inbound events, while the transports' bus
+/// channel holds 64: past its capacity the broadcast receiver lags, replies
+/// are dropped, and the inventory comes back missing sentences. A batch of 32
+/// is 64 events at the observed duplication, so a window fits what the channel
+/// holds even if nothing is read until the last request is out. Batching also
+/// spares the hub a burst it never asked for.
+pub const DESCRIBE_BATCH: usize = 32;
+
 /// The language asked about when the caller names none.
 pub(crate) const DEFAULT_LANG: &str = "en-us";
 
@@ -518,7 +529,8 @@ async fn await_reply<T>(
             let event = match receiver.recv().await {
                 Ok(event) => event,
                 // Replies we could not keep up with are gone; the ones still
-                // queued may be the ones we want.
+                // queued may be the ones we want. `DESCRIBE_BATCH` is what
+                // keeps a describe window inside the channel's capacity.
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => {
                     return Err(ThalovantError::Connection(
@@ -653,17 +665,20 @@ pub(crate) async fn describe_intent<L: HubLink>(
 /// `(skill_id, intent_name, lang)`: one registration to describe.
 type Wanted = (String, String, String);
 
-/// Describe many registrations with the requests in flight together.
+/// Describe many registrations, at most `batch` of them in flight.
 ///
-/// One subscription, one request id per registration, replies matched by that
-/// id, repeats dropped. A hub that does not echo the id is matched by the
-/// definition's own `skill_id`/`intent_name`/`lang`. The deadline covers the
-/// whole batch, and a partial answer is still an answer: the intents the hub
-/// did not describe in time are simply absent from the result.
+/// One subscription per batch, one request id per registration, replies
+/// matched by that id, repeats dropped. A hub that does not echo the id is
+/// matched by the definition's own `skill_id`/`intent_name`/`lang`. The
+/// deadline covers each batch, so a hub that answers nothing fails after one
+/// batch rather than holding every request open; a batch the hub answers in
+/// part is still an answer, and the intents it did not describe in time are
+/// simply absent from the result. `batch` 0 sends them all at once.
 pub(crate) async fn describe_many<L: HubLink>(
     link: &L,
     wanted: &[Wanted],
     deadline: Duration,
+    batch: usize,
 ) -> Result<HashMap<Wanted, Vec<IntentDefinition>>> {
     let mut unique: Vec<Wanted> = Vec::new();
     for key in wanted {
@@ -671,6 +686,22 @@ pub(crate) async fn describe_many<L: HubLink>(
             unique.push(key.clone());
         }
     }
+    if batch > 0 && unique.len() > batch {
+        let mut found: HashMap<Wanted, Vec<IntentDefinition>> = HashMap::new();
+        for window in unique.chunks(batch) {
+            found.extend(describe_one_batch(link, window, deadline).await?);
+        }
+        return Ok(found);
+    }
+    describe_one_batch(link, &unique, deadline).await
+}
+
+/// One describe window: every request out, then the replies, then done.
+async fn describe_one_batch<L: HubLink>(
+    link: &L,
+    unique: &[Wanted],
+    deadline: Duration,
+) -> Result<HashMap<Wanted, Vec<IntentDefinition>>> {
     let mut found: HashMap<Wanted, Vec<IntentDefinition>> = HashMap::new();
     if unique.is_empty() {
         return Ok(found);
@@ -678,7 +709,7 @@ pub(crate) async fn describe_many<L: HubLink>(
 
     let mut receiver = link.subscribe();
     let mut by_request: HashMap<String, Wanted> = HashMap::new();
-    for key in &unique {
+    for key in unique {
         let (skill_id, intent_name, lang) = key;
         let request_id = new_request_id();
         by_request.insert(request_id.clone(), key.clone());
@@ -868,7 +899,7 @@ where
         })
         .collect();
     let described = if opts.describe && !wanted.is_empty() {
-        describe_many(link, &wanted, deadline).await?
+        describe_many(link, &wanted, deadline, DESCRIBE_BATCH).await?
     } else {
         HashMap::new()
     };
@@ -952,29 +983,44 @@ mod tests {
     const SHADOW: &str = "thalovant-skill-custos-shadow.thalovant";
     const ALLOWED: [&str; 2] = ["recognizer_loop:utterance", "speak"];
 
-    type Registration = ((&'static str, &'static str), Vec<&'static str>);
+    /// One intent the hub registered: `((skill_id, intent_name), samples)`.
+    type Registration = ((String, String), Vec<String>);
+
+    /// The transports all build their bus channel with this capacity, so the
+    /// fake does too: a describe window that outgrows it loses replies.
+    const BUS_CAPACITY: usize = 64;
+
+    fn registration(skill_id: &str, intent_name: &str, samples: &[&str]) -> Registration {
+        (
+            (skill_id.to_string(), intent_name.to_string()),
+            samples.iter().map(|text| text.to_string()).collect(),
+        )
+    }
 
     /// What the hub registered: per language, per intent, the sentences.
     /// Weather speaks both languages; the shadow skill only English.
     fn registrations(lang: &str) -> Vec<Registration> {
         match lang {
             "en-us" => vec![
-                (
-                    (WEATHER, "current.weather"),
-                    vec![
+                registration(
+                    WEATHER,
+                    "current.weather",
+                    &[
                         "what is the weather",
                         "what is the weather in {location}",
                         "how is it outside",
                     ],
                 ),
-                (
-                    (SHADOW, "custos.incidents"),
-                    vec!["are there incidents", "any incidents"],
+                registration(
+                    SHADOW,
+                    "custos.incidents",
+                    &["are there incidents", "any incidents"],
                 ),
             ],
-            "fr-fr" => vec![(
-                (WEATHER, "current.weather"),
-                vec![
+            "fr-fr" => vec![registration(
+                WEATHER,
+                "current.weather",
+                &[
                     "quel temps fait-il",
                     "quelle est la météo à {location}",
                     "quelle est la météo",
@@ -1015,6 +1061,8 @@ mod tests {
         adapt_names: Vec<String>,
         tx: broadcast::Sender<Event>,
         emitted: Mutex<Vec<Emitted>>,
+        /// One entry per subscription window, counting the describes sent in it.
+        windows: Mutex<Vec<usize>>,
     }
 
     impl Default for FakeHub {
@@ -1032,8 +1080,9 @@ mod tests {
                 deaf_to_describes_for: None,
                 keyword_rows: KeywordRows::None,
                 adapt_names: Vec::new(),
-                tx: broadcast::channel(256).0,
+                tx: broadcast::channel(BUS_CAPACITY).0,
                 emitted: Mutex::new(Vec::new()),
+                windows: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1076,7 +1125,7 @@ mod tests {
             }
         }
 
-        fn definition(lang: &str, skill_id: &str, intent_name: &str, samples: &[&str]) -> Value {
+        fn definition(lang: &str, skill_id: &str, intent_name: &str, samples: &[String]) -> Value {
             json!({
                 "skill_id": skill_id,
                 "intent_name": intent_name,
@@ -1090,6 +1139,7 @@ mod tests {
 
     impl HubLink for FakeHub {
         fn subscribe(&self) -> broadcast::Receiver<Event> {
+            self.windows.lock().unwrap().push(0);
             self.tx.subscribe()
         }
 
@@ -1099,6 +1149,11 @@ mod tests {
                 data.clone(),
                 context.clone(),
             ));
+            if event_type == EVENT_INTENT_DESCRIBE {
+                if let Some(window) = self.windows.lock().unwrap().last_mut() {
+                    *window += 1;
+                }
+            }
             if self.refuse.contains(&event_type) {
                 self.deliver(
                     EVENT_POLICY_DENIED,
@@ -1128,6 +1183,7 @@ mod tests {
                         .registered(&lang)
                         .into_iter()
                         .flat_map(|((skill_id, intent_name), samples)| {
+                            let (skill_id, intent_name) = (skill_id.as_str(), intent_name.as_str());
                             let mut template = json!({
                                 "skill_id": skill_id,
                                 "intent_name": intent_name,
@@ -1171,7 +1227,9 @@ mod tests {
                     let samples = self
                         .registered(&lang)
                         .into_iter()
-                        .find(|(key, _)| *key == (skill_id, intent_name))
+                        .find(|((registered_skill, registered_intent), _)| {
+                            registered_skill == skill_id && registered_intent == intent_name
+                        })
                         .map(|(_, samples)| samples);
                     let payload = match samples {
                         None => json!({"ok": false, "error": "unknown intent"}),
@@ -1638,7 +1696,7 @@ mod tests {
     #[tokio::test]
     async fn has_phrases_means_at_least_one_sentence() {
         let hub = FakeHub {
-            registrations: vec![("en-us", vec![((SHADOW, "custos.incidents"), vec![])])],
+            registrations: vec![("en-us", vec![registration(SHADOW, "custos.incidents", &[])])],
             ..Default::default()
         };
         let inventory = inventory(&hub, ["en-us"], &options(None)).await.unwrap();
@@ -1666,7 +1724,11 @@ mod tests {
             let hub = FakeHub {
                 registrations: vec![(
                     "en-us",
-                    vec![((WEATHER, "current.weather"), vec!["what is the weather"])],
+                    vec![registration(
+                        WEATHER,
+                        "current.weather",
+                        &["what is the weather"],
+                    )],
                 )],
                 keyword_rows,
                 definitions_in_list,
@@ -1683,6 +1745,139 @@ mod tests {
             let describes = hub.emitted(EVENT_INTENT_DESCRIBE).len();
             assert_eq!(describes, usize::from(!definitions_in_list));
         }
+    }
+
+    /// A hub with `count` intents in one skill, each with one sentence.
+    fn many_registrations(
+        lang: &'static str,
+        count: usize,
+    ) -> Vec<(&'static str, Vec<Registration>)> {
+        vec![(
+            lang,
+            (0..count)
+                .map(|index| {
+                    registration(
+                        WEATHER,
+                        &format!("intent.{index:03}"),
+                        &[&format!("sentence number {index}")],
+                    )
+                })
+                .collect(),
+        )]
+    }
+
+    #[tokio::test]
+    async fn a_large_inventory_is_described_in_bounded_batches() {
+        // 69 intents is 69 describes and, at two copies a reply, 138 inbound
+        // events against a 64-slot bus channel: sent as one window they would
+        // outrun the receiver and the sentences would go missing. Three
+        // windows of at most DESCRIBE_BATCH keep every reply.
+        let hub = FakeHub {
+            registrations: many_registrations("en-us", 69),
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-us"], &options(None)).await.unwrap();
+
+        assert_eq!(hub.emitted(EVENT_INTENT_DESCRIBE).len(), 69);
+        let windows: Vec<usize> = hub
+            .windows
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|sent| *sent > 0)
+            .collect();
+        assert_eq!(
+            windows,
+            [DESCRIBE_BATCH, DESCRIBE_BATCH, 69 - 2 * DESCRIBE_BATCH],
+            "three windows, none over DESCRIBE_BATCH"
+        );
+
+        assert_eq!(inventory.intents().count(), 69);
+        assert!(inventory.has_phrases());
+        for (index, intent) in inventory.intents().enumerate() {
+            assert_eq!(
+                intent.phrases_for("en-us"),
+                [format!("sentence number {index}")],
+                "{} lost its sentence",
+                intent.id()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_hub_gives_up_after_one_describe_batch() {
+        // Nothing is answered, so the first window's deadline ends it; the
+        // remaining requests are never sent.
+        let hub = FakeHub {
+            registrations: many_registrations("en-us", 69),
+            silent: vec![EVENT_INTENT_DESCRIBE],
+            ..Default::default()
+        };
+        let error = inventory(&hub, ["en-us"], &options(Some(Duration::from_millis(200))))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ThalovantError::Timeout(_)), "{error:?}");
+        assert_eq!(
+            hub.emitted(EVENT_INTENT_DESCRIBE).len(),
+            DESCRIBE_BATCH,
+            "one batch, not all 69 requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn batching_is_what_keeps_a_window_inside_the_bus_channel() {
+        // Why DESCRIBE_BATCH exists. 40 describes, each answered twice, is 80
+        // events against the transports' 64 slots, and every request goes out
+        // before the first reply is read: sent as one window (`batch` 0) the
+        // oldest replies are overwritten before the receiver sees them and
+        // those intents come back with no sentences. Bounded, the same 40 all
+        // arrive.
+        async fn describe_all(batch: usize) -> (usize, usize) {
+            let hub = FakeHub {
+                registrations: many_registrations("en-us", 40),
+                ..Default::default()
+            };
+            let rows = list_intents(&hub, "en-us", &IntentListOptions::default())
+                .await
+                .unwrap();
+            let wanted: Vec<Wanted> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.skill_id.clone(),
+                        row.intent_name.clone(),
+                        "en-us".to_string(),
+                    )
+                })
+                .collect();
+            // A short deadline: the fake answers at once, so only the window
+            // that lost replies ever waits it out.
+            let found = describe_many(&hub, &wanted, Duration::from_millis(300), batch)
+                .await
+                .unwrap();
+            let windows = hub
+                .windows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|sent| **sent > 0)
+                .count();
+            (found.len(), windows)
+        }
+
+        assert_eq!(
+            describe_all(DESCRIBE_BATCH).await,
+            (40, 2),
+            "bounded: two windows, every definition kept"
+        );
+        let (found, windows) = describe_all(0).await;
+        assert_eq!(windows, 1, "`batch` 0 sends them all at once");
+        assert!(
+            found < 40,
+            "precondition: one window of 40 overruns the channel, found {found}"
+        );
     }
 
     #[tokio::test]
