@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod errors;
 pub mod events;
 pub mod identity;
+pub mod intents;
 pub mod protocols;
 mod redact;
 pub mod rich;
@@ -36,6 +37,11 @@ pub use events::{
     utterance_payload, Context, Data, Event, Reply,
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
+pub use intents::{
+    HubIntent, HubIntentInventory, HubSkillIntents, IntentDefinition, IntentDescribeOptions,
+    IntentInventoryOptions, IntentInventorySource, IntentListOptions, IntentRegistration,
+    DEFAULT_INTENT_TIMEOUT,
+};
 pub use protocols::{
     endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,
     HubProtocolSettings, SelectedHubEndpoint, DEFAULT_PROTOCOL_PREFERENCE,

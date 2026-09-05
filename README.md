@@ -379,6 +379,42 @@ let items = control
 println!("{}", items["data"]);
 ```
 
+## What Can I Ask?
+
+A connected client can ask its hub what it can be asked, over its own session,
+with no control-plane token:
+
+```rust
+use thalovant::{Client, IntentInventoryOptions};
+
+let client = Client::from_file("_identity.json")?;
+let inventory = client
+    .intents(["en-us", "fr-fr"], IntentInventoryOptions::default())
+    .await?;
+for skill in &inventory.skills {
+    for intent in &skill.intents {
+        println!("{} {:?}", intent.id(), intent.examples(Some("fr-fr"), 2));
+    }
+}
+println!("{}", serde_json::to_string_pretty(&inventory)?);
+```
+
+Each intent carries the sentences a person says to reach it, per language, as
+the skill wrote them (`{location}` marks a slot); `examples` shows whole
+sentences before ones with a slot. The hub's connection must be allowed to
+publish `ovos.intent.list` and `ovos.intent.describe`. A hub that refuses
+answers `hive.policy.denied`, which the SDK returns at once as
+`ThalovantError::PolicyDenied` naming the type and the types the connection may
+publish. With the default `fallback: true`, a refused `ovos.intent.list` falls
+back to the engines' own manifests: the inventory then lists intent names only,
+with `source` set to `IntentInventorySource::EngineManifests` and `denied`
+naming the refused query.
+
+`list_intents(lang, IntentListOptions)` returns the manifest rows for one
+language and `describe_intent(skill_id, intent_name, lang, IntentDescribeOptions)`
+the registrations behind one intent, sentences included, for callers that want
+the two underlying queries.
+
 ## Use An Existing Identity
 
 For local development, store one or more identities in the protected SDK config:
@@ -604,6 +640,10 @@ for item in items {
 - MQTT fails immediately: create or download a fresh client identity after MQTT
   is enabled. MQTT needs the per-client `identity.mqtt` credentials.
 - A request times out: set `RequestOptions { timeout: Some(...), .. }`.
+- `ThalovantError::PolicyDenied`: the hub's policy does not let this connection
+  publish that message type (`ovos.intent.list`, say). Allow the type in the
+  connection's settings in the dashboard; `allowed` lists what it may publish
+  today.
 - `HTTP 429` with `"code": "token_rate_limited"`: the API token exceeded its
   plan's per-minute request rate (60 requests per minute on the free plan).
   The response carries a `Retry-After` header and a matching
@@ -674,6 +714,9 @@ resending. Per-plan limits are listed in the dashboard and at
 - `client.send_action(payload, options)`
 - `client.send_code(value, options)`
 - `client.conversation(options)`
+- `client.intents(languages, options)` (`IntentInventoryOptions`; the hub's intent manifest, sentences per language)
+- `client.list_intents(lang, options)` (`IntentListOptions`)
+- `client.describe_intent(skill_id, intent_name, lang, options)` (`IntentDescribeOptions`)
 
 ## Development
 

@@ -10,12 +10,16 @@ use crate::{
         new_session_id, utterance_payload, Context, Data, Event, Reply,
     },
     identity::Identity,
+    intents::{
+        self, HubIntentInventory, HubLink, IntentDefinition, IntentDescribeOptions,
+        IntentInventoryOptions, IntentListOptions, IntentRegistration, DEFAULT_INTENT_TIMEOUT,
+    },
     protocols::{HubProtocol, DEFAULT_PROTOCOL_PREFERENCE},
     transport::{HiveMessage, RuntimeTransport, TransportConnectionInfo, TransportHealth},
 };
 use serde_json::{Map, Value};
 use std::{path::Path, time::Duration};
-use tokio::time::timeout;
+use tokio::{sync::broadcast, time::timeout};
 
 #[derive(Clone)]
 pub struct Client {
@@ -475,6 +479,87 @@ impl Client {
             lang: opts.lang.unwrap_or_else(|| "en-us".to_string()),
             context: opts.context.unwrap_or_default(),
         }
+    }
+
+    /// Everything the hub can be asked, per language, grouped by skill.
+    ///
+    /// Read from the runtime's intent manifest over this session, so no
+    /// control-plane credential is involved. Each intent carries the sentences
+    /// a person says to reach it, as the skill wrote them, `{slot}`
+    /// placeholders included. `languages` defaults to `en-us` when empty.
+    ///
+    /// Fails with [`ThalovantError::PolicyDenied`] when the hub refuses the
+    /// query and `fallback` is off; with it on (the default), a hub allowed for
+    /// only the engines' manifests yields intent names with `source` set to
+    /// [`IntentInventorySource::EngineManifests`](crate::IntentInventorySource::EngineManifests).
+    pub async fn intents<I, S>(
+        &self,
+        languages: I,
+        opts: IntentInventoryOptions,
+    ) -> Result<HubIntentInventory>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.connect().await?;
+        intents::inventory(self, languages, &opts).await
+    }
+
+    /// The hub's intent manifest for one language, one row per registration.
+    ///
+    /// `lang` defaults to `en-us` when empty.
+    pub async fn list_intents(
+        &self,
+        lang: &str,
+        opts: IntentListOptions,
+    ) -> Result<Vec<IntentRegistration>> {
+        self.connect().await?;
+        intents::list_intents(self, lang_or_default(lang), &opts).await
+    }
+
+    /// The registrations behind one intent in one language, sentences included.
+    ///
+    /// Empty for a registration the hub does not know. `lang` defaults to
+    /// `en-us` when empty.
+    pub async fn describe_intent(
+        &self,
+        skill_id: &str,
+        intent_name: &str,
+        lang: &str,
+        opts: IntentDescribeOptions,
+    ) -> Result<Vec<IntentDefinition>> {
+        self.connect().await?;
+        intents::describe_intent(
+            self,
+            skill_id,
+            intent_name,
+            lang_or_default(lang),
+            opts.timeout.unwrap_or(DEFAULT_INTENT_TIMEOUT),
+        )
+        .await
+    }
+}
+
+fn lang_or_default(lang: &str) -> &str {
+    let lang = lang.trim();
+    if lang.is_empty() {
+        intents::DEFAULT_LANG
+    } else {
+        lang
+    }
+}
+
+impl HubLink for Client {
+    fn subscribe(&self) -> broadcast::Receiver<Event> {
+        self.transport.subscribe()
+    }
+
+    async fn emit_bus(&self, event_type: &str, data: Data, context: Context) -> Result<()> {
+        self.transport.emit_bus(event_type, data, context).await
+    }
+
+    fn site_id(&self) -> Option<String> {
+        Some(self.identity.site_id.clone()).filter(|value| !value.is_empty())
     }
 }
 
