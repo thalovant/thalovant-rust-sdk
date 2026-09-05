@@ -352,7 +352,8 @@ impl Serialize for HubSkillIntents {
 /// is the names-only fallback, and `denied` then names the query the hub refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HubIntentInventory {
-    /// The languages asked for, in the order they were asked.
+    /// The languages asked for, one per language in the order given, spelt
+    /// as first given (`en-US` after `en-us` is the same language, asked once).
     pub languages: Vec<String>,
     /// Sorted by skill id.
     pub skills: Vec<HubSkillIntents>,
@@ -367,7 +368,9 @@ impl HubIntentInventory {
         self.skills.iter().flat_map(|skill| skill.intents.iter())
     }
 
-    /// Whether any intent carries sentences; false for the names-only fallback.
+    /// True when at least one intent carries at least one sentence: false for
+    /// the names-only fallback, and for a manifest whose describes all came
+    /// back empty.
     pub fn has_phrases(&self) -> bool {
         self.intents().any(|intent| {
             intent
@@ -433,8 +436,10 @@ pub(crate) trait HubLink {
     fn site_id(&self) -> Option<String>;
 }
 
-/// The languages an inventory call asks about: trimmed, deduplicated, and
-/// `en-us` when the caller named none.
+/// The languages an inventory call asks about: trimmed, one entry per
+/// language whatever its spelling (`en-us`, `en-US` and `en_us` are one, the
+/// first spelling seen is kept, in the order given), and `en-us` when the
+/// caller named none.
 pub(crate) fn chosen_languages<I, S>(languages: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -443,7 +448,7 @@ where
     let mut chosen: Vec<String> = Vec::new();
     for language in languages {
         let tag = language.as_ref().trim();
-        if !tag.is_empty() && !chosen.iter().any(|seen| seen == tag) {
+        if !tag.is_empty() && !chosen.iter().any(|seen| same_language(seen, tag)) {
             chosen.push(tag.to_string());
         }
     }
@@ -779,16 +784,18 @@ fn inventory_from_names(
                 }
                 _ => (String::new(), raw.clone()),
             };
-            by_skill.entry(skill_id.clone()).or_default().insert(
-                intent_name.clone(),
-                HubIntent {
+            // First engine to name it wins, as on the manifest path.
+            by_skill
+                .entry(skill_id.clone())
+                .or_default()
+                .entry(intent_name.clone())
+                .or_insert_with(|| HubIntent {
                     skill_id,
                     name: intent_name,
                     engine: engine.to_string(),
                     enabled: true,
                     phrases: BTreeMap::new(),
-                },
-            );
+                });
         }
     }
     HubIntentInventory {
@@ -891,10 +898,13 @@ where
                     .map(|definition| definition.samples.clone())
                     .unwrap_or_default(),
             };
-            phrases
-                .entry(key)
-                .or_default()
-                .insert(lang.clone(), sentences);
+            // An intent registered under both engines has two rows for the
+            // language; the keyword row carries no sentences and must not
+            // erase the template row's, whichever order they arrive in.
+            let per_language = phrases.entry(key).or_default();
+            if !sentences.is_empty() || !per_language.contains_key(lang) {
+                per_language.insert(lang.clone(), sentences);
+            }
         }
     }
 
@@ -980,8 +990,19 @@ mod tests {
 
     type Emitted = (String, Data, Context);
 
+    /// Whether the hub also registered each intent under adapt, and where
+    /// that keyword row sits in the listing relative to the template row.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum KeywordRows {
+        None,
+        AfterTemplate,
+        BeforeTemplate,
+    }
+
     /// A hub session: answers the manifest, or refuses it, twice over.
     struct FakeHub {
+        /// Per language, what the hub registered; [`registrations`] by default.
+        registrations: Vec<(&'static str, Vec<Registration>)>,
         refuse: Vec<&'static str>,
         silent: Vec<&'static str>,
         definitions_in_list: bool,
@@ -989,6 +1010,9 @@ mod tests {
         repeats: usize,
         /// A skill whose describes go unanswered.
         deaf_to_describes_for: Option<&'static str>,
+        keyword_rows: KeywordRows,
+        /// What the adapt engine's manifest lists.
+        adapt_names: Vec<String>,
         tx: broadcast::Sender<Event>,
         emitted: Mutex<Vec<Emitted>>,
     }
@@ -996,12 +1020,18 @@ mod tests {
     impl Default for FakeHub {
         fn default() -> Self {
             Self {
+                registrations: ["en-us", "fr-fr"]
+                    .into_iter()
+                    .map(|lang| (lang, registrations(lang)))
+                    .collect(),
                 refuse: Vec::new(),
                 silent: Vec::new(),
                 definitions_in_list: false,
                 echo_request_id: true,
                 repeats: 2,
                 deaf_to_describes_for: None,
+                keyword_rows: KeywordRows::None,
+                adapt_names: Vec::new(),
                 tx: broadcast::channel(256).0,
                 emitted: Mutex::new(Vec::new()),
             }
@@ -1009,6 +1039,14 @@ mod tests {
     }
 
     impl FakeHub {
+        fn registered(&self, lang: &str) -> Vec<Registration> {
+            self.registrations
+                .iter()
+                .find(|(candidate, _)| *candidate == lang)
+                .map(|(_, rows)| rows.clone())
+                .unwrap_or_default()
+        }
+
         fn emitted(&self, event_type: &str) -> Vec<Emitted> {
             self.emitted
                 .lock()
@@ -1084,10 +1122,13 @@ mod tests {
                 .to_string();
             match event_type {
                 EVENT_INTENT_LIST => {
-                    let rows: Vec<Value> = registrations(&lang)
+                    let attach = self.definitions_in_list
+                        && data.get("include_definitions") == Some(&Value::Bool(true));
+                    let rows: Vec<Value> = self
+                        .registered(&lang)
                         .into_iter()
-                        .map(|((skill_id, intent_name), samples)| {
-                            let mut row = json!({
+                        .flat_map(|((skill_id, intent_name), samples)| {
+                            let mut template = json!({
                                 "skill_id": skill_id,
                                 "intent_name": intent_name,
                                 // The runtime standardises what it stores.
@@ -1096,13 +1137,23 @@ mod tests {
                                 "enabled": true,
                                 "session_id": "default",
                             });
-                            if self.definitions_in_list
-                                && data.get("include_definitions") == Some(&Value::Bool(true))
-                            {
-                                row["definition"] =
+                            let mut keyword = template.clone();
+                            keyword["method"] = json!("keyword");
+                            if attach {
+                                template["definition"] =
                                     Self::definition(&lang, skill_id, intent_name, &samples);
+                                keyword["definition"] = json!({
+                                    "skill_id": skill_id,
+                                    "intent_name": intent_name,
+                                    "lang": lang,
+                                    "required": [["WeatherKeyword"]],
+                                });
                             }
-                            row
+                            match self.keyword_rows {
+                                KeywordRows::None => vec![template],
+                                KeywordRows::AfterTemplate => vec![template, keyword],
+                                KeywordRows::BeforeTemplate => vec![keyword, template],
+                            }
                         })
                         .collect();
                     self.deliver(
@@ -1117,7 +1168,8 @@ mod tests {
                     if self.deaf_to_describes_for == Some(skill_id) {
                         return Ok(());
                     }
-                    let samples = registrations(&lang)
+                    let samples = self
+                        .registered(&lang)
                         .into_iter()
                         .find(|(key, _)| *key == (skill_id, intent_name))
                         .map(|(_, samples)| samples);
@@ -1131,12 +1183,17 @@ mod tests {
                     self.deliver(EVENT_INTENT_DESCRIBE_RESPONSE, payload, &context);
                 }
                 EVENT_ADAPT_MANIFEST_GET => {
-                    self.deliver(EVENT_ADAPT_MANIFEST, json!({"intents": []}), &context);
+                    self.deliver(
+                        EVENT_ADAPT_MANIFEST,
+                        json!({"intents": self.adapt_names}),
+                        &context,
+                    );
                 }
                 EVENT_PADATIOUS_MANIFEST_GET => {
-                    let names: BTreeSet<String> = ["en-us", "fr-fr"]
-                        .into_iter()
-                        .flat_map(registrations)
+                    let names: BTreeSet<String> = self
+                        .registrations
+                        .iter()
+                        .flat_map(|(_, rows)| rows.iter())
                         .map(|((skill_id, intent_name), _)| format!("{skill_id}:{intent_name}"))
                         .collect();
                     self.deliver(
@@ -1553,6 +1610,105 @@ mod tests {
         assert_eq!(
             chosen_languages([" fr-fr ", "en-us", "fr-fr"]),
             ["fr-fr", "en-us"]
+        );
+    }
+
+    #[tokio::test]
+    async fn languages_are_folded_and_deduplicated_before_asking() {
+        let hub = FakeHub::default();
+        let inventory = inventory(&hub, [" en-us ", "en-US", "en_us", "fr-fr"], &options(None))
+            .await
+            .unwrap();
+
+        assert_eq!(inventory.languages, ["en-us", "fr-fr"]);
+        assert_eq!(
+            hub.emitted(EVENT_INTENT_LIST)
+                .iter()
+                .map(|(_, data, _)| data["lang"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["en-us", "fr-fr"]
+        );
+        assert_eq!(
+            chosen_languages(["en-US", "en_us", "fr-fr", "FR_fr"]),
+            ["en-US", "fr-fr"],
+            "the first spelling seen is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_phrases_means_at_least_one_sentence() {
+        let hub = FakeHub {
+            registrations: vec![("en-us", vec![((SHADOW, "custos.incidents"), vec![])])],
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-us"], &options(None)).await.unwrap();
+
+        assert_eq!(inventory.intents().count(), 1);
+        assert_eq!(inventory.intents().next().unwrap().languages(), ["en-us"]);
+        assert!(
+            !inventory.has_phrases(),
+            "a describe that came back empty is not a phrase"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyword_row_does_not_erase_the_template_rows_sentences() {
+        // One intent, two registrations in one language: the keyword row has
+        // no samples. Whether it arrives after or before the template row,
+        // and whether the definitions ride on the listing or come from the
+        // describes, the sentences survive and the first row names the engine.
+        for (keyword_rows, definitions_in_list, engine) in [
+            (KeywordRows::AfterTemplate, true, "padatious"),
+            (KeywordRows::BeforeTemplate, true, "adapt"),
+            (KeywordRows::AfterTemplate, false, "padatious"),
+            (KeywordRows::BeforeTemplate, false, "adapt"),
+        ] {
+            let hub = FakeHub {
+                registrations: vec![(
+                    "en-us",
+                    vec![((WEATHER, "current.weather"), vec!["what is the weather"])],
+                )],
+                keyword_rows,
+                definitions_in_list,
+                ..Default::default()
+            };
+            let inventory = inventory(&hub, ["en-us"], &options(None)).await.unwrap();
+
+            assert_eq!(inventory.intents().count(), 1, "one intent, not two");
+            let weather = inventory.intents().next().unwrap();
+            assert_eq!(weather.phrases_for("en-us"), ["what is the weather"]);
+            assert_eq!(weather.engine, engine, "the first row names the engine");
+            assert!(inventory.has_phrases());
+            // Only the template row is described; the keyword row never is.
+            let describes = hub.emitted(EVENT_INTENT_DESCRIBE).len();
+            assert_eq!(describes, usize::from(!definitions_in_list));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fallback_keeps_the_first_engine_that_names_an_intent() {
+        let hub = FakeHub {
+            refuse: vec![EVENT_INTENT_LIST],
+            adapt_names: vec![format!("{WEATHER}:current.weather")],
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-us"], &options(None)).await.unwrap();
+
+        assert_eq!(inventory.source, IntentInventorySource::EngineManifests);
+        let weather = inventory
+            .intents()
+            .find(|intent| intent.name == "current.weather")
+            .unwrap();
+        assert_eq!(weather.engine, "adapt", "adapt is asked first and named it");
+        let shadow = inventory
+            .intents()
+            .find(|intent| intent.name == "custos.incidents")
+            .unwrap();
+        assert_eq!(shadow.engine, "padatious");
+        assert_eq!(
+            inventory.intents().count(),
+            2,
+            "a name both engines list is one intent"
         );
     }
 
