@@ -401,14 +401,20 @@ println!("{}", serde_json::to_string_pretty(&inventory)?);
 
 Each intent carries the sentences a person says to reach it, per language, as
 the skill wrote them (`{location}` marks a slot); `examples` shows whole
-sentences before ones with a slot. The hub's connection must be allowed to
-publish `ovos.intent.list` and `ovos.intent.describe`. A hub that refuses
-answers `hive.policy.denied`, which the SDK returns at once as
-`ThalovantError::PolicyDenied` naming the type and the types the connection may
-publish. With the default `fallback: true`, a refused `ovos.intent.list` falls
-back to the engines' own manifests: the inventory then lists intent names only,
-with `source` set to `IntentInventorySource::EngineManifests` and `denied`
-naming the refused query.
+sentences before ones with a slot. The hub's connection must always be allowed
+to publish `ovos.intent.list`. `ovos.intent.describe` is needed only when the
+client has to ask for the definitions itself -- that is, `describe: true` (the
+default) *and* a runtime that did not attach each row's `definition` to the
+listing; a runtime that honours `include_definitions` is sent no describe at
+all. A hub that refuses answers `hive.policy.denied`, which the
+SDK returns at once as `ThalovantError::PolicyDenied` naming the type and the
+types the connection may publish. With the default `fallback: true`, a refused
+`ovos.intent.list` falls back to the engines' own manifests: the inventory then
+lists intent names only, with `source` set to
+`IntentInventorySource::EngineManifests` and `denied` naming the refused query.
+A listing the hub answers `ok: false` is a different thing -- the query failed,
+which is not an empty hub and not a refusal to fall back from -- and returns
+`ThalovantError::Runtime` carrying the hub's own wording.
 
 `list_intents(lang, IntentListOptions)` returns the manifest rows for one
 language and `describe_intent(skill_id, intent_name, lang, IntentDescribeOptions)`

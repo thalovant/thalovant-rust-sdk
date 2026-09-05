@@ -15,10 +15,14 @@
 //!   session_id}]}`. `method` is `template` (sample sentences) or `keyword`
 //!   (keyword sets). A runtime may attach each entry's `definition` when asked
 //!   with `include_definitions`; when it does not, the client describes each
-//!   intent individually.
+//!   intent individually. `{"ok": false, "error"}` is a failed query, not an
+//!   empty hub: it becomes [`ThalovantError::Runtime`] carrying the hub's
+//!   wording.
 //! - `ovos.intent.describe` `{"skill_id", "intent_name", "lang"}` ->
 //!   `ovos.intent.describe.response` `{"ok", "definitions": [{method,
-//!   definition}]}` or `{"ok": false, "error"}`.
+//!   definition}]}` or `{"ok": false, "error"}`. Here `ok: false` is a real
+//!   answer -- the hub does not know that registration -- and leaves the
+//!   intent without sentences rather than failing.
 //!
 //! A hub whose connection may not publish a type answers `hive.policy.denied`
 //! naming it; that becomes [`ThalovantError::PolicyDenied`] at once rather
@@ -478,6 +482,9 @@ fn policy_denied(event: &Event) -> ThalovantError {
         .and_then(|inner| inner.get("allowed"))
         .and_then(Value::as_array)
         .map(|items| {
+            // Only strings: a number or a null in the hub's list is not a
+            // message type, and rendering one would put "3" or "null" in
+            // front of an operator reading which types to allow.
             items
                 .iter()
                 .filter_map(Value::as_str)
@@ -608,6 +615,21 @@ fn definitions_of(event: &Event) -> Vec<IntentDefinition> {
         .unwrap_or_default()
 }
 
+/// The hub's wording for a listing that failed, or a sentence of our own.
+fn listing_error(event: &Event) -> String {
+    let detail = match event.data.get("error") {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(other) if !other.is_null() => other.to_string(),
+        _ => String::new(),
+    };
+    let detail = if detail.is_empty() {
+        "the hub refused the listing"
+    } else {
+        detail.as_str()
+    };
+    format!("{EVENT_INTENT_LIST} failed: {detail}")
+}
+
 /// The hub's intent manifest for one language.
 pub(crate) async fn list_intents<L: HubLink>(
     link: &L,
@@ -628,6 +650,14 @@ pub(crate) async fn list_intents<L: HubLink>(
         opts.timeout.unwrap_or(DEFAULT_INTENT_TIMEOUT),
     )
     .await?;
+    if matches!(event.data.get("ok"), Some(Value::Bool(false))) {
+        // A refused listing is not an empty hub. A describe answering
+        // `ok: false` is a real answer -- the hub does not know that
+        // registration -- but a listing that failed has told us nothing, and
+        // reading the missing `intents` key as no intents would show a person
+        // a device that can do nothing.
+        return Err(ThalovantError::Runtime(listing_error(&event)));
+    }
     Ok(registrations_of(&event))
 }
 
@@ -1067,6 +1097,8 @@ mod tests {
         registrations: Vec<(&'static str, Vec<Registration>)>,
         refuse: Vec<&'static str>,
         silent: Vec<&'static str>,
+        /// Answer the listing `{"ok": false, "error": ...}` instead of rows.
+        listing_fails_with: Option<Value>,
         definitions_in_list: bool,
         echo_request_id: bool,
         repeats: usize,
@@ -1093,6 +1125,7 @@ mod tests {
                     .collect(),
                 refuse: Vec::new(),
                 silent: Vec::new(),
+                listing_fails_with: None,
                 definitions_in_list: false,
                 echo_request_id: true,
                 repeats: 2,
@@ -1198,6 +1231,14 @@ mod tests {
                 .to_string();
             match event_type {
                 EVENT_INTENT_LIST => {
+                    if let Some(error) = &self.listing_fails_with {
+                        self.deliver(
+                            EVENT_INTENT_LIST_RESPONSE,
+                            json!({"ok": false, "error": error}),
+                            &context,
+                        );
+                        return Ok(());
+                    }
                     let attach = self.definitions_in_list
                         && data.get("include_definitions") == Some(&Value::Bool(true));
                     let rows: Vec<Value> = self
@@ -1562,6 +1603,74 @@ mod tests {
                 assert!(message.contains(EVENT_INTENT_LIST), "{message}")
             }
             other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_listing_is_an_error_not_an_empty_hub() {
+        // `ok: false` means the query failed. Reading the missing `intents`
+        // key as no intents would show a person an empty hub, and the
+        // engine-manifest fallback answers a denial, not a failed query.
+        let hub = FakeHub {
+            listing_fails_with: Some(json!("manifest unavailable")),
+            ..Default::default()
+        };
+        let error = inventory(&hub, ["en-us"], &options(None))
+            .await
+            .unwrap_err();
+
+        match &error {
+            ThalovantError::Runtime(message) => {
+                assert!(message.contains(EVENT_INTENT_LIST), "{message}");
+                assert!(message.contains("manifest unavailable"), "{message}");
+            }
+            other => panic!("expected Runtime, got {other:?}"),
+        }
+        assert!(
+            hub.emitted(EVENT_ADAPT_MANIFEST_GET).is_empty(),
+            "a failed listing is not a refused one; it must not fall back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_fails_without_wording_still_names_the_query() {
+        for error in [json!(null), json!("   ")] {
+            let hub = FakeHub {
+                listing_fails_with: Some(error.clone()),
+                ..Default::default()
+            };
+            let message = list_intents(&hub, "en-us", &IntentListOptions::default())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(message.contains(EVENT_INTENT_LIST), "{error}: {message}");
+            assert!(
+                message.contains("refused the listing"),
+                "{error}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_string_entries_survive_in_the_allowed_list() {
+        // A number or a null in `allowed` is not a message type; stringifying
+        // one would put "3" in front of an operator reading which types to
+        // allow.
+        let error = policy_denied(&Event::new(
+            EVENT_POLICY_DENIED,
+            object(json!({
+                "denied_type": EVENT_INTENT_LIST,
+                "code": "acl_disallowed_type",
+                "data": {"allowed": ["speak", 3, null, "recognizer_loop:utterance"]},
+            })),
+            Context::new(),
+            None,
+        ));
+        match &error {
+            ThalovantError::PolicyDenied { allowed, .. } => {
+                assert_eq!(allowed, &["speak", "recognizer_loop:utterance"]);
+            }
+            other => panic!("expected PolicyDenied, got {other:?}"),
         }
     }
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- `list_intents` (and so `intents`) returns `ThalovantError::Runtime` carrying the hub's `error` text when the hub answers `ovos.intent.list` with `ok: false`, instead of reading the missing `intents` key as an empty list. A refused listing is not an empty hub, and reporting it as no intents showed a person a device that can do nothing; the engine-manifest fallback still answers a `hive.policy.denied` refusal only, since a failed query is not evidence the connection lacks the type. `describe_intent` keeps returning an empty list for `ok: false`, which is a real answer: the hub does not know that registration, so the intent simply has no sentences. Reported by the Kotlin port's review.
+- Documentation: `ovos.intent.list` is always needed; `ovos.intent.describe` only when the client has to ask for the definitions itself -- `describe` is on (the default) *and* the runtime did not attach each row's `definition` to the listing. A runtime that honours `include_definitions` is sent no describe at all. `ThalovantError::PolicyDenied`'s `allowed` already kept string entries only -- the other half of the Kotlin port's report -- and a test now pins it.
+
 ## 0.3.0
 
 - Add the intent inventory: `Client::intents(languages, IntentInventoryOptions)` reads the hub runtime's intent manifest (OVOS-INTENT-4 §10) over the client's own session and returns a `HubIntentInventory` — every intent each skill registered, per language, with the sentences a person says to reach it as the skill's locale files wrote them, `{slot}` placeholders included. No control-plane credential is involved. `Client::list_intents(lang, IntentListOptions)` and `Client::describe_intent(skill_id, intent_name, lang, IntentDescribeOptions)` expose the two underlying queries (`ovos.intent.list` / `ovos.intent.describe`).

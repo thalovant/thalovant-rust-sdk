@@ -488,10 +488,21 @@ impl Client {
     /// a person says to reach it, as the skill wrote them, `{slot}`
     /// placeholders included. `languages` defaults to `en-us` when empty.
     ///
+    /// The connection must always be allowed to publish `ovos.intent.list`.
+    /// `ovos.intent.describe` is needed only when the client has to ask for
+    /// the definitions itself: `describe` is on (the default) *and* the
+    /// runtime did not attach each row's `definition` to the listing. A
+    /// runtime that honours `include_definitions` is never sent a describe,
+    /// and `describe: false` never asks for the sentences at all.
+    ///
     /// Fails with [`ThalovantError::PolicyDenied`] when the hub refuses the
     /// query and `fallback` is off; with it on (the default), a hub allowed for
     /// only the engines' manifests yields intent names with `source` set to
     /// [`IntentInventorySource::EngineManifests`](crate::IntentInventorySource::EngineManifests).
+    /// A hub that answers the listing `ok: false` fails with
+    /// [`ThalovantError::Runtime`] carrying the hub's wording: a query that
+    /// failed is not an empty hub, and the fallback answers a refusal, not a
+    /// failure.
     pub async fn intents<I, S>(
         &self,
         languages: I,
@@ -507,7 +518,8 @@ impl Client {
 
     /// The hub's intent manifest for one language, one row per registration.
     ///
-    /// `lang` defaults to `en-us` when empty.
+    /// `lang` defaults to `en-us` when empty. A hub answering `ok: false`
+    /// fails with [`ThalovantError::Runtime`] rather than reporting no intents.
     pub async fn list_intents(
         &self,
         lang: &str,
@@ -519,8 +531,8 @@ impl Client {
 
     /// The registrations behind one intent in one language, sentences included.
     ///
-    /// Empty for a registration the hub does not know. `lang` defaults to
-    /// `en-us` when empty.
+    /// Empty for a registration the hub does not know -- `ok: false` here is a
+    /// real answer, not a failure. `lang` defaults to `en-us` when empty.
     pub async fn describe_intent(
         &self,
         skill_id: &str,
