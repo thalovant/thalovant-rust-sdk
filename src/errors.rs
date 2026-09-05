@@ -2,7 +2,12 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ThalovantError>;
 
+/// Every way an SDK call fails.
+///
+/// `#[non_exhaustive]`: a caller matching on this enum needs a wildcard arm,
+/// so a later release can name a new failure without breaking them.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ThalovantError {
     #[error("missing identity field: {0}")]
     MissingIdentityField(&'static str),
@@ -14,6 +19,25 @@ pub enum ThalovantError {
     Timeout(String),
     #[error("runtime error: {0}")]
     Runtime(String),
+    /// The hub refused a message type this connection may not publish.
+    ///
+    /// The hub answers `hive.policy.denied` at once, naming the type and the
+    /// list it does allow; failing here saves the caller a timeout and tells
+    /// the operator exactly what to add to the connection's allow-list.
+    #[error(
+        "policy denied: the hub refused `{denied_type}`: {}. Allow this connection to publish `{denied_type}` in the dashboard's connection settings.",
+        policy_denied_detail(.code, .reason)
+    )]
+    PolicyDenied {
+        /// The message type the hub refused, for example `ovos.intent.list`.
+        denied_type: String,
+        /// The hub's code, `acl_disallowed_type` for a type outside the allow-list.
+        code: String,
+        /// The hub's own wording, when it gave one.
+        reason: String,
+        /// The types this connection may publish, as the hub listed them.
+        allowed: Vec<String>,
+    },
     #[error("api error: {0}")]
     Api(String),
     #[error("device authorization denied: the sign-in request was denied in the browser")]
@@ -30,6 +54,13 @@ pub enum ThalovantError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Http(reqwest::Error),
+}
+
+fn policy_denied_detail<'a>(code: &'a str, reason: &'a str) -> &'a str {
+    [reason, code]
+        .into_iter()
+        .find(|text| !text.is_empty())
+        .unwrap_or("refused by the hub's policy")
 }
 
 impl From<reqwest::Error> for ThalovantError {

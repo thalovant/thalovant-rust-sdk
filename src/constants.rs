@@ -11,6 +11,16 @@ pub const EVENT_INTENT_FAILURE: &str = "complete_intent_failure";
 pub const EVENT_INTENT_UNMATCHED: &str = "ovos.intent.unmatched";
 pub const EVENT_POLICY_DENIED: &str = "hive.policy.denied";
 pub const EVENT_QUERY_TIMEOUT: &str = "hive.query.timeout";
+// The hub runtime's intent manifest (OVOS-INTENT-4 section 10) and the engines'
+// own manifests, the names-only fallback. See `intents`.
+pub const EVENT_INTENT_LIST: &str = "ovos.intent.list";
+pub const EVENT_INTENT_LIST_RESPONSE: &str = "ovos.intent.list.response";
+pub const EVENT_INTENT_DESCRIBE: &str = "ovos.intent.describe";
+pub const EVENT_INTENT_DESCRIBE_RESPONSE: &str = "ovos.intent.describe.response";
+pub const EVENT_ADAPT_MANIFEST_GET: &str = "intent.service.adapt.manifest.get";
+pub const EVENT_ADAPT_MANIFEST: &str = "intent.service.adapt.manifest";
+pub const EVENT_PADATIOUS_MANIFEST_GET: &str = "intent.service.padatious.manifest.get";
+pub const EVENT_PADATIOUS_MANIFEST: &str = "intent.service.padatious.manifest";
 
 pub fn is_failure_event(name: &str) -> bool {
     matches!(
