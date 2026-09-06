@@ -40,6 +40,11 @@
 - A `wss` connection the hub refuses now fails with the close reason instead of
   running out the handshake clock: a wrong password reported as a timeout hid
   what had actually happened.
+- **Breaking.** The MQTT transport now refuses a broker whose identity does not
+  enable TLS. Removing the crypto key took the separate payload cipher with it,
+  so TLS is the only confidentiality left on that hop; without it every message
+  and the broker password would travel in the clear. Use an `mqtts://`
+  endpoint, or set `tls: true` on the identity's `mqtt` block.
 - Messages larger than one Noise transport message are chunked at 65000 bytes
   and reassembled by the peer, with reassembly capped at 32 MiB. Any transport
   message that fails to decrypt, and any malformed chunk sequence, drops the

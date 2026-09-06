@@ -1579,6 +1579,16 @@ fn mqtt_options_for_identity(identity: &Identity) -> Result<MqttOptions> {
         ThalovantError::Connection("MQTT endpoint must include a host".to_string())
     })?;
     let tls_enabled = mqtt_tls_enabled(credentials, parsed.scheme());
+    // TLS is the only confidentiality on this path. The identity crypto key
+    // that once sealed MQTT payloads separately is gone with v3, so a broker
+    // hop without TLS would put every message, and the broker password with
+    // them, on the wire in the clear.
+    if !tls_enabled {
+        return Err(ThalovantError::Connection(
+            "refusing to connect to an MQTT broker without TLS. Use an mqtts:// endpoint, or set tls: true on the identity's mqtt block"
+                .to_string(),
+        ));
+    }
     let port = parsed.port().unwrap_or(mqtt_default_port(tls_enabled));
     let mut options = MqttOptions::new(
         format!("thalovant-{}", safe_mqtt_client_id(&identity.access_key)),
@@ -1768,5 +1778,53 @@ mod tests {
 
         assert_eq!(health.connection.phase, TransportConnectionPhase::Idle);
         assert!(health.connection.connect_ms.is_none());
+    }
+
+    /// Pins the one thing standing between an MQTT message and the wire now
+    /// that v3 removed the separate payload cipher.
+    #[test]
+    fn mqtt_options_refuse_a_cleartext_broker() {
+        let identity = Identity::from_value(serde_json::json!({
+            "access_key": "access",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "https://hub.example.com",
+            "mqtt": {
+                "endpoint": "mqtt://broker.example.com:1883",
+                "username": "access",
+                "password": "broker-secret",
+                "topic_prefix": "hubs/hub-1/client-1",
+                "tls": false
+            }
+        }))
+        .unwrap();
+
+        let error = mqtt_options_for_identity(&identity)
+            .expect_err("connected to a cleartext MQTT broker; every message and the broker password would go out in the clear")
+            .to_string();
+        assert!(
+            error.contains("mqtts://"),
+            "the refusal does not tell the caller how to proceed: {error}"
+        );
+    }
+
+    #[test]
+    fn mqtt_options_accept_a_tls_broker() {
+        let identity = Identity::from_value(serde_json::json!({
+            "access_key": "access",
+            "password": "secret",
+            "site_id": "site",
+            "default_master": "https://hub.example.com",
+            "mqtt": {
+                "endpoint": "mqtts://broker.example.com:8883",
+                "username": "access",
+                "password": "broker-secret",
+                "topic_prefix": "hubs/hub-1/client-1",
+                "tls": true
+            }
+        }))
+        .unwrap();
+
+        assert!(mqtt_options_for_identity(&identity).is_ok());
     }
 }
