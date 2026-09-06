@@ -27,6 +27,14 @@ pub const NOISE_PINS_FILENAME: &str = "noise_pins.json";
 
 /// Serializes the read-modify-write of the pin file, so two connections pinning
 /// different hubs at once cannot lose one another's entry.
+///
+/// This coordinates threads in one process only. Two *processes* sharing a
+/// state directory can still each read the map, decide, and commit -- and the
+/// rename means the later commit wins, which can drop a pin the other just
+/// added and make that hub look like first contact again. Closing that needs an
+/// inter-process lock, which is a dependency this SDK does not carry today; the
+/// static key is handled separately, with `create_new`, because losing that
+/// race strands a client permanently rather than costing a re-pin.
 static PIN_LOCK: Mutex<()> = Mutex::new(());
 
 /// The directory holding the static key and the pin file.
@@ -77,11 +85,40 @@ pub fn load_or_create_noise_key(dir: Option<&Path>) -> Result<[u8; 32]> {
             let mut key = [0_u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
             fs::create_dir_all(&dir)?;
-            write_private(&path, &hex::encode(key))?;
-            Ok(key)
+            // create_new at the final path, not a rename: PIN_LOCK only covers
+            // this process, so another process can be generating a key at the
+            // same moment. Renaming over the destination would leave one of
+            // them holding a key that is not the one on disk -- and the hub
+            // pins what it was shown, so that client would be refused for good.
+            // Losing the create means the other process won; read its key.
+            match write_private_exclusive(&path, &hex::encode(key)) {
+                Ok(()) => Ok(key),
+                Err(ThalovantError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    load_existing_noise_key(&path)
+                }
+                Err(err) => Err(err),
+            }
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// Read a static key that is already on disk, enforcing its permissions.
+fn load_existing_noise_key(path: &Path) -> Result<[u8; 32]> {
+    assert_secure_secret_file(path, "Noise key file")?;
+    let raw = fs::read_to_string(path)?;
+    let decoded = hex::decode(raw.trim()).map_err(|_| {
+        ThalovantError::InvalidIdentity(format!(
+            "Noise key file {} is not a 32-byte hex key",
+            path.display()
+        ))
+    })?;
+    decoded.try_into().map_err(|_| {
+        ThalovantError::InvalidIdentity(format!(
+            "Noise key file {} is not a 32-byte hex key",
+            path.display()
+        ))
+    })
 }
 
 /// The pinned hub static key for a node id, or `None` when this client has not
@@ -175,6 +212,14 @@ fn write_pins(path: &Path, pins: &BTreeMap<String, String>) -> Result<()> {
     let mut encoded = serde_json::to_string_pretty(pins)?;
     encoded.push('\n');
     write_private(path, &encoded)
+}
+
+/// Create a secret file at `path`, failing if it already exists.
+///
+/// Used where losing the race must be observable rather than silently
+/// overwriting: whoever creates the file first owns the value.
+fn write_private_exclusive(path: &Path, contents: &str) -> Result<()> {
+    write_private_at(path, contents)
 }
 
 /// Write a secret file atomically: a uniquely named temporary file in the same
@@ -285,6 +330,37 @@ mod tests {
             load_noise_pin(Some(&dir), "hub-two").unwrap().as_deref(),
             Some("22".repeat(32).as_str())
         );
+    }
+
+    /// The create race is closed by `create_new` semantics: the second writer
+    /// must be told the file exists rather than replacing it, so
+    /// `load_or_create_noise_key` can reload the winner's key.
+    ///
+    /// This pins that primitive. The full race needs the file to be absent at
+    /// the read and present at the create, which one process cannot stage
+    /// without injecting a delay into the function under test -- so what is
+    /// asserted here is the property the fix rests on, not the interleaving.
+    #[test]
+    fn creating_a_static_key_never_replaces_an_existing_one() {
+        let dir = tempdir();
+        let path = dir.join(NOISE_KEY_FILENAME);
+        let theirs = [7_u8; 32];
+
+        write_private_exclusive(&path, &hex::encode(theirs)).unwrap();
+
+        let error = write_private_exclusive(&path, &hex::encode([9_u8; 32]))
+            .expect_err("a second create replaced the existing static key");
+        match error {
+            ThalovantError::Io(err) => assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "the caller cannot tell it lost the race: {err}"
+            ),
+            other => panic!("expected an AlreadyExists io error, got {other}"),
+        }
+
+        // And the winner's key is what a subsequent load returns.
+        assert_eq!(load_or_create_noise_key(Some(&dir)).unwrap(), theirs);
     }
 
     #[test]

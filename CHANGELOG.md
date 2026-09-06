@@ -51,6 +51,12 @@
 - Trust on first use moved into `noise_store::pin_hub_key`, which holds the pin
   lock across the read and the write. Checking for a pin and then writing it as
   separate calls was the race itself.
+- The static key is created with `create_new` straight at its final path. The
+  pin lock only covers one process, so two processes could each generate a key
+  and the rename would leave one of them holding a key the file does not
+  contain -- and the hub pins what it was shown, so that client would be
+  refused for good. Losing the create now reloads the winner's key. Pin-map
+  updates remain process-local; see the note in `noise_store`.
 - Noise state files are written to a uniquely named temporary file created
   `0600` with `create_new` and renamed into place. A truncating write left the
   pin file empty on failure, which reads back as "no pins" and would silently
