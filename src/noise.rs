@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn derive_psk_matches_the_reference_vectors() {
-        for (password, node_id, expected) in [
+        for (index, case) in [
             (
                 "Tr0ub4dor-Horse-Battery-91x",
                 "node-alpha",
@@ -563,12 +563,19 @@ mod tests {
                 "hub-\u{fc}ml\u{e4}ut",
                 "988418601dbad183fbd6116e7981e9ab8ffe93be3f3f45c27eb0b70c325f9cd8",
             ),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (password, node_id, expected) = case;
             let psk = derive_psk(password, node_id).unwrap();
+            // Identify the failing case by index rather than by echoing the
+            // password: these are public reference vectors, but a test that
+            // prints a secret teaches the wrong habit and trips secret scanners.
             assert_eq!(
                 hex::encode(psk),
                 expected,
-                "the pre-shared key for ({password:?}, {node_id:?}) does not match the reference"
+                "vector {index} (node id {node_id:?}) does not match the reference"
             );
         }
     }
