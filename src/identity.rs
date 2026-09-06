@@ -125,14 +125,13 @@ impl fmt::Debug for MqttBrokerCredentials {
     }
 }
 
-// `Debug` is hand-written (below) to redact `access_key`, `password`, and
-// `crypto_key`; `Serialize` stays derived so identity-file persistence and the
-// wire protocol keep emitting the real credential values.
+// `Debug` is hand-written (below) to redact `access_key` and `password`;
+// `Serialize` stays derived so identity-file persistence and the wire protocol
+// keep emitting the real credential values.
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub struct Identity {
     pub access_key: String,
     pub password: String,
-    pub crypto_key: Option<String>,
     pub site_id: String,
     pub default_master: String,
     pub default_port: u16,
@@ -204,7 +203,6 @@ impl Identity {
         Ok(Self {
             access_key,
             password,
-            crypto_key: optional_string(object, "crypto_key", &["cryptoKey", "preshared_key"])?,
             site_id,
             default_master,
             default_port,
@@ -231,7 +229,6 @@ impl Identity {
         for (env_key, field) in [
             ("ACCESS_KEY", "access_key"),
             ("PASSWORD", "password"),
-            ("CRYPTO_KEY", "crypto_key"),
             ("SITE_ID", "site_id"),
             ("DEFAULT_MASTER", "default_master"),
             ("HUB_HTTP_HOST", "default_master"),
@@ -338,10 +335,6 @@ impl fmt::Debug for Identity {
             .debug_struct("Identity")
             .field("access_key", &crate::redact::REDACTED)
             .field("password", &crate::redact::REDACTED)
-            .field(
-                "crypto_key",
-                &self.crypto_key.as_ref().map(|_| crate::redact::REDACTED),
-            )
             .field("site_id", &self.site_id)
             // Endpoints may embed `user:pass@` userinfo; strip it in this
             // non-secret view, matching `as_value(false)` / `as_map(true)`.
@@ -417,7 +410,7 @@ fn assert_secure_identity_file(path: &Path) -> Result<()> {
     assert_secure_secret_file(path, "identity file")
 }
 
-fn assert_secure_secret_file(path: &Path, description: &str) -> Result<()> {
+pub(crate) fn assert_secure_secret_file(path: &Path, description: &str) -> Result<()> {
     let metadata = fs::metadata(path)?;
     #[cfg(unix)]
     {
@@ -887,7 +880,6 @@ profiles:
         let identity = Identity::from_value(json!({
             "access_key": "ak-LIVE-SECRET",
             "password": "pw-LIVE-SECRET",
-            "crypto_key": "ck-LIVE-SECRET",
             "site_id": "site",
             "default_master": "https://hub.example.com",
             "default_port": 443,
@@ -901,12 +893,7 @@ profiles:
 
         // `{:?}` must never leak a secret, but stays useful for non-secret fields.
         let debug = format!("{identity:?}");
-        for secret in [
-            "ak-LIVE-SECRET",
-            "pw-LIVE-SECRET",
-            "ck-LIVE-SECRET",
-            "broker-LIVE-SECRET",
-        ] {
+        for secret in ["ak-LIVE-SECRET", "pw-LIVE-SECRET", "broker-LIVE-SECRET"] {
             assert!(!debug.contains(secret), "Debug leaked {secret}: {debug}");
         }
         assert!(debug.contains("<redacted>"));
@@ -917,14 +904,12 @@ profiles:
         let serialized = serde_json::to_value(&identity).unwrap();
         assert_eq!(serialized["access_key"], "ak-LIVE-SECRET");
         assert_eq!(serialized["password"], "pw-LIVE-SECRET");
-        assert_eq!(serialized["crypto_key"], "ck-LIVE-SECRET");
         assert_eq!(serialized["mqtt"]["password"], "broker-LIVE-SECRET");
 
         // ...and a Serialize -> parse round-trip recovers the same secrets.
         let restored = Identity::from_value(serialized).unwrap();
         assert_eq!(restored.access_key, "ak-LIVE-SECRET");
         assert_eq!(restored.password, "pw-LIVE-SECRET");
-        assert_eq!(restored.crypto_key.as_deref(), Some("ck-LIVE-SECRET"));
         assert_eq!(
             restored.mqtt.as_ref().map(|mqtt| mqtt.password.as_str()),
             Some("broker-LIVE-SECRET")
