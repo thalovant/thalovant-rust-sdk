@@ -40,6 +40,14 @@
 - A `wss` connection the hub refuses now fails with the close reason instead of
   running out the handshake clock: a wrong password reported as a timeout hid
   what had actually happened.
+- **Breaking.** `HttpTransport::connect` now refuses a hub endpoint that is not
+  `https://`, for the same reason as the MQTT change below: TLS is the only
+  confidentiality left on that hop, and the access key travels in the
+  `authorization` query.
+- `create_client_identity` drops `cryptoKey` and `crypto_key` from a
+  caller-supplied `opts.spec` rather than passing them through. The error
+  redaction covers only what the SDK mints, so a legacy value left in by a
+  caller could otherwise be echoed back inside a `ThalovantError::Api`.
 - **Breaking.** The MQTT transport now refuses a broker whose identity does not
   enable TLS. Removing the crypto key took the separate payload cipher with it,
   so TLS is the only confidentiality left on that hop; without it every message

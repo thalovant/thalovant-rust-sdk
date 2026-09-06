@@ -268,6 +268,14 @@ impl HttpTransport {
     pub async fn connect(&self) -> Result<()> {
         let started = Instant::now();
         self.set_connection(connecting_connection()).await;
+        // TLS is the only confidentiality on this path. The identity crypto key
+        // that once sealed HTTP payloads separately is gone with v3, so a plain
+        // http:// hub would put every message, and the access key in the
+        // authorization query, on the wire in the clear.
+        if let Err(error) = require_tls_endpoint(&self.base_url()) {
+            self.mark_connection_error(&error).await;
+            return Err(error);
+        }
         let response = self
             .state
             .http_client
@@ -1601,6 +1609,22 @@ fn mqtt_options_for_identity(identity: &Identity) -> Result<MqttOptions> {
     Ok(options)
 }
 
+/// Refuse a hub endpoint that is not https.
+fn require_tls_endpoint(endpoint: &str) -> Result<()> {
+    let parsed = Url::parse(endpoint).map_err(|_| {
+        ThalovantError::Connection(format!(
+            "the HTTP transport needs a valid https:// endpoint; got {endpoint}"
+        ))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(ThalovantError::Connection(format!(
+            "refusing to use the HTTP transport over {}://. It needs an https:// endpoint: without TLS every message and the access key travel in the clear",
+            parsed.scheme()
+        )));
+    }
+    Ok(())
+}
+
 fn default_mqtt_tls_transport() -> Transport {
     Transport::tls_with_config(TlsConfiguration::Native)
 }
@@ -1826,5 +1850,22 @@ mod tests {
         .unwrap();
 
         assert!(mqtt_options_for_identity(&identity).is_ok());
+    }
+
+    /// Pins the one thing standing between an HTTPS-transport message and the
+    /// wire now that v3 removed the payload cipher. The access key also travels
+    /// in the authorization query.
+    #[test]
+    fn require_tls_endpoint_refuses_cleartext() {
+        let error = require_tls_endpoint("http://hub.example.com")
+            .expect_err("accepted a cleartext endpoint; every message and the access key would go out in the clear")
+            .to_string();
+        assert!(
+            error.contains("https://"),
+            "the refusal does not tell the caller how to proceed: {error}"
+        );
+
+        assert!(require_tls_endpoint("https://hub.example.com").is_ok());
+        assert!(require_tls_endpoint("not a url").is_err());
     }
 }

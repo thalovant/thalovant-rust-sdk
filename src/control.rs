@@ -1230,7 +1230,7 @@ impl ControlPlane {
         let api_key = new_secret();
         let password = new_secret();
 
-        let mut spec = opts.spec.clone();
+        let mut spec = sanitize_caller_spec(&opts.spec);
         spec.entry("version".to_string())
             .or_insert_with(|| Value::String("1".to_string()));
         spec.insert("apiKey".to_string(), Value::String(api_key.clone()));
@@ -1639,9 +1639,46 @@ fn server_error_detail(body: &str) -> String {
     }
 }
 
+/// A caller-supplied client spec with the legacy crypto key removed.
+///
+/// `opts.spec` is passed straight through into the `POST /v1/clients` body, and
+/// the error redaction covers only the secrets minted here -- so a legacy value
+/// a caller left in could be echoed back inside an `Api` error. v3 issues no
+/// crypto key, so both spellings are dropped.
+fn sanitize_caller_spec(spec: &Map<String, Value>) -> Map<String, Value> {
+    let mut sanitized = spec.clone();
+    sanitized.remove("cryptoKey");
+    sanitized.remove("crypto_key");
+    sanitized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_callers_legacy_crypto_key_never_reaches_the_request() {
+        let caller = serde_json::json!({
+            "cryptoKey": "caller-supplied-SECRET",
+            "crypto_key": "caller-supplied-SECRET-2",
+            "label": "keep-me",
+        });
+        let sanitized = sanitize_caller_spec(caller.as_object().unwrap());
+
+        assert!(
+            !sanitized.contains_key("cryptoKey"),
+            "a caller-supplied cryptoKey would reach /v1/clients"
+        );
+        assert!(
+            !sanitized.contains_key("crypto_key"),
+            "a caller-supplied crypto_key would reach /v1/clients"
+        );
+        assert_eq!(
+            sanitized.get("label").and_then(Value::as_str),
+            Some("keep-me"),
+            "the rest of the caller's spec must survive"
+        );
+    }
     use std::{
         io::{Read, Write},
         net::TcpListener,
