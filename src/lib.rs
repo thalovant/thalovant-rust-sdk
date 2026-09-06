@@ -4,11 +4,12 @@ pub mod client;
 pub mod constants;
 pub mod context;
 pub mod control;
-pub mod crypto;
 pub mod errors;
 pub mod events;
 pub mod identity;
 pub mod intents;
+pub mod noise;
+pub mod noise_store;
 pub mod protocols;
 mod redact;
 pub mod rich;
@@ -28,9 +29,6 @@ pub use control::{
     MemoryListOptions, OperationResource, OperationStatus, ReleaseOptions, SkillInstallOptions,
     DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_SKILL_SOURCE_TYPE,
 };
-pub use crypto::{
-    decrypt_binary, decrypt_from_json, encrypt_as_binary, encrypt_as_json, runtime_crypto_key,
-};
 pub use errors::{Result, ThalovantError};
 pub use events::{
     context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
@@ -41,6 +39,14 @@ pub use intents::{
     HubIntent, HubIntentInventory, HubSkillIntents, IntentDefinition, IntentDescribeOptions,
     IntentInventoryOptions, IntentInventorySource, IntentListOptions, IntentRegistration,
     DEFAULT_INTENT_TIMEOUT, DESCRIBE_BATCH,
+};
+pub use noise::{
+    canonical_json, derive_psk, noise_protocol_name, select_noise_options, NoiseFrame,
+    NoiseHandshake, NoiseSession, NOISE_PATTERN_KK, NOISE_PATTERN_XX, NOISE_SUITES, PROTOCOL_V3,
+};
+pub use noise_store::{
+    forget_noise_pin, load_noise_pin, load_or_create_noise_key, noise_state_dir,
+    NOISE_KEY_FILENAME, NOISE_PINS_FILENAME,
 };
 pub use protocols::{
     endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,

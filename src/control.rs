@@ -1229,14 +1229,12 @@ impl ControlPlane {
         let site_id = clean_site_id(opts.site_id.as_deref().unwrap_or(&opts.name));
         let api_key = new_secret();
         let password = new_secret();
-        let crypto_key = new_secret();
 
         let mut spec = opts.spec.clone();
         spec.entry("version".to_string())
             .or_insert_with(|| Value::String("1".to_string()));
         spec.insert("apiKey".to_string(), Value::String(api_key.clone()));
         spec.insert("password".to_string(), Value::String(password.clone()));
-        spec.insert("cryptoKey".to_string(), Value::String(crypto_key.clone()));
         spec.insert("siteId".to_string(), Value::String(site_id.clone()));
 
         let mut payload = Map::from_iter([
@@ -1278,7 +1276,6 @@ impl ControlPlane {
             Identity {
                 access_key: api_key,
                 password,
-                crypto_key: Some(crypto_key),
                 site_id,
                 default_master,
                 default_port: 443,
@@ -1454,9 +1451,6 @@ impl BootstrapIdentityResult {
                 "password".to_string(),
                 Value::String(self.identity.password.clone()),
             );
-            if let Some(crypto_key) = self.identity.crypto_key.clone() {
-                identity.insert("crypto_key".to_string(), Value::String(crypto_key));
-            }
         }
         if let Some(mqtt) = self.identity.mqtt.as_ref() {
             identity.insert("mqtt".to_string(), mqtt.as_value(include_secrets));

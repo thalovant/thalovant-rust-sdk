@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.4.0
+
+- **Breaking.** `wss` connections now perform the HiveMind v3 Noise handshake,
+  and only that. A HiveMind-core 5.x hub accepts no other key exchange, so this
+  release requires one; against an older hub the connection is refused rather
+  than downgraded. `Noise_XXpsk2_25519_ChaChaPoly_SHA256` on first contact and
+  `Noise_KKpsk0_...` once the hub's static key is pinned, with
+  `25519_AESGCM_SHA256` supported where a hub prefers it.
+- **Breaking.** `Identity::crypto_key` is gone, along with the whole `crypto`
+  module (`encrypt_as_json`, `decrypt_from_json`, `encrypt_as_binary`,
+  `decrypt_binary`, `runtime_crypto_key`) and the pre-shared handshake on all
+  three transports. Hubs no longer issue a crypto key and v3 derives its
+  pre-shared key from the `password`, so the field named a credential that no
+  longer exists. `crypto_key` is still accepted and ignored when parsing an
+  older identity file, and stays in the bootstrap redaction list so an older
+  payload carrying one does not leak it. `https` and `mqtt` now rely on TLS for
+  confidentiality, as they already did for everything the crypto key did not
+  cover.
+- The Noise pre-shared key is derived from `password` with argon2id
+  (`t_cost=3`, 64 MiB, `p_cost=1`), salted with SHA-256 of the hub's node id. A
+  transport caches it per hub, so only the first connection pays the few
+  hundred milliseconds.
+- New `noise` and `noise_store` modules: `derive_psk`, `canonical_json`,
+  `select_noise_options`, `NoiseHandshake`, `NoiseSession`, and the on-disk
+  state helpers `load_or_create_noise_key`, `load_noise_pin`, `save_noise_pin`
+  and `forget_noise_pin`.
+- Two files persist beside the SDK config file, both `0600`: `noise_key` (this
+  client's static X25519 key) and `noise_pins.json` (the hub keys it has
+  pinned). `WssTransport::set_noise_state_dir` overrides the location.
+- Trust on first use: the first hub key seen for a node id is pinned, and a
+  later connection presenting a different key is refused with an error naming
+  `forget_noise_pin`, rather than silently re-pinned. A failed `KKpsk0`
+  handshake drops the stale pin, because `KK` needs each side to hold the
+  other's key and the failure is as likely to mean the hub no longer has this
+  client's.
+- `WssTransport::remote_static_key` reports the hub's static key for the
+  current session.
+- A `wss` connection the hub refuses now fails with the close reason instead of
+  running out the handshake clock: a wrong password reported as a timeout hid
+  what had actually happened.
+- Messages larger than one Noise transport message are chunked at 65000 bytes
+  and reassembled by the peer, with reassembly capped at 32 MiB. Any transport
+  message that fails to decrypt, and any malformed chunk sequence, drops the
+  session rather than the frame.
+- `HiveMessage` derives `Default`.
+
 ## 0.3.1
 
 - `list_intents` (and so `intents`) returns `ThalovantError::Runtime` carrying the hub's `error` text when the hub answers `ovos.intent.list` with `ok: false`, instead of reading the missing `intents` key as an empty list. A refused listing is not an empty hub, and reporting it as no intents showed a person a device that can do nothing; the engine-manifest fallback still answers a `hive.policy.denied` refusal only, since a failed query is not evidence the connection lacks the type. `describe_intent` keeps returning an empty list for `ok: false`, which is a real answer: the hub does not know that registration, so the intent simply has no sentences. Reported by the Kotlin port's review.

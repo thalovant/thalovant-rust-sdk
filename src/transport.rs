@@ -1,11 +1,13 @@
 use crate::{
     constants::DEFAULT_USER_AGENT,
-    crypto::{
-        decrypt_binary, decrypt_from_json, encrypt_as_binary, encrypt_as_json, runtime_crypto_key,
-    },
     errors::{Result, ThalovantError},
     events::{event_from_bus_payload, Data, Event},
     identity::{Identity, MqttBrokerCredentials},
+    noise::{
+        build_prologue, canonical_json, derive_psk, noise_protocol_name, select_noise_options,
+        NoiseFrame, NoiseHandshake, NoiseSession, NOISE_PATTERN_KK,
+    },
+    noise_store::{forget_noise_pin, load_noise_pin, load_or_create_noise_key, save_noise_pin},
     protocols::HubProtocol,
     tls::ensure_rustls_provider,
     wire::{decode_hive_binary_frame, encode_hive_binary_frame},
@@ -19,6 +21,7 @@ use rumqttc::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -80,7 +83,7 @@ impl Default for TransportConnectionInfo {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct HiveMessage {
     pub msg_type: String,
     #[serde(default)]
@@ -419,17 +422,7 @@ impl HttpTransport {
 
     async fn handle_raw_message(&self, raw: Value) -> Result<()> {
         let decoded = match raw {
-            Value::String(raw) => {
-                let parsed: Value = serde_json::from_str(&raw)?;
-                if parsed.get("ciphertext").is_some() {
-                    self.decrypt_message_value(parsed)?
-                } else {
-                    parsed
-                }
-            }
-            Value::Object(object) if object.get("ciphertext").is_some() => {
-                self.decrypt_message_value(Value::Object(object))?
-            }
+            Value::String(raw) => serde_json::from_str(&raw)?,
             other => other,
         };
         let message: HiveMessage = serde_json::from_value(decoded.clone())?;
@@ -448,28 +441,13 @@ impl HttpTransport {
         }
     }
 
-    fn decrypt_message_value(&self, value: Value) -> Result<Value> {
-        let key = self.state.identity.crypto_key.as_deref().ok_or_else(|| {
-            ThalovantError::Crypto(
-                "encrypted message received without identity.crypto_key".to_string(),
-            )
-        })?;
-        let decrypted = decrypt_from_json(key, &value.to_string())?;
-        Ok(serde_json::from_str(&decrypted)?)
-    }
-
+    /// Complete the HTTP handshake.
+    ///
+    /// HTTP runs no Noise session: it authenticates with the identity
+    /// credentials and takes its confidentiality from TLS, so there is no key
+    /// exchange here.
     async fn handle_handshake(&self, payload: Map<String, Value>) -> Result<()> {
-        if truthy(payload.get("preshared_key"))
-            && !truthy(payload.get("handshake"))
-            && payload.get("envelope").is_none()
-        {
-            let crypto_key = self.state.identity.crypto_key.as_deref();
-            if runtime_crypto_key(crypto_key).is_none() {
-                return Err(ThalovantError::Connection(
-                    "HiveMind requested a preshared key, but identity.crypto_key is missing"
-                        .to_string(),
-                ));
-            }
+        if !truthy(payload.get("handshake")) && payload.get("envelope").is_none() {
             self.send_hive_message(
                 HiveMessage {
                     msg_type: "hello".to_string(),
@@ -497,21 +475,12 @@ impl HttpTransport {
             return Ok(());
         }
         Err(ThalovantError::Connection(
-            "Only HiveMind preshared-key HTTP handshakes are supported in this alpha".to_string(),
+            "unexpected HiveMind HTTP handshake envelope".to_string(),
         ))
     }
 
-    pub async fn send_hive_message(&self, message: HiveMessage, encrypt: bool) -> Result<()> {
-        let serialized = serde_json::to_string(&message)?;
-        let payload = if encrypt && self.is_handshake_complete().await {
-            if let Some(key) = self.state.identity.crypto_key.as_deref() {
-                encrypt_as_json(key, &serialized)?
-            } else {
-                serialized
-            }
-        } else {
-            serialized
-        };
+    pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
+        let payload = serde_json::to_string(&message)?;
         let response = self
             .state
             .http_client
@@ -578,6 +547,20 @@ struct WssTransportState {
     writer: Mutex<Option<WssWriter>>,
     read_task: Mutex<Option<JoinHandle<()>>>,
     handshake_notify: Notify,
+
+    /// Overrides where the static key and the pin file live. `None` uses the
+    /// directory holding the SDK config file.
+    noise_state_dir: Mutex<Option<PathBuf>>,
+    /// The hub's cleartext HELLO payload, kept verbatim because it is bound
+    /// into the Noise prologue rather than read for the node id alone.
+    server_hello: Mutex<Option<Map<String, Value>>>,
+    node_id: Mutex<String>,
+    noise_handshake: Mutex<Option<NoiseHandshake>>,
+    session: Mutex<Option<Arc<NoiseSession>>>,
+    /// Deriving the pre-shared key costs 64 MiB and a few hundred
+    /// milliseconds, and the result is fixed for a (password, node id) pair,
+    /// so a reconnect to the same hub reuses it.
+    psk_cache: Mutex<Option<(String, [u8; 32])>>,
 }
 
 impl WssTransport {
@@ -595,12 +578,35 @@ impl WssTransport {
                 writer: Mutex::new(None),
                 read_task: Mutex::new(None),
                 handshake_notify: Notify::new(),
+                noise_state_dir: Mutex::new(None),
+                server_hello: Mutex::new(None),
+                node_id: Mutex::new(String::new()),
+                noise_handshake: Mutex::new(None),
+                session: Mutex::new(None),
+                psk_cache: Mutex::new(None),
             }),
         }
     }
 
     pub fn identity(&self) -> &Identity {
         &self.state.identity
+    }
+
+    /// Put the Noise static key and pin file somewhere other than beside the
+    /// SDK config file.
+    pub async fn set_noise_state_dir(&self, dir: Option<PathBuf>) {
+        *self.state.noise_state_dir.lock().await = dir;
+    }
+
+    /// The hub's Noise static public key for the current session, hex encoded.
+    /// `None` before the handshake completes.
+    pub async fn remote_static_key(&self) -> Option<String> {
+        self.state
+            .session
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|session| session.remote_static_key().map(str::to_string))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -664,16 +670,14 @@ impl WssTransport {
                 match message {
                     Ok(WebSocketMessage::Text(payload)) => {
                         if let Err(error) =
-                            transport.handle_raw_message(Value::String(payload)).await
+                            transport.handle_socket_message(payload.into_bytes()).await
                         {
                             transport.mark_error(&error).await;
                             break;
                         }
                     }
                     Ok(WebSocketMessage::Binary(payload)) => {
-                        let text = String::from_utf8_lossy(&payload).to_string();
-                        if let Err(error) = transport.handle_raw_message(Value::String(text)).await
-                        {
+                        if let Err(error) = transport.handle_socket_message(payload).await {
                             transport.mark_error(&error).await;
                             break;
                         }
@@ -690,15 +694,27 @@ impl WssTransport {
                     }
                 }
             }
+            // Release a connect() still waiting on the handshake. A hub that
+            // refuses one closes the socket, and reporting that as a timeout
+            // would hide a wrong password behind the whole wait.
+            transport.state.handshake_notify.notify_waiters();
         }));
         let notified = self.state.handshake_notify.notified();
         tokio::pin!(notified);
         if !self.is_handshake_complete().await {
-            let _ = timeout(Duration::from_secs(6), &mut notified).await;
+            // The first handshake with a hub runs argon2id at 64 MiB, which
+            // costs a few hundred milliseconds on top of the round trips.
+            let _ = timeout(Duration::from_secs(20), &mut notified).await;
         }
         if !self.is_handshake_complete().await {
+            let cause = self.state.health.lock().await.last_error.clone();
             self.disconnect().await?;
-            let error = ThalovantError::Timeout("HiveMind WSS handshake timed out".to_string());
+            let error = match cause {
+                Some(reason) => ThalovantError::Connection(format!(
+                    "v3 Noise handshake did not complete: {reason}"
+                )),
+                None => ThalovantError::Timeout("HiveMind WSS handshake timed out".to_string()),
+            };
             self.mark_error(&error).await;
             return Err(error);
         }
@@ -762,34 +778,280 @@ impl WssTransport {
         self.state.health.lock().await.handshake_complete
     }
 
-    async fn handle_raw_message(&self, raw: Value) -> Result<()> {
-        let completed = handle_runtime_message(
-            &self.state.identity,
-            &self.state.bus_tx,
-            &self.state.hive_tx,
-            raw,
-            |message, encrypt| {
-                let transport = self.clone();
-                async move { transport.send_hive_message(message, encrypt).await }
+    /// Handle one websocket message.
+    ///
+    /// Before the Noise session exists the frames are cleartext JSON handshake
+    /// traffic. After it they are Noise transport messages, and the plaintext
+    /// underneath is what gets parsed.
+    async fn handle_socket_message(&self, data: Vec<u8>) -> Result<()> {
+        let session = self.state.session.lock().await.clone();
+
+        let raw = match session {
+            Some(session) => match session.decrypt_frame(&data)? {
+                NoiseFrame::Partial => return Ok(()),
+                NoiseFrame::Message {
+                    payload,
+                    is_json: true,
+                } => payload,
+                // A HIVEMIND-WIRE-1 binary frame. The Rust SDK does not decode
+                // binary bus payloads on this transport yet, so it is dropped
+                // rather than mis-parsed as JSON.
+                NoiseFrame::Message { is_json: false, .. } => return Ok(()),
             },
-        )
-        .await?;
-        if completed {
-            let mut health = self.state.health.lock().await;
-            health.handshake_complete = true;
-            health.transport_alive = true;
-            self.state.handshake_notify.notify_waiters();
+            None => data,
+        };
+
+        let decoded: Value = serde_json::from_slice(&raw)?;
+        let msg_type = decoded
+            .get("msg_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let payload = decoded
+            .get("payload")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        match msg_type.as_str() {
+            "hello" => self.handle_hello(payload).await,
+            "handshake" | "shake" => self.handle_handshake(payload).await,
+            "bus" => {
+                let event = event_from_bus_payload(&payload, Some(decoded));
+                let _ = self.state.bus_tx.send(event);
+                Ok(())
+            }
+            "query" | "cascade" => {
+                let message: HiveMessage = serde_json::from_value(decoded)?;
+                let _ = self.state.hive_tx.send(message);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Record the hub's cleartext HELLO. Both its payload and the parameter
+    /// HANDSHAKE payload are bound into the Noise prologue, so it is kept
+    /// whole rather than reduced to the node id.
+    async fn handle_hello(&self, payload: Map<String, Value>) -> Result<()> {
+        if self.state.session.lock().await.is_some() {
+            return Ok(());
+        }
+        let mut hello = self.state.server_hello.lock().await;
+        if hello.is_none() {
+            *self.state.node_id.lock().await = payload
+                .get("node_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            *hello = Some(payload);
         }
         Ok(())
     }
 
-    pub async fn send_hive_message(&self, message: HiveMessage, encrypt: bool) -> Result<()> {
-        let payload = serialize_hive_message(
-            &self.state.identity,
-            self.is_handshake_complete().await,
-            message,
-            encrypt,
+    async fn handle_handshake(&self, payload: Map<String, Value>) -> Result<()> {
+        let noise_params = payload.get("noise").and_then(Value::as_object).cloned().ok_or_else(|| {
+            ThalovantError::Connection(
+                "this hub did not offer the v3 Noise handshake; the SDK requires a hub running HiveMind-core 5.x or newer".to_string(),
+            )
+        })?;
+
+        if noise_params.contains_key("msg") {
+            self.continue_noise_handshake(&noise_params).await
+        } else {
+            self.start_noise_handshake(&payload, &noise_params).await
+        }
+    }
+
+    /// Select a pattern and suite, bind the negotiation into the prologue, and
+    /// send Noise message 1.
+    async fn start_noise_handshake(
+        &self,
+        handshake_payload: &Map<String, Value>,
+        noise_params: &Map<String, Value>,
+    ) -> Result<()> {
+        let node_id = self.state.node_id.lock().await.clone();
+        if node_id.is_empty() {
+            return Err(ThalovantError::Connection(
+                "the hub sent its HANDSHAKE parameters before a HELLO carrying node_id".to_string(),
+            ));
+        }
+        let server_hello = self
+            .state
+            .server_hello
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_default();
+
+        let state_dir = self.state.noise_state_dir.lock().await.clone();
+        let pinned = load_noise_pin(state_dir.as_deref(), &node_id)?;
+
+        let (pattern, suite) = select_noise_options(
+            &string_list(noise_params.get("patterns")),
+            &string_list(noise_params.get("suites")),
+            pinned.as_deref(),
+        )
+        .ok_or_else(|| {
+            ThalovantError::Connection(
+                "no Noise pattern and suite this SDK supports are on offer from the hub"
+                    .to_string(),
+            )
+        })?;
+
+        let protocol_name = noise_protocol_name(&pattern, &suite);
+        let prologue = build_prologue(&server_hello, handshake_payload, &protocol_name);
+        let static_key = load_or_create_noise_key(state_dir.as_deref())?;
+        let psk = self.psk_for(&node_id).await?;
+
+        let mut handshake = NoiseHandshake::new(
+            &pattern,
+            &suite,
+            &psk,
+            &prologue,
+            &static_key,
+            pinned.as_deref(),
         )?;
+
+        // Message 1 carries this node's binarize capability and its
+        // preference-ordered encodings, canonicalized so both peers hash the
+        // same bytes.
+        let noise_payload = canonical_json(&json!({"binarize": false, "encodings": []}));
+        let message = handshake.write_message(noise_payload.as_bytes())?;
+        *self.state.noise_handshake.lock().await = Some(handshake);
+
+        self.send_cleartext(HiveMessage {
+            msg_type: "shake".to_string(),
+            payload: json!({"noise": {
+                "pattern": pattern,
+                "suite": suite,
+                "msg": hex::encode(&message),
+            }})
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Consume the hub's Noise message, send the final one where the pattern
+    /// needs it, and bring the transport up.
+    async fn continue_noise_handshake(&self, noise_params: &Map<String, Value>) -> Result<()> {
+        let node_id = self.state.node_id.lock().await.clone();
+        let state_dir = self.state.noise_state_dir.lock().await.clone();
+
+        let encoded = noise_params
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let message = hex::decode(encoded).map_err(|_| {
+            ThalovantError::Connection("malformed Noise handshake envelope".to_string())
+        })?;
+
+        let mut slot = self.state.noise_handshake.lock().await;
+        let handshake = slot.as_mut().ok_or_else(|| {
+            ThalovantError::Connection(
+                "the hub sent a Noise handshake message before its parameters".to_string(),
+            )
+        })?;
+
+        if let Err(error) = handshake.read_message(&message) {
+            // KKpsk0 needs each side to hold the other's static key, but the
+            // client chose it knowing only that it had pinned the hub's. The
+            // failure is as likely to mean the hub no longer has this client's,
+            // so drop the pin and let the next attempt fall back to XXpsk2.
+            if handshake.pattern() == NOISE_PATTERN_KK {
+                let _ = forget_noise_pin(state_dir.as_deref(), &node_id);
+            }
+            return Err(error);
+        }
+
+        let mut pending_final = None;
+        if !handshake.is_finished() {
+            // XXpsk2 message 3: our encrypted static key and the final DH mix.
+            // The pattern and suite are named only on message 1.
+            pending_final = Some(handshake.write_message(&[])?);
+        }
+        let handshake = slot.take().expect("checked above");
+        drop(slot);
+
+        if let Some(final_message) = pending_final {
+            self.send_cleartext(HiveMessage {
+                msg_type: "shake".to_string(),
+                payload: json!({"noise": {"msg": hex::encode(&final_message)}})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                ..Default::default()
+            })
+            .await?;
+        }
+
+        let session = handshake.into_session()?;
+        if let Some(remote) = session.remote_static_key() {
+            self.pin_hub_key(state_dir.as_deref(), &node_id, remote)?;
+        }
+        *self.state.session.lock().await = Some(Arc::new(session));
+
+        // The first Noise transport message is the encrypted HELLO.
+        self.send_hive_message(
+            hello_hive_message(&self.state.identity, "thalovant-rust-"),
+            false,
+        )
+        .await?;
+
+        let mut health = self.state.health.lock().await;
+        health.handshake_complete = true;
+        health.transport_alive = true;
+        drop(health);
+        self.state.handshake_notify.notify_waiters();
+        Ok(())
+    }
+
+    /// Enforce trust on first use: the first key seen for a node id is
+    /// recorded, and a later key that does not match it is refused.
+    ///
+    /// A changed key means the hub was reinstalled or another machine is
+    /// answering at the address. The SDK cannot tell those apart, so it refuses
+    /// and leaves clearing the pin as a deliberate act.
+    fn pin_hub_key(&self, dir: Option<&Path>, node_id: &str, remote: &str) -> Result<()> {
+        match load_noise_pin(dir, node_id)? {
+            None => save_noise_pin(dir, node_id, remote),
+            Some(pinned) if pinned == remote => Ok(()),
+            Some(_) => Err(ThalovantError::Connection(
+                "the hub's Noise static key changed. If the hub was not reinstalled or replaced, another machine may be answering at this address. If it was, drop the stale pin with forget_noise_pin and reconnect to trust the new key"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Derive, or reuse, the pre-shared key for a hub.
+    async fn psk_for(&self, node_id: &str) -> Result<[u8; 32]> {
+        {
+            let cache = self.state.psk_cache.lock().await;
+            if let Some((cached_node, psk)) = cache.as_ref() {
+                if cached_node == node_id {
+                    return Ok(*psk);
+                }
+            }
+        }
+        let password = &self.state.identity.password;
+        if password.is_empty() {
+            return Err(ThalovantError::MissingIdentityField(
+                "password: the v3 Noise handshake derives its pre-shared key from it",
+            ));
+        }
+        let psk = derive_psk(password, node_id)?;
+        *self.state.psk_cache.lock().await = Some((node_id.to_string(), psk));
+        Ok(psk)
+    }
+
+    /// Write a handshake message as a cleartext JSON text frame. Only the
+    /// handshake exchange travels this way; everything after it goes through
+    /// the Noise session.
+    async fn send_cleartext(&self, message: HiveMessage) -> Result<()> {
+        let payload = serde_json::to_string(&message)?;
         let mut writer = self.state.writer.lock().await;
         let writer = writer.as_mut().ok_or_else(|| {
             ThalovantError::Connection("HiveMind WSS transport is not connected".to_string())
@@ -798,6 +1060,31 @@ impl WssTransport {
             .send(WebSocketMessage::Text(payload))
             .await
             .map_err(|err| ThalovantError::Connection(err.to_string()))
+    }
+
+    pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
+        let session = self.state.session.lock().await.clone().ok_or_else(|| {
+            ThalovantError::Connection(
+                "refusing to send before the v3 Noise session is established".to_string(),
+            )
+        })?;
+        let raw = serde_json::to_vec(&message)?;
+        let frames = session.encrypt_message(&raw, true)?;
+
+        // Hold the writer across every chunk of one message: the cipher state
+        // nonce counter is strictly sequential, so interleaving two messages
+        // would break decryption at the hub.
+        let mut writer = self.state.writer.lock().await;
+        let writer = writer.as_mut().ok_or_else(|| {
+            ThalovantError::Connection("HiveMind WSS transport is not connected".to_string())
+        })?;
+        for frame in frames {
+            writer
+                .send(WebSocketMessage::Binary(frame))
+                .await
+                .map_err(|err| ThalovantError::Connection(err.to_string()))?;
+        }
+        Ok(())
     }
 
     async fn mark_error(&self, error: &ThalovantError) {
@@ -1058,7 +1345,7 @@ impl MqttTransport {
     }
 
     async fn handle_raw_mqtt_payload(&self, raw: Vec<u8>) -> Result<()> {
-        let (message, decoded) = decode_mqtt_hive_message(&self.state.identity, &raw)?;
+        let (message, decoded) = decode_mqtt_hive_message(&raw)?;
         match message.msg_type.as_str() {
             "handshake" | "shake" => {
                 if !truthy(message.payload.get("preshared_key"))
@@ -1066,13 +1353,7 @@ impl MqttTransport {
                     || message.payload.get("envelope").is_some()
                 {
                     return Err(ThalovantError::Connection(
-                        "Only HiveMind preshared-key MQTT handshakes are supported".to_string(),
-                    ));
-                }
-                if runtime_crypto_key(self.state.identity.crypto_key.as_deref()).is_none() {
-                    return Err(ThalovantError::Connection(
-                        "HiveMind requested a preshared key, but identity.crypto_key is missing"
-                            .to_string(),
+                        "unexpected HiveMind MQTT handshake envelope".to_string(),
                     ));
                 }
             }
@@ -1097,12 +1378,7 @@ impl MqttTransport {
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
-        let mut payload = encode_hive_binary_frame(&message)?;
-        if let Some(key) = self.state.identity.crypto_key.as_deref() {
-            if !key.trim().is_empty() {
-                payload = encrypt_as_binary(key, &payload)?;
-            }
-        }
+        let payload = encode_hive_binary_frame(&message)?;
         let client = self.state.client.lock().await.clone().ok_or_else(|| {
             ThalovantError::Connection("HiveMind MQTT transport is not connected".to_string())
         })?;
@@ -1180,96 +1456,13 @@ fn truthy(value: Option<&Value>) -> bool {
     matches!(value, Some(Value::Bool(true)))
 }
 
-async fn handle_runtime_message<F, Fut>(
-    identity: &Identity,
-    bus_tx: &broadcast::Sender<Event>,
-    hive_tx: &broadcast::Sender<HiveMessage>,
-    raw: Value,
-    send: F,
-) -> Result<bool>
-where
-    F: Fn(HiveMessage, bool) -> Fut,
-    Fut: std::future::Future<Output = Result<()>>,
-{
-    let decoded = match raw {
-        Value::String(raw) => {
-            let parsed: Value = serde_json::from_str(&raw)?;
-            if parsed.get("ciphertext").is_some() {
-                decrypt_message_value(identity, parsed)?
-            } else {
-                parsed
-            }
-        }
-        Value::Object(object) if object.get("ciphertext").is_some() => {
-            decrypt_message_value(identity, Value::Object(object))?
-        }
-        other => other,
-    };
-    let message: HiveMessage = serde_json::from_value(decoded.clone())?;
-    match message.msg_type.as_str() {
-        "handshake" | "shake" => {
-            if truthy(message.payload.get("preshared_key"))
-                && !truthy(message.payload.get("handshake"))
-                && message.payload.get("envelope").is_none()
-            {
-                if runtime_crypto_key(identity.crypto_key.as_deref()).is_none() {
-                    return Err(ThalovantError::Connection(
-                        "HiveMind requested a preshared key, but identity.crypto_key is missing"
-                            .to_string(),
-                    ));
-                }
-                send(hello_hive_message(identity, "thalovant-rust-"), false).await?;
-                Ok(true)
-            } else {
-                Err(ThalovantError::Connection(
-                    "Only HiveMind preshared-key handshakes are supported".to_string(),
-                ))
-            }
-        }
-        "bus" => {
-            let event = event_from_bus_payload(&message.payload, Some(decoded));
-            let _ = bus_tx.send(event);
-            Ok(false)
-        }
-        "query" | "cascade" => {
-            let _ = hive_tx.send(message);
-            Ok(false)
-        }
-        _ => Ok(false),
-    }
-}
-
-fn decrypt_message_value(identity: &Identity, value: Value) -> Result<Value> {
-    let key = identity.crypto_key.as_deref().ok_or_else(|| {
-        ThalovantError::Crypto("encrypted message received without identity.crypto_key".to_string())
-    })?;
-    let decrypted = decrypt_from_json(key, &value.to_string())?;
-    Ok(serde_json::from_str(&decrypted)?)
-}
-
-fn decode_mqtt_hive_message(identity: &Identity, raw: &[u8]) -> Result<(HiveMessage, Value)> {
+fn decode_mqtt_hive_message(raw: &[u8]) -> Result<(HiveMessage, Value)> {
     if let Ok(text) = std::str::from_utf8(raw) {
         if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-            if parsed.get("ciphertext").is_some() {
-                let decoded = decrypt_message_value(identity, parsed)?;
-                let message = serde_json::from_value(decoded.clone())?;
-                return Ok((message, decoded));
-            }
             if parsed.get("msg_type").is_some() {
                 let message = serde_json::from_value(parsed.clone())?;
                 return Ok((message, parsed));
             }
-        }
-    }
-    if let Some(key) = identity
-        .crypto_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        if let Ok(decrypted) = decrypt_binary(key, raw) {
-            let message = decode_hive_binary_frame(&decrypted)?;
-            let decoded = serde_json::to_value(&message)?;
-            return Ok((message, decoded));
         }
     }
     let message = decode_hive_binary_frame(raw)?;
@@ -1277,19 +1470,18 @@ fn decode_mqtt_hive_message(identity: &Identity, raw: &[u8]) -> Result<(HiveMess
     Ok((message, decoded))
 }
 
-fn serialize_hive_message(
-    identity: &Identity,
-    handshake_complete: bool,
-    message: HiveMessage,
-    encrypt: bool,
-) -> Result<String> {
-    let serialized = serde_json::to_string(&message)?;
-    if encrypt && handshake_complete {
-        if let Some(key) = identity.crypto_key.as_deref() {
-            return encrypt_as_json(key, &serialized);
-        }
-    }
-    Ok(serialized)
+/// The string entries of a JSON array, ignoring anything else in it.
+fn string_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn hello_hive_message(identity: &Identity, prefix: &str) -> HiveMessage {
