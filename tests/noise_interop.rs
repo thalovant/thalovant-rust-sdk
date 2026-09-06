@@ -48,11 +48,20 @@ async fn completes_a_v3_handshake_against_a_live_hub() {
         return;
     };
 
-    let state_dir = env::var("THALOVANT_INTEROP_STATE_DIR")
+    // Part of the opt-in guard, not an assertion: the hub pins the client static
+    // key, so the state directory has to outlive the run. Panicking here would
+    // fail the suite for anyone who set only three of the four variables.
+    let Some(state_dir) = env::var("THALOVANT_INTEROP_STATE_DIR")
         .ok()
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .expect("set THALOVANT_INTEROP_STATE_DIR so the static key survives between runs");
+    else {
+        eprintln!(
+            "skipping: set THALOVANT_INTEROP_STATE_DIR too, so the client static key \
+             survives between runs (the hub pins it)"
+        );
+        return;
+    };
 
     let identity = Identity::from_value(json!({
         "access_key": access_key,

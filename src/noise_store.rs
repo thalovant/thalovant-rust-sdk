@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use rand::RngCore;
@@ -108,6 +109,35 @@ pub fn save_noise_pin(dir: Option<&Path>, node_id: &str, public_key: &str) -> Re
     write_pins(&path, &pins)
 }
 
+/// Enforce trust on first use: record the first key seen for a node id, and
+/// refuse a later key that does not match it.
+///
+/// The read and the write happen in one critical section. Checking for a pin and
+/// then writing it as separate steps is the race itself: two connections could
+/// both see no pin, and the later one would overwrite the earlier decision.
+///
+/// A changed key means either the hub was reinstalled or another machine is
+/// answering at this address. The SDK cannot tell those apart, so it refuses and
+/// leaves clearing the pin ([`forget_noise_pin`]) as a deliberate act.
+pub fn pin_hub_key(dir: Option<&Path>, node_id: &str, remote_static_key: &str) -> Result<()> {
+    if remote_static_key.is_empty() {
+        return Ok(());
+    }
+    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let (mut pins, path) = read_pins(dir)?;
+    match pins.get(node_id) {
+        None => {
+            pins.insert(node_id.to_string(), remote_static_key.to_string());
+            write_pins(&path, &pins)
+        }
+        Some(pinned) if pinned == remote_static_key => Ok(()),
+        Some(_) => Err(ThalovantError::Connection(
+            "the hub's Noise static key changed. If the hub was not reinstalled or replaced, another machine may be answering at this address. If it was, drop the stale pin with forget_noise_pin and reconnect to trust the new key"
+                .to_string(),
+        )),
+    }
+}
+
 /// Drop a pinned hub key.
 ///
 /// Use it when a hub was deliberately reinstalled or replaced. A pin that stops
@@ -147,30 +177,152 @@ fn write_pins(path: &Path, pins: &BTreeMap<String, String>) -> Result<()> {
     write_private(path, &encoded)
 }
 
-/// Write a secret file, creating it `0600` so it is never briefly readable.
-#[cfg(unix)]
+/// Write a secret file atomically: a uniquely named temporary file in the same
+/// directory, created `0600`, then renamed into place.
+///
+/// Truncating the real file first would leave it empty or half-written if the
+/// write failed, and an empty pin file reads back as "no pins" -- which makes
+/// the next connection look like first contact and silently re-pin whatever key
+/// it is offered.
 fn write_private(path: &Path, contents: &str) -> Result<()> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let unique = format!(
+        "{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("noise"),
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+    );
+    let temporary = directory.join(unique);
+
+    let result = write_private_at(&temporary, contents)
+        .and_then(|()| fs::rename(&temporary, path).map_err(ThalovantError::from));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// Distinguishes temporary files created within one process; the pid alone does
+/// not, because two threads can be writing at the same moment.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(unix)]
+fn write_private_at(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
+    // create_new: never write through an existing file, so a stale temporary
+    // cannot be reused and the mode is always applied at creation.
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
     file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
-/// Write a secret file. Windows has no mode bits to set at creation, and the
-/// SDK's permission check is Unix-only for the same reason.
+/// Windows has no mode bits to set at creation, and the SDK's permission check
+/// is Unix-only for the same reason.
 #[cfg(not(unix))]
-fn write_private(path: &Path, contents: &str) -> Result<()> {
-    fs::write(path, contents)?;
+fn write_private_at(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
     Ok(())
 }
 
 fn poisoned<T>(_: T) -> ThalovantError {
     ThalovantError::Connection("the Noise state lock was poisoned by a panic".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_hub_key_records_then_refuses_a_changed_key() {
+        let dir = tempdir();
+        let first = "aa".repeat(32);
+        let second = "bb".repeat(32);
+
+        pin_hub_key(Some(&dir), "hub", &first).unwrap();
+        // The same key again is a normal reconnect.
+        pin_hub_key(Some(&dir), "hub", &first).unwrap();
+
+        let error = pin_hub_key(Some(&dir), "hub", &second)
+            .expect_err("a changed hub key was accepted; pinning gives no protection")
+            .to_string();
+        assert!(
+            error.contains("forget_noise_pin"),
+            "the refusal does not tell the operator how to proceed: {error}"
+        );
+        assert_eq!(
+            load_noise_pin(Some(&dir), "hub").unwrap().as_deref(),
+            Some(first.as_str()),
+            "the stored pin was overwritten by the rejected key"
+        );
+    }
+
+    #[test]
+    fn forgetting_one_hub_keeps_the_others() {
+        let dir = tempdir();
+        pin_hub_key(Some(&dir), "hub-one", &"11".repeat(32)).unwrap();
+        pin_hub_key(Some(&dir), "hub-two", &"22".repeat(32)).unwrap();
+
+        forget_noise_pin(Some(&dir), "hub-one").unwrap();
+
+        assert_eq!(load_noise_pin(Some(&dir), "hub-one").unwrap(), None);
+        assert_eq!(
+            load_noise_pin(Some(&dir), "hub-two").unwrap().as_deref(),
+            Some("22".repeat(32).as_str())
+        );
+    }
+
+    #[test]
+    fn the_static_key_persists_and_stays_private() {
+        let dir = tempdir();
+        let first = load_or_create_noise_key(Some(&dir)).unwrap();
+        let second = load_or_create_noise_key(Some(&dir)).unwrap();
+        assert_eq!(
+            first, second,
+            "a second call generated a new static key; every connection would look like a new peer"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir.join(NOISE_KEY_FILENAME))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "the static key file is group or world accessible: {mode:o}"
+            );
+        }
+    }
+
+    /// A unique directory under the system temp dir; removed on the next run of
+    /// the same name rather than tracked, which keeps this dependency-free.
+    fn tempdir() -> PathBuf {
+        let unique = format!(
+            "thalovant-noise-store-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = std::env::temp_dir().join(unique);
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
 }

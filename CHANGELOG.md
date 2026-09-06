@@ -40,6 +40,21 @@
 - A `wss` connection the hub refuses now fails with the close reason instead of
   running out the handshake clock: a wrong password reported as a timeout hid
   what had actually happened.
+- The WSS transport takes the writer lock *before* encrypting. `encrypt_message`
+  advances the cipher state nonce counter and the hub decrypts strictly in
+  counter order, so encrypting outside the lock let two concurrent senders
+  consume nonces in one order and reach the wire in the other -- which the hub
+  treats as tampering and drops the session for.
+- The MQTT handshake no longer requires the legacy `preshared_key` capability
+  flag, which a v3 hub does not set. Requiring it rejected the handshake and
+  left `connect()` to time out.
+- Trust on first use moved into `noise_store::pin_hub_key`, which holds the pin
+  lock across the read and the write. Checking for a pin and then writing it as
+  separate calls was the race itself.
+- Noise state files are written to a uniquely named temporary file created
+  `0600` with `create_new` and renamed into place. A truncating write left the
+  pin file empty on failure, which reads back as "no pins" and would silently
+  re-pin whatever key the next connection was offered.
 - **Breaking.** `HttpTransport::connect` now refuses a hub endpoint that is not
   `https://`, for the same reason as the MQTT change below: TLS is the only
   confidentiality left on that hop, and the access key travels in the

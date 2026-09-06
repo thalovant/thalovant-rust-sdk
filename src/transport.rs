@@ -7,7 +7,7 @@ use crate::{
         build_prologue, canonical_json, derive_psk, noise_protocol_name, select_noise_options,
         NoiseFrame, NoiseHandshake, NoiseSession, NOISE_PATTERN_KK,
     },
-    noise_store::{forget_noise_pin, load_noise_pin, load_or_create_noise_key, save_noise_pin},
+    noise_store::{forget_noise_pin, load_noise_pin, load_or_create_noise_key, pin_hub_key},
     protocols::HubProtocol,
     tls::ensure_rustls_provider,
     wire::{decode_hive_binary_frame, encode_hive_binary_frame},
@@ -21,7 +21,7 @@ use rumqttc::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -998,7 +998,7 @@ impl WssTransport {
 
         let session = handshake.into_session()?;
         if let Some(remote) = session.remote_static_key() {
-            self.pin_hub_key(state_dir.as_deref(), &node_id, remote)?;
+            pin_hub_key(state_dir.as_deref(), &node_id, remote)?;
         }
         *self.state.session.lock().await = Some(Arc::new(session));
 
@@ -1023,17 +1023,6 @@ impl WssTransport {
     /// A changed key means the hub was reinstalled or another machine is
     /// answering at the address. The SDK cannot tell those apart, so it refuses
     /// and leaves clearing the pin as a deliberate act.
-    fn pin_hub_key(&self, dir: Option<&Path>, node_id: &str, remote: &str) -> Result<()> {
-        match load_noise_pin(dir, node_id)? {
-            None => save_noise_pin(dir, node_id, remote),
-            Some(pinned) if pinned == remote => Ok(()),
-            Some(_) => Err(ThalovantError::Connection(
-                "the hub's Noise static key changed. If the hub was not reinstalled or replaced, another machine may be answering at this address. If it was, drop the stale pin with forget_noise_pin and reconnect to trust the new key"
-                    .to_string(),
-            )),
-        }
-    }
-
     /// Derive, or reuse, the pre-shared key for a hub.
     async fn psk_for(&self, node_id: &str) -> Result<[u8; 32]> {
         {
@@ -1077,12 +1066,14 @@ impl WssTransport {
             )
         })?;
         let raw = serde_json::to_vec(&message)?;
-        let frames = session.encrypt_message(&raw, true)?;
 
-        // Hold the writer across every chunk of one message: the cipher state
-        // nonce counter is strictly sequential, so interleaving two messages
-        // would break decryption at the hub.
+        // Take the writer *before* encrypting. encrypt_message advances the
+        // cipher state nonce counter, and the hub decrypts strictly in counter
+        // order -- so encrypting outside this lock lets two concurrent senders
+        // consume their nonces in one order and reach the wire in the other,
+        // which the hub treats as tampering and drops the session for.
         let mut writer = self.state.writer.lock().await;
+        let frames = session.encrypt_message(&raw, true)?;
         let writer = writer.as_mut().ok_or_else(|| {
             ThalovantError::Connection("HiveMind WSS transport is not connected".to_string())
         })?;
@@ -1356,8 +1347,10 @@ impl MqttTransport {
         let (message, decoded) = decode_mqtt_hive_message(&raw)?;
         match message.msg_type.as_str() {
             "handshake" | "shake" => {
-                if !truthy(message.payload.get("preshared_key"))
-                    || truthy(message.payload.get("handshake"))
+                // preshared_key is a legacy capability flag a v3 hub no longer
+                // sets. Requiring it here rejected the handshake and left
+                // connect() to time out.
+                if truthy(message.payload.get("handshake"))
                     || message.payload.get("envelope").is_some()
                 {
                     return Err(ThalovantError::Connection(
