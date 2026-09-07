@@ -31,5 +31,5 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
-snow = "0.9.6"
+snow = "0.10.0"
 argon2 = "0.5.3"
