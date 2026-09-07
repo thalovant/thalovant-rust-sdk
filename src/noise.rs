@@ -266,7 +266,9 @@ impl NoiseHandshake {
                     "KKpsk0 needs a pinned 32-byte hub static key".to_string(),
                 ));
             }
-            builder = builder.remote_public_key(&remote_bytes).map_err(setup_failed)?;
+            builder = builder
+                .remote_public_key(&remote_bytes)
+                .map_err(setup_failed)?;
         }
 
         let state = builder
