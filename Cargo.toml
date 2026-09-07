@@ -32,4 +32,4 @@ url = "2"
 urlencoding = "2"
 uuid = { version = "1", features = ["v4", "fast-rng"] }
 snow = "0.10.0"
-argon2 = "0.5.3"
+argon2 = "0.6.0"
