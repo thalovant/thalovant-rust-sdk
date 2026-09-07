@@ -241,10 +241,17 @@ impl NoiseHandshake {
             }
         };
 
+        // snow 0.10 made these builder steps fallible: they validate the key
+        // and prologue up front instead of at build time.
+        let setup_failed =
+            |err| ThalovantError::Connection(format!("could not configure {name}: {err}"));
         let mut builder = snow::Builder::new(params)
             .local_private_key(static_key)
+            .map_err(setup_failed)?
             .prologue(prologue)
-            .psk(psk_index, psk);
+            .map_err(setup_failed)?
+            .psk(psk_index, psk)
+            .map_err(setup_failed)?;
 
         let remote_bytes;
         if pattern == NOISE_PATTERN_KK {
@@ -259,7 +266,7 @@ impl NoiseHandshake {
                     "KKpsk0 needs a pinned 32-byte hub static key".to_string(),
                 ));
             }
-            builder = builder.remote_public_key(&remote_bytes);
+            builder = builder.remote_public_key(&remote_bytes).map_err(setup_failed)?;
         }
 
         let state = builder
@@ -772,8 +779,11 @@ mod tests {
         .unwrap();
         let mut responder = snow::Builder::new(params)
             .local_private_key(&server_key.private)
+            .unwrap()
             .prologue(prologue)
+            .unwrap()
             .psk(2, &psk)
+            .unwrap()
             .build_responder()
             .unwrap();
 
