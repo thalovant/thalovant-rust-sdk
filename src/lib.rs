@@ -45,8 +45,9 @@ pub use noise::{
     NoiseHandshake, NoiseSession, NOISE_PATTERN_KK, NOISE_PATTERN_XX, NOISE_SUITES, PROTOCOL_V3,
 };
 pub use noise_store::{
-    forget_noise_pin, load_noise_pin, load_or_create_noise_key, noise_state_dir, pin_hub_key,
-    NOISE_KEY_FILENAME, NOISE_PINS_FILENAME,
+    forget_noise_pin, load_cached_psk, load_noise_pin, load_or_create_noise_key, noise_state_dir,
+    pin_hub_key, psk_password_verifier, save_cached_psk, NOISE_KEY_FILENAME, NOISE_PINS_FILENAME,
+    NOISE_PSK_FILENAME,
 };
 pub use protocols::{
     endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,

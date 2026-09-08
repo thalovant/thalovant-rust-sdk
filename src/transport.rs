@@ -7,7 +7,10 @@ use crate::{
         build_prologue, canonical_json, derive_psk, noise_protocol_name, select_noise_options,
         NoiseFrame, NoiseHandshake, NoiseSession, NOISE_PATTERN_KK,
     },
-    noise_store::{forget_noise_pin, load_noise_pin, load_or_create_noise_key, pin_hub_key},
+    noise_store::{
+        forget_noise_pin, load_cached_psk, load_noise_pin, load_or_create_noise_key, pin_hub_key,
+        psk_password_verifier, save_cached_psk,
+    },
     protocols::HubProtocol,
     tls::ensure_rustls_provider,
     wire::{decode_hive_binary_frame, encode_hive_binary_frame},
@@ -568,7 +571,11 @@ struct WssTransportState {
     /// Deriving the pre-shared key costs 64 MiB and a few hundred
     /// milliseconds, and the result is fixed for a (password, node id) pair,
     /// so a reconnect to the same hub reuses it.
-    psk_cache: Mutex<Option<(String, [u8; 32])>>,
+    /// (node id, password verifier) -> PSK. The verifier is part of the key:
+    /// a caller that swaps the identity's password and reconnects on this same
+    /// transport would otherwise be handed the previous password's key, which
+    /// the hub refuses exactly as it refuses a wrong password.
+    psk_cache: Mutex<Option<(String, String, [u8; 32])>>,
 }
 
 impl WssTransport {
@@ -1025,22 +1032,35 @@ impl WssTransport {
     /// and leaves clearing the pin as a deliberate act.
     /// Derive, or reuse, the pre-shared key for a hub.
     async fn psk_for(&self, node_id: &str) -> Result<[u8; 32]> {
-        {
-            let cache = self.state.psk_cache.lock().await;
-            if let Some((cached_node, psk)) = cache.as_ref() {
-                if cached_node == node_id {
-                    return Ok(*psk);
-                }
-            }
-        }
         let password = &self.state.identity.password;
         if password.is_empty() {
             return Err(ThalovantError::MissingIdentityField(
                 "password: the v3 Noise handshake derives its pre-shared key from it",
             ));
         }
-        let psk = derive_psk(password, node_id)?;
-        *self.state.psk_cache.lock().await = Some((node_id.to_string(), psk));
+        let verifier = psk_password_verifier(password);
+        {
+            let cache = self.state.psk_cache.lock().await;
+            if let Some((cached_node, cached_verifier, psk)) = cache.as_ref() {
+                if cached_node == node_id && cached_verifier == &verifier {
+                    return Ok(*psk);
+                }
+            }
+        }
+
+        // On disk before deriving: argon2id at 64 MiB gives the same answer for
+        // a password and hub every time, so a restart should not pay it again.
+        let state_dir = self.state.noise_state_dir.lock().await.clone();
+        let psk = match load_cached_psk(state_dir.as_deref(), node_id, &verifier)? {
+            Some(psk) => psk,
+            None => {
+                let derived = derive_psk(password, node_id)?;
+                // Persisting is an optimisation, never a reason to fail.
+                let _ = save_cached_psk(state_dir.as_deref(), node_id, &derived, &verifier);
+                derived
+            }
+        };
+        *self.state.psk_cache.lock().await = Some((node_id.to_string(), verifier, psk));
         Ok(psk)
     }
 
