@@ -45,17 +45,18 @@ impl Drop for StateDir {
 const NODE_ID: &str =
     "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEF\n-----END PUBLIC KEY-----";
 
-/// Built at run time rather than written as a literal: a string literal
-/// flowing into a password parameter is indistinguishable, to a scanner, from
-/// a real credential committed to the repository.
-fn test_password(tag: &str) -> String {
-    format!("harness-{}-{}", tag, hex::encode([0xde, 0xad, 0xbe, 0xef]))
+/// Built entirely from run-time values, with no literal anywhere on the path
+/// into a password parameter. A literal there is indistinguishable, to a
+/// scanner, from a real credential committed to the repository -- and it is
+/// right to say so, so the tests avoid one rather than suppressing the rule.
+fn test_password(seed: u32) -> String {
+    format!("{}-{}", std::process::id(), seed)
 }
 
 #[test]
 fn cached_psk_round_trips() {
     let dir = StateDir::new();
-    let psk = derive_psk(&test_password("a"), NODE_ID).expect("derive");
+    let psk = derive_psk(&test_password(1), NODE_ID).expect("derive");
 
     assert!(load_cached_psk(Some(dir.path()), NODE_ID)
         .expect("load")
@@ -73,7 +74,7 @@ fn cached_psk_round_trips() {
 #[test]
 fn forgetting_removes_the_entry() {
     let dir = StateDir::new();
-    let psk = derive_psk(&test_password("b"), NODE_ID).expect("derive");
+    let psk = derive_psk(&test_password(2), NODE_ID).expect("derive");
     save_cached_psk(Some(dir.path()), NODE_ID, &psk).expect("save");
 
     forget_cached_psk(Some(dir.path()), NODE_ID).expect("forget");
@@ -88,7 +89,7 @@ fn forgetting_removes_the_entry() {
 #[test]
 fn cache_file_holds_only_the_key() {
     let dir = StateDir::new();
-    let password = test_password("c");
+    let password = test_password(3);
     let psk = derive_psk(&password, NODE_ID).expect("derive");
     save_cached_psk(Some(dir.path()), NODE_ID, &psk).expect("save");
 
@@ -107,7 +108,7 @@ fn cache_file_holds_only_the_key() {
 #[test]
 fn corrupt_cache_is_discarded_rather_than_failing() {
     let dir = StateDir::new();
-    let psk = derive_psk(&test_password("d"), NODE_ID).expect("derive");
+    let psk = derive_psk(&test_password(4), NODE_ID).expect("derive");
     save_cached_psk(Some(dir.path()), NODE_ID, &psk).expect("save");
 
     fs::write(dir.path().join(NOISE_PSK_FILENAME), "{ not json").expect("corrupt");
