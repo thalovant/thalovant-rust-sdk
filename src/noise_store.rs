@@ -25,6 +25,19 @@ pub const NOISE_KEY_FILENAME: &str = "noise_key";
 /// node id.
 pub const NOISE_PINS_FILENAME: &str = "noise_pins.json";
 
+/// Cached pre-shared keys, as a JSON object keyed by hub node id.
+///
+/// The derivation is argon2id at 64 MiB and depends only on the password and
+/// the hub's node id, both constant for the life of the pairing, so it is the
+/// same answer every time. The in-memory cache on a transport only helps that
+/// one object; this survives reconnects and restarts.
+///
+/// Only the key is stored. A fingerprint of the password would make rotation
+/// cheap to detect, but it would also put a fast hash of the password in the
+/// same file as the key it protects -- and a fast hash is exactly the offline
+/// oracle argon2id exists to deny.
+pub const NOISE_PSK_FILENAME: &str = "noise_psks.json";
+
 /// Serializes the read-modify-write of the pin file, so two connections pinning
 /// different hubs at once cannot lose one another's entry.
 ///
@@ -287,6 +300,76 @@ fn write_private_at(path: &Path, contents: &str) -> Result<()> {
 
 fn poisoned<T>(_: T) -> ThalovantError {
     ThalovantError::Connection("the Noise state lock was poisoned by a panic".to_string())
+}
+
+/// The cached pre-shared key for a hub, or `None` when there is none.
+pub fn load_cached_psk(dir: Option<&Path>, node_id: &str) -> Result<Option<[u8; 32]>> {
+    if node_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let (cache, _) = read_psk_cache(dir)?;
+    let Some(encoded) = cache.get(node_id) else {
+        return Ok(None);
+    };
+    let Ok(raw) = hex::decode(encoded.trim()) else {
+        return Ok(None);
+    };
+    Ok(<[u8; 32]>::try_from(raw.as_slice()).ok())
+}
+
+/// Record a derived key so the next connection to this hub skips argon2id.
+pub fn save_cached_psk(dir: Option<&Path>, node_id: &str, psk: &[u8; 32]) -> Result<()> {
+    if node_id.trim().is_empty() {
+        return Ok(());
+    }
+    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let (mut cache, path) = read_psk_cache(dir)?;
+    let encoded = hex::encode(psk);
+    if cache
+        .get(node_id)
+        .is_some_and(|current| current == &encoded)
+    {
+        return Ok(());
+    }
+    cache.insert(node_id.to_string(), encoded);
+    write_psk_cache(&path, &cache)
+}
+
+/// Drop a stored key.
+///
+/// The handshake calls this when the hub rejects the key we offered, which is
+/// how a password rotated elsewhere is noticed: the next attempt derives again.
+pub fn forget_cached_psk(dir: Option<&Path>, node_id: &str) -> Result<()> {
+    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let (mut cache, path) = read_psk_cache(dir)?;
+    if cache.remove(node_id).is_none() {
+        return Ok(());
+    }
+    write_psk_cache(&path, &cache)
+}
+
+fn read_psk_cache(dir: Option<&Path>) -> Result<(BTreeMap<String, String>, PathBuf)> {
+    let path = resolve_dir(dir)?.join(NOISE_PSK_FILENAME);
+    match fs::read_to_string(&path) {
+        Ok(raw) => {
+            assert_secure_secret_file(&path, "Noise PSK cache")?;
+            // A corrupt cache is derivable state, not a reason to fail a
+            // connection: drop it and pay the derivation once.
+            Ok((serde_json::from_str(&raw).unwrap_or_default(), path))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((BTreeMap::new(), path)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn write_psk_cache(path: &Path, cache: &BTreeMap<String, String>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut serialized = serde_json::to_string_pretty(cache)?;
+    serialized.push('\n');
+    write_private(path, &serialized)
 }
 
 #[cfg(test)]
