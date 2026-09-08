@@ -454,8 +454,16 @@ impl HttpTransport {
     /// HTTP runs no Noise session: it authenticates with the identity
     /// credentials and takes its confidentiality from TLS, so there is no key
     /// exchange here.
-    async fn handle_handshake(&self, payload: Map<String, Value>) -> Result<()> {
-        if !truthy(payload.get("handshake")) && payload.get("envelope").is_none() {
+    async fn handle_handshake(&self, _payload: Map<String, Value>) -> Result<()> {
+        // The capability flags in this payload are not ours to negotiate. A 5.x
+        // hub sends `{"noise": {...}}` and a 4.x one sends
+        // `{"handshake": true, "min_protocol_version": ...}`; either way HTTP
+        // runs no key exchange, so the answer is the same. Requiring both
+        // fields to be ABSENT accepted only the 5.x shape and returned
+        // "unexpected HiveMind HTTP handshake envelope" against a 4.x hub,
+        // leaving connect() to time out. The Go SDK ignores the payload here
+        // for the same reason.
+        {
             self.send_hive_message(
                 HiveMessage {
                     msg_type: "hello".to_string(),
@@ -480,11 +488,8 @@ impl HttpTransport {
             let mut health = self.state.health.lock().await;
             health.handshake_complete = true;
             health.transport_alive = true;
-            return Ok(());
+            Ok(())
         }
-        Err(ThalovantError::Connection(
-            "unexpected HiveMind HTTP handshake envelope".to_string(),
-        ))
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
@@ -1347,16 +1352,15 @@ impl MqttTransport {
         let (message, decoded) = decode_mqtt_hive_message(&raw)?;
         match message.msg_type.as_str() {
             "handshake" | "shake" => {
-                // preshared_key is a legacy capability flag a v3 hub no longer
-                // sets. Requiring it here rejected the handshake and left
-                // connect() to time out.
-                if truthy(message.payload.get("handshake"))
-                    || message.payload.get("envelope").is_some()
-                {
-                    return Err(ThalovantError::Connection(
-                        "unexpected HiveMind MQTT handshake envelope".to_string(),
-                    ));
-                }
+                // The capability flags here are not ours to negotiate. A 5.x
+                // hub sends `{"noise": {...}}` and a 4.x one sends
+                // `{"handshake": true, "min_protocol_version": ...}`; MQTT runs
+                // no key exchange either way -- the broker connection is
+                // authenticated with the per-client credentials and takes its
+                // confidentiality from TLS. Rejecting the frame when those
+                // fields were present accepted only the 5.x shape and left
+                // connect() to time out against a 4.x hub. The Go SDK ignores
+                // the payload here for the same reason.
             }
             "bus" => {
                 let event = event_from_bus_payload(&message.payload, Some(decoded));
@@ -1451,10 +1455,6 @@ fn connecting_connection() -> TransportConnectionInfo {
 
 fn elapsed_ms(start: Instant, end: Instant) -> f64 {
     end.saturating_duration_since(start).as_micros() as f64 / 1000.0
-}
-
-fn truthy(value: Option<&Value>) -> bool {
-    matches!(value, Some(Value::Bool(true)))
 }
 
 fn decode_mqtt_hive_message(raw: &[u8]) -> Result<(HiveMessage, Value)> {
