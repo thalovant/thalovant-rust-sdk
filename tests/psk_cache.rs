@@ -122,3 +122,27 @@ fn corrupt_cache_is_discarded_rather_than_failing() {
         Some(psk)
     );
 }
+
+/// The cache is key material, so `read_psk_cache` runs it through the same
+/// owner-only check as the static key. Untested until now: the enforcement
+/// exists, but nothing proved a loosened file is actually refused rather
+/// than quietly read.
+#[cfg(unix)]
+#[test]
+fn a_group_readable_cache_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = StateDir::new();
+    let psk = derive_psk(&test_password(5), NODE_ID).expect("derive");
+    save_cached_psk(Some(dir.path()), NODE_ID, &psk).expect("save");
+
+    let path = dir.path().join(NOISE_PSK_FILENAME);
+    let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the cache must be created owner-only");
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+    match load_cached_psk(Some(dir.path()), NODE_ID) {
+        Err(thalovant::ThalovantError::InvalidIdentity(_)) => {}
+        other => panic!("a group-readable cache must be refused, got {other:?}"),
+    }
+}
