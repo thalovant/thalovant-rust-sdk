@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use rand::RngCore;
-use sha2::{Digest, Sha256};
 
 use crate::errors::{Result, ThalovantError};
 use crate::identity::{assert_secure_secret_file, default_config_path};
@@ -26,12 +25,17 @@ pub const NOISE_KEY_FILENAME: &str = "noise_key";
 /// node id.
 pub const NOISE_PINS_FILENAME: &str = "noise_pins.json";
 
-/// Cached password-to-PSK derivations, as a JSON object keyed by hub node id.
+/// Cached pre-shared keys, as a JSON object keyed by hub node id.
 ///
 /// The derivation is argon2id at 64 MiB and depends only on the password and
 /// the hub's node id, both constant for the life of the pairing, so it is the
 /// same answer every time. The in-memory cache on a transport only helps that
 /// one object; this survives reconnects and restarts.
+///
+/// Only the key is stored. A fingerprint of the password would make rotation
+/// cheap to detect, but it would also put a fast hash of the password in the
+/// same file as the key it protects -- and a fast hash is exactly the offline
+/// oracle argon2id exists to deny.
 pub const NOISE_PSK_FILENAME: &str = "noise_psks.json";
 
 /// Serializes the read-modify-write of the pin file, so two connections pinning
@@ -412,27 +416,54 @@ mod tests {
     }
 }
 
-/// One cached derivation: the key, and a fingerprint of the password it came
-/// from.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct CachedPsk {
-    psk: String,
-    verifier: String,
+/// The cached pre-shared key for a hub, or `None` when there is none.
+pub fn load_cached_psk(dir: Option<&Path>, node_id: &str) -> Result<Option<[u8; 32]>> {
+    if node_id.trim().is_empty() {
+        return Ok(None);
+    }
+    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let (cache, _) = read_psk_cache(dir)?;
+    let Some(encoded) = cache.get(node_id) else {
+        return Ok(None);
+    };
+    let Ok(raw) = hex::decode(encoded.trim()) else {
+        return Ok(None);
+    };
+    Ok(<[u8; 32]>::try_from(raw.as_slice()).ok())
 }
 
-/// Fingerprint the password a cached PSK was derived from, so a rotated
-/// password is noticed and re-derived rather than offered to the hub -- which
-/// refuses it exactly as it refuses a wrong password.
+/// Record a derived key so the next connection to this hub skips argon2id.
+pub fn save_cached_psk(dir: Option<&Path>, node_id: &str, psk: &[u8; 32]) -> Result<()> {
+    if node_id.trim().is_empty() {
+        return Ok(());
+    }
+    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let (mut cache, path) = read_psk_cache(dir)?;
+    let encoded = hex::encode(psk);
+    if cache
+        .get(node_id)
+        .is_some_and(|current| current == &encoded)
+    {
+        return Ok(());
+    }
+    cache.insert(node_id.to_string(), encoded);
+    write_psk_cache(&path, &cache)
+}
+
+/// Drop a stored key.
 ///
-/// A hash, never the password, and it never leaves the machine. The identity
-/// file on the same host already holds the password itself, so this adds no
-/// exposure that was not already there.
-pub fn psk_password_verifier(password: &str) -> String {
-    let digest = Sha256::digest(format!("thalovant-psk-verifier:{password}").as_bytes());
-    hex::encode(digest)
+/// The handshake calls this when the hub rejects the key we offered, which is
+/// how a password rotated elsewhere is noticed: the next attempt derives again.
+pub fn forget_cached_psk(dir: Option<&Path>, node_id: &str) -> Result<()> {
+    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let (mut cache, path) = read_psk_cache(dir)?;
+    if cache.remove(node_id).is_none() {
+        return Ok(());
+    }
+    write_psk_cache(&path, &cache)
 }
 
-fn read_psk_cache(dir: Option<&Path>) -> Result<(BTreeMap<String, CachedPsk>, PathBuf)> {
+fn read_psk_cache(dir: Option<&Path>) -> Result<(BTreeMap<String, String>, PathBuf)> {
     let path = resolve_dir(dir)?.join(NOISE_PSK_FILENAME);
     match fs::read_to_string(&path) {
         Ok(raw) => {
@@ -446,60 +477,11 @@ fn read_psk_cache(dir: Option<&Path>) -> Result<(BTreeMap<String, CachedPsk>, Pa
     }
 }
 
-/// The cached PSK for a hub, or `None` when absent or derived from another
-/// password.
-pub fn load_cached_psk(
-    dir: Option<&Path>,
-    node_id: &str,
-    verifier: &str,
-) -> Result<Option<[u8; 32]>> {
-    if node_id.trim().is_empty() {
-        return Ok(None);
-    }
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
-    let (cache, _) = read_psk_cache(dir)?;
-    let Some(entry) = cache.get(node_id) else {
-        return Ok(None);
-    };
-    if entry.verifier != verifier {
-        return Ok(None);
-    }
-    let Ok(raw) = hex::decode(entry.psk.trim()) else {
-        return Ok(None);
-    };
-    Ok(<[u8; 32]>::try_from(raw.as_slice()).ok())
-}
-
-/// Record a derived PSK so the next connection to this hub skips argon2id.
-pub fn save_cached_psk(
-    dir: Option<&Path>,
-    node_id: &str,
-    psk: &[u8; 32],
-    verifier: &str,
-) -> Result<()> {
-    if node_id.trim().is_empty() {
-        return Ok(());
-    }
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
-    let (mut cache, path) = read_psk_cache(dir)?;
-    let encoded = hex::encode(psk);
-    if cache
-        .get(node_id)
-        .is_some_and(|entry| entry.psk == encoded && entry.verifier == verifier)
-    {
-        return Ok(());
-    }
-    cache.insert(
-        node_id.to_string(),
-        CachedPsk {
-            psk: encoded,
-            verifier: verifier.to_string(),
-        },
-    );
+fn write_psk_cache(path: &Path, cache: &BTreeMap<String, String>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut serialized = serde_json::to_string_pretty(&cache)?;
+    let mut serialized = serde_json::to_string_pretty(cache)?;
     serialized.push('\n');
-    write_private(&path, &serialized)
+    write_private(path, &serialized)
 }
