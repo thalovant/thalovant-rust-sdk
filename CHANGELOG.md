@@ -2,6 +2,9 @@
 
 ## 0.5.0
 
+- Refuse control-plane redirects, including 307/308 login-body replay, require HTTPS for authenticated requests and request bodies outside explicit loopback development endpoints, and remove request URLs from transport errors.
+- Flush complete MQTT broker-fixture packets before waiting for more input, with a buffered-writer regression and native TLS coverage on Windows.
+
 - Raise the minimum Rust version from 1.85 to 1.88 and upgrade `time` to 0.3.55 to fix RUSTSEC-2026-0009 (RFC2822 parser stack exhaustion). HTTP cookie affinity requires this dependency; upgrade the compiler before upgrading the crate.
 
 - Preserve complete Noise identities with atomic publication and OS locks across processes. Interrupted writers cannot publish partial keys, pin transactions cannot lose another process's changes, and malformed or exposed trust files remain errors without automatic reset. Bound OS lock waits and move handshake/store work off Tokio workers so caller deadlines remain responsive.

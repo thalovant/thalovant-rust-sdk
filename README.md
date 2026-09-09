@@ -78,6 +78,11 @@ async fn main() -> thalovant::Result<()> {
 
 `ControlPlane::default()` uses `https://api.thalovant.com`. Use
 `ControlPlane::new(...)` only for local development or a self-hosted control plane.
+Control-plane requests never follow redirects: configure the final API URL.
+Authenticated requests and requests with a body require HTTPS. HTTP is allowed
+only for explicit `localhost`, `127.0.0.1`, and `[::1]` development endpoints.
+Credentials embedded in the API URL are refused, and HTTP transport errors omit
+the request URL.
 
 ## MFA Login
 

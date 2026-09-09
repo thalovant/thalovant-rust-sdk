@@ -623,7 +623,22 @@ async fn mqtt_write<S: AsyncWrite + Unpin>(
         }
     }
     packet.extend_from_slice(payload);
-    stream.write_all(&packet).await
+    stream.write_all(&packet).await?;
+    // A TLS writer may accept the final plaintext bytes while retaining the
+    // last encrypted record. The broker must flush before waiting for input.
+    stream.flush().await
+}
+
+#[tokio::test]
+async fn mqtt_fixture_flushes_the_complete_packet_before_reading_again() {
+    let (writer, mut reader) = tokio::io::duplex(64);
+    let mut writer = tokio::io::BufWriter::new(writer);
+    mqtt_write(&mut writer, 0x20, &[0, 0]).await.unwrap();
+    let packet = timeout(Duration::from_secs(1), mqtt_packet(&mut reader))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(packet, (0x20, vec![0, 0]));
 }
 async fn serve_mqtt<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
@@ -701,6 +716,7 @@ async fn mqtt_noise_tls_broker_reconnect_and_wrong_password() {
             let mut responder = Responder::new();
             for _ in 0..attempts {
                 let (stream, _) = listener.accept().await.unwrap();
+                stream.set_nodelay(true).unwrap();
                 let mut stream = acceptor.accept(stream).await.unwrap();
                 let result = serve_mqtt(&mut stream, &mut responder, &topics).await;
                 if !wrong_password {
@@ -733,10 +749,14 @@ async fn mqtt_noise_tls_broker_reconnect_and_wrong_password() {
                 .unwrap();
             // This exchanges 1.2 MiB through native TLS and many Noise chunks;
             // Windows SChannel runners need a transfer budget, not a 2s echo budget.
-            let event = timeout(Duration::from_secs(10), events.recv())
-                .await
-                .unwrap()
-                .unwrap();
+            let event = match timeout(Duration::from_secs(10), events.recv()).await {
+                Ok(result) => result.unwrap(),
+                Err(error) => panic!(
+                    "MQTT echo deadline: {error}; health={:?}; broker_finished={}",
+                    transport.healthcheck().await,
+                    broker.is_finished()
+                ),
+            };
             assert_eq!(event.context["request_id"], "mqtt");
             transport.disconnect().await.unwrap();
             assert!(transport.remote_static_key().await.is_none());

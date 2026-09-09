@@ -318,7 +318,10 @@ impl ControlPlane {
             api_url: normalize_control_api_url(api_url.into()),
             access_token,
             user_agent: DEFAULT_CONTROL_USER_AGENT.to_string(),
-            http_client: reqwest::Client::new(),
+            http_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("build control-plane HTTP client"),
         }
     }
 
@@ -1344,6 +1347,8 @@ impl ControlPlane {
         headers: Option<HeaderMap>,
         auth: bool,
     ) -> Result<(reqwest::StatusCode, String)> {
+        let url = format!("{}{}", self.api_url, path.trim_start_matches('/'));
+        let url = validate_control_request_url(&url, auth || body.is_some())?;
         let mut request_headers = HeaderMap::new();
         request_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         request_headers.insert(
@@ -1371,7 +1376,6 @@ impl ControlPlane {
         let method = method
             .parse::<reqwest::Method>()
             .map_err(|err| ThalovantError::Api(err.to_string()))?;
-        let url = format!("{}{}", self.api_url, path.trim_start_matches('/'));
         let mut request = self
             .http_client
             .request(method, url)
@@ -1382,18 +1386,42 @@ impl ControlPlane {
         let response = request
             .send()
             .await
-            .map_err(|err| ThalovantError::Api(err.to_string()))?;
+            .map_err(|err| ThalovantError::Api(err.without_url().to_string()))?;
         let status = response.status();
+        if status.is_redirection() {
+            return Err(ThalovantError::Api(format!(
+                "HTTP {status}: control-plane redirects are refused; configure the final API URL"
+            )));
+        }
         let body = if status.is_success() {
             response
                 .text()
                 .await
-                .map_err(|err| ThalovantError::Api(err.to_string()))?
+                .map_err(|err| ThalovantError::Api(err.without_url().to_string()))?
         } else {
             response.text().await.unwrap_or_default()
         };
         Ok((status, body))
     }
+}
+
+fn validate_control_request_url(raw: &str, sensitive: bool) -> Result<url::Url> {
+    let url = url::Url::parse(raw)
+        .map_err(|_| ThalovantError::Api("invalid control-plane API URL".into()))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ThalovantError::Api(
+            "control-plane API URLs cannot contain credentials".into(),
+        ));
+    }
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if !matches!(url.scheme(), "https" | "http")
+        || (sensitive && url.scheme() != "https" && !loopback)
+    {
+        return Err(ThalovantError::Api(
+            "authenticated control-plane requests and request bodies require HTTPS; HTTP is allowed only on localhost, 127.0.0.1 or [::1] for development".into(),
+        ));
+    }
+    Ok(url)
 }
 
 impl Default for ControlPlane {
@@ -1711,6 +1739,82 @@ mod tests {
         assert_eq!(DEFAULT_CONTROL_USER_AGENT, expected);
         assert_eq!(crate::constants::DEFAULT_USER_AGENT, expected);
         assert_eq!(ControlPlane::default().user_agent, expected);
+    }
+
+    #[tokio::test]
+    async fn control_credentials_require_tls_before_network_io() {
+        for endpoint in [
+            "http://api.example.invalid",
+            "http://localhost.example.invalid",
+            "http://127.0.0.2",
+            "ftp://localhost",
+            "https://user:SECRET@example.invalid",
+        ] {
+            let mut control = ControlPlane::new(endpoint, Some("SECRET".into()));
+            let error = control
+                .login("test@example.invalid", "SECRET", None)
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("SECRET"));
+            assert!(matches!(error, ThalovantError::Api(_)));
+            let error = control
+                .request("GET", "/v1/me", None, None, true)
+                .await
+                .unwrap_err();
+            assert!(!error.to_string().contains("SECRET"));
+            assert!(
+                error.to_string().contains("require HTTPS")
+                    || error.to_string().contains("cannot contain credentials")
+            );
+        }
+        for endpoint in [
+            "http://localhost:1234",
+            "http://127.0.0.1:1234",
+            "http://[::1]:1234",
+            "https://api.example.invalid",
+        ] {
+            assert!(validate_control_request_url(endpoint, true).is_ok());
+        }
+        assert!(validate_control_request_url("http://api.example.invalid", false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn control_redirects_never_forward_credentials_or_login_bodies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for status in [301, 302, 303, 307, 308] {
+            for login in [false, true] {
+                let receiver = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let source = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}", source.local_addr().unwrap());
+                let destination = format!(
+                    "http://{}/stolen?secret=SECRET",
+                    receiver.local_addr().unwrap()
+                );
+                let server = tokio::spawn(async move {
+                    let (mut stream, _) = source.accept().await.unwrap();
+                    let mut buffer = [0; 8192];
+                    assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                    stream.write_all(format!("HTTP/1.1 {status} Redirect\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                });
+                let mut control = ControlPlane::new(endpoint, Some("SECRET".into()));
+                let result = if login {
+                    control.login("test@example.invalid", "SECRET", None).await
+                } else {
+                    control.request("GET", "/v1/me", None, None, true).await
+                };
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("redirects are refused"), "{error}");
+                assert!(!error.contains("SECRET"));
+                server.await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), receiver.accept())
+                        .await
+                        .is_err(),
+                    "redirect destination was contacted for {status}, login={login}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
