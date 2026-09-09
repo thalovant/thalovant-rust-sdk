@@ -345,11 +345,13 @@ impl HttpTransport {
             });
         if let Err(error) = &result {
             self.mark_connection_error(error).await;
-            let _ = timeout(
-                Duration::from_secs(2),
-                self.request(reqwest::Method::POST, "/disconnect", None),
-            )
-            .await;
+            if self.state.admitted.swap(false, Ordering::AcqRel) {
+                let _ = timeout(
+                    Duration::from_secs(2),
+                    self.request(reqwest::Method::POST, "/disconnect", None),
+                )
+                .await;
+            }
         }
         result
     }
@@ -405,7 +407,9 @@ impl HttpTransport {
             health.transport_alive = false;
             health.connection.phase = TransportConnectionPhase::Closed;
         }
-        self.state.admitted.store(false, Ordering::Release);
+        if !self.state.admitted.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
         self.request(reqwest::Method::POST, "/disconnect", None)
             .await
             .map(|_| ())
