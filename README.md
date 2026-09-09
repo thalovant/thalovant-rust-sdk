@@ -584,6 +584,12 @@ seconds for the caller; an owned worker continues cleanup after that deadline.
 MQTT allows its worker three seconds for offline publication and event-loop
 retirement. An unacknowledged HTTP cleanup retains this object's admission marker,
 so the next connection retries cleanup before admitting a fresh session.
+If the hub cleaned up but its response was lost, the retry also accepts its
+exact one-field JSON object: `{"error":"Already Disconnected"}` or
+`{"error":"Client is not connected"}`. These acknowledgments apply only to
+successful HTTP disconnect responses; any additional field, including `ok` or
+`status`, invalidates them. Other refusals and `ok: false` still fail and retain
+admission ownership.
 
 All three transports use the same Noise negotiation, authenticated framing, and
 peer pinning implementation; transport-specific connection and send ownership
@@ -595,7 +601,8 @@ An initial connection does not evict a peer admitted by another process.
 
 HTTP retains the listener's replica affinity cookie, sends encrypted frames as
 Base64 form data with `binary=1`, and decrypts `/get_binary_messages` replies.
-HTTP errors and JSON `error` responses both fail the session. Redirects are
+HTTP errors and JSON `error` responses fail the session, except the documented
+already-disconnected acknowledgments during cleanup. Redirects are
 refused so identity credentials cannot move to another endpoint. For custom
 trust roots, use `HttpTransport::with_options_and_http_client_builder`; it
 always enables cookies and disables redirects.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- Recover HTTP cleanup after a lost disconnect response by accepting successful JSON responses containing exactly one `error` field with `Already Disconnected` or `Client is not connected`. Additional fields such as `ok` or `status` invalidate these idempotent acknowledgments. Preserve replica affinity and Noise trust across explicit cleanup retry or reconnect; other errors, unsuccessful HTTP responses and `ok: false` remain failures.
+
 ## 0.5.0
 
 - Share one absolute timeout across every intent-description window, retain earlier answers, and stop publishing after the budget expires.
