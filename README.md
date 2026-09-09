@@ -9,6 +9,7 @@ Full docs: <https://docs.thalovant.com/developers/sdks/rust/>
 
 ## What You Need
 
+- Rust 1.85 or newer (tested in CI alongside the current stable compiler).
 - A Thalovant account with API access for authenticated control-plane actions.
 - A hub id or slug.
 - A client identity for that hub. You can create one through the API or use one
