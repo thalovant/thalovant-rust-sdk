@@ -815,9 +815,7 @@ async fn wss_noise_same_object_reconnect_after_encrypted_reply() {
         );
         transport.disconnect().await.unwrap();
         assert!(transport.remote_static_key().await.is_none());
-        assert!(transport.state.noise_handshake.lock().await.is_none());
-        assert!(transport.state.server_hello.lock().await.is_none());
-        assert!(transport.state.node_id.lock().await.is_empty());
+        assert!(transport.state.noise.lock().await.is_none());
     }
     assert_eq!(
         timeout(Duration::from_secs(2), server)
@@ -886,11 +884,11 @@ async fn wss_failed_kk_keeps_the_authenticated_hub_pin() {
     )
     .unwrap();
     handshake.write_message(&[]).unwrap();
-    *transport.state.noise_handshake.lock().await = Some(handshake);
-    *transport.state.node_id.lock().await = "test-hub".into();
-    assert!(transport
-        .continue_noise_handshake(json!({"msg":"00"}).as_object().unwrap())
-        .await
+    let mut channel = NoiseChannel::new(transport.identity().clone(), Some(dir.0.clone()));
+    channel.handshake = Some(handshake);
+    channel.node_id = "test-hub".into();
+    assert!(channel
+        .continue_handshake(json!({"msg":"00"}).as_object().unwrap())
         .is_err());
     assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), Some(pin));
 }
@@ -1003,4 +1001,217 @@ async fn http_reconnect_waits_for_failed_caller_poll_cleanup() {
         vec!["XXpsk2", "KKpsk0"]
     );
     transport.disconnect().await.unwrap();
+}
+
+fn exchange_with_channel(channel: &mut NoiseChannel, responder: &mut Responder) -> Result<()> {
+    let mut incoming = VecDeque::from(responder.reset());
+    while let Some(write) = incoming.pop_front() {
+        let (_, outgoing) = channel.receive(&write.payload, write.binary)?;
+        for write in outgoing {
+            incoming.extend(responder.receive(&write.payload, write.binary)?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn shared_noise_channel_reuses_persisted_psk_and_recovers_after_rejection() {
+    let dir = FixtureDir::new();
+    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":"https://example.invalid"})).unwrap();
+    let mut responder = Responder::new();
+    // A deliberately different cached credential makes reuse observable without
+    // timing or counting calls to the implementation's derivation function.
+    let cached = [0x43; 32];
+    save_cached_psk(Some(&dir.0), "test-hub", &cached).unwrap();
+    responder.psk = cached;
+    let mut channel = NoiseChannel::new(identity.clone(), Some(dir.0.clone()));
+    exchange_with_channel(&mut channel, &mut responder).unwrap();
+    assert!(channel.ready());
+    assert_eq!(responder.hellos, 1);
+    let pin = load_noise_pin(Some(&dir.0), "test-hub").unwrap();
+    assert!(pin.is_some());
+
+    // The password rotates back to the identity's current value. Force XX so
+    // the peer can return the response that authenticates and rejects our PSK.
+    responder.psk = derive_psk(test_password(), "test-hub").unwrap();
+    responder.peer = None;
+    let mut stale = NoiseChannel::new(identity.clone(), Some(dir.0.clone()));
+    assert!(exchange_with_channel(&mut stale, &mut responder).is_err());
+    assert!(!stale.ready());
+    assert_eq!(load_cached_psk(Some(&dir.0), "test-hub").unwrap(), None);
+    assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), pin);
+
+    let mut recovered = NoiseChannel::new(identity, Some(dir.0.clone()));
+    exchange_with_channel(&mut recovered, &mut responder).unwrap();
+    assert!(recovered.ready());
+    assert_eq!(
+        load_cached_psk(Some(&dir.0), "test-hub").unwrap(),
+        Some(responder.psk)
+    );
+    assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), pin);
+}
+
+#[test]
+fn shared_noise_rejects_duplicate_hello_and_a_changed_pinned_peer() {
+    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":"https://example.invalid"})).unwrap();
+    let dir = FixtureDir::new();
+    let mut responder = Responder::new();
+    let hello = responder.reset().remove(0);
+    let mut channel = NoiseChannel::new(identity.clone(), Some(dir.0.clone()));
+    channel.receive(&hello.payload, false).unwrap();
+    assert!(channel.receive(&hello.payload, false).is_err());
+    assert!(!channel.ready());
+
+    let mut first = NoiseChannel::new(identity.clone(), Some(dir.0.clone()));
+    exchange_with_channel(&mut first, &mut responder).unwrap();
+    let pin = load_noise_pin(Some(&dir.0), "test-hub").unwrap();
+    let mut replacement = Responder::new();
+    let mut reconnect = NoiseChannel::new(identity, Some(dir.0.clone()));
+    assert!(exchange_with_channel(&mut reconnect, &mut replacement).is_err());
+    assert!(!reconnect.ready());
+    assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), pin);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"wss":endpoint}})).unwrap();
+    let transport = WssTransport::new(identity);
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    let paused = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (server_paused, server_release) = (paused.clone(), release.clone());
+    let server = tokio::spawn(async move {
+        let mut responder = Responder::new();
+        for attempt in 0..2 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for write in responder.reset() {
+                stream
+                    .send(WebSocketMessage::Text(
+                        String::from_utf8(write.payload).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            while let Some(message) = stream.next().await {
+                let (raw, binary) = match message.unwrap() {
+                    WebSocketMessage::Text(text) => (text.into_bytes(), false),
+                    WebSocketMessage::Binary(bytes) => (bytes, true),
+                    WebSocketMessage::Close(_) => break,
+                    _ => continue,
+                };
+                for write in responder.receive(&raw, binary).unwrap() {
+                    stream
+                        .send(if write.binary {
+                            WebSocketMessage::Binary(write.payload)
+                        } else {
+                            WebSocketMessage::Text(String::from_utf8(write.payload).unwrap())
+                        })
+                        .await
+                        .unwrap();
+                }
+                if attempt == 0 && responder.hellos == 1 {
+                    server_paused.notify_one();
+                    server_release.notified().await;
+                    break;
+                }
+            }
+        }
+        responder.patterns
+    });
+    transport.connect().await.unwrap();
+    timeout(Duration::from_secs(5), paused.notified())
+        .await
+        .unwrap();
+    let sender = transport.clone();
+    let send = tokio::spawn(async move {
+        sender
+            .emit_bus(
+                "large",
+                json!({"body":"x".repeat(16*1024*1024)})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                Map::new(),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if transport.state.writer.try_lock().is_err()
+                && transport.state.noise.try_lock().is_err()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!send.is_finished());
+    send.abort();
+    assert!(send.await.unwrap_err().is_cancelled());
+    assert!(!transport.healthcheck().await.handshake_complete);
+    assert!(transport.remote_static_key().await.is_none());
+    assert!(transport
+        .emit_bus("rejected", Map::new(), Map::new())
+        .await
+        .is_err());
+    release.notify_one();
+    transport.connect().await.unwrap();
+    let mut events = transport.subscribe();
+    transport
+        .emit_bus("echo", Map::new(), Map::new())
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    transport.disconnect().await.unwrap();
+    assert_eq!(server.await.unwrap(), vec!["XXpsk2", "KKpsk0"]);
+}
+
+#[test]
+fn shared_noise_rederives_after_peer_rejects_kk_before_responding() {
+    let dir = FixtureDir::new();
+    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":"https://example.invalid"})).unwrap();
+    let mut responder = Responder::new();
+    let current = responder.psk;
+    responder.psk = [0x52; 32];
+    save_cached_psk(Some(&dir.0), "test-hub", &responder.psk).unwrap();
+    let mut initial = NoiseChannel::new(identity.clone(), Some(dir.0.clone()));
+    exchange_with_channel(&mut initial, &mut responder).unwrap();
+    assert!(initial.ready());
+    let pin = load_noise_pin(Some(&dir.0), "test-hub").unwrap();
+    let client_key = load_or_create_noise_key(Some(&dir.0)).unwrap();
+    drop(initial);
+    assert_eq!(
+        load_cached_psk(Some(&dir.0), "test-hub").unwrap(),
+        Some(responder.psk)
+    );
+
+    responder.psk = current;
+    let mut stale = NoiseChannel::new(identity.clone(), Some(dir.0.clone()));
+    // KK fails at the peer while reading message 1, so our receive path never
+    // gets a message on which to report an authentication failure.
+    assert!(exchange_with_channel(&mut stale, &mut responder).is_err());
+    assert!(stale.handshake.is_some());
+    assert!(stale.session.is_none());
+    drop(stale); // Transport failure/timeout cleanup abandons this channel.
+    assert_eq!(load_cached_psk(Some(&dir.0), "test-hub").unwrap(), None);
+    assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), pin);
+    assert_eq!(load_or_create_noise_key(Some(&dir.0)).unwrap(), client_key);
+
+    let mut recovered = NoiseChannel::new(identity, Some(dir.0.clone()));
+    exchange_with_channel(&mut recovered, &mut responder).unwrap();
+    assert!(recovered.ready());
+    assert_eq!(
+        load_cached_psk(Some(&dir.0), "test-hub").unwrap(),
+        Some(current)
+    );
+    assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), pin);
 }

@@ -503,13 +503,15 @@ Nothing extra has to be provisioned. The Noise pre-shared key is derived from
 the identity `password` with argon2id, salted with the hub's node id, so an
 identity that can authenticate can already handshake.
 
-Two files persist beside the SDK config file (`~/.config/thalovant` unless
-`XDG_CONFIG_HOME` or `%APPDATA%` says otherwise), both `0600`:
+Three files persist beside the SDK config file (`~/.config/thalovant` unless
+`XDG_CONFIG_HOME` or `%APPDATA%` says otherwise), all `0600`:
 
 - `noise_key` — this client's static X25519 key. It has to persist: a hub pins
   it on first contact, so regenerating it makes the client look like a
   different peer and the hub refuses it.
 - `noise_pins.json` — the hub static keys this client has pinned.
+- `noise_psks.json` — cached derived Noise credentials, indexed by hub node ID.
+  Protect it like a password file; `forget_cached_psk` removes one entry.
 
 Use `set_noise_state_dir` on `WssTransport`, `HttpTransport`, or `MqttTransport`
 to select another persistent directory. Keep the same directory when switching
@@ -526,9 +528,25 @@ use thalovant::forget_noise_pin;
 forget_noise_pin(None, &node_id)?;
 ```
 
-The derivation costs 64 MiB and a few hundred milliseconds. WSS caches the
-result per hub; HTTP and MQTT derive from the current password for each fresh
-connection. Failed authentication never removes the trusted hub pin.
+Argon2id uses 64 MiB for derivation. WSS, HTTP, and MQTT share the protected
+persisted PSK cache, indexed by hub node ID. A cached PSK is itself a credential:
+changing only the identity password does not replace a cached key the hub still
+accepts. Failed handshake authentication or an abandoned unfinished handshake
+(including peer closure or timeout) evicts that derived entry, so the next
+connection derives from the current password. Client static keys and trusted
+hub pins are retained.
+
+To deliberately derive again, remove only the PSK cache entry before reconnecting:
+
+```rust
+use thalovant::forget_cached_psk;
+
+forget_cached_psk(None, &node_id)?; // Or Some(state_dir.as_path()).
+```
+
+All three transports use the same Noise negotiation, authenticated framing, and
+peer pinning implementation; transport-specific connection and send ownership
+remain separate.
 
 HTTP reconnect resets this object's prior admission before asking for a new
 Noise offer, so it can recover when a failed poll leaves the old peer registered.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.8
+
+- Drive WSS, HTTP, and MQTT through one Noise handshake, authenticated framing, and hub trust implementation. Preserve WSS writer ordering and cancellation poisoning, and keep HTTP/MQTT lifecycle ownership unchanged.
+- Reuse the protected persisted PSK cache across all runtime transports. A rejected or abandoned unfinished handshake discards the derived cache entry while preserving the authenticated hub pin, so the next connection can derive from the current password.
+- Share transport health reporting and validate cached-credential recovery, changed-peer rejection, and a canceled chunked WSS send followed by a fresh authenticated reconnect.
+
 ## 0.4.7
 
 - Correct the declared minimum Rust version to 1.85, already required by the
@@ -57,9 +63,11 @@
   `select_noise_options`, `NoiseHandshake`, `NoiseSession`, and the on-disk
   state helpers `load_or_create_noise_key`, `load_noise_pin`, `save_noise_pin`
   and `forget_noise_pin`.
-- Two files persist beside the SDK config file, both `0600`: `noise_key` (this
-  client's static X25519 key) and `noise_pins.json` (the hub keys it has
-  pinned). `WssTransport::set_noise_state_dir` overrides the location.
+- Three files persist beside the SDK config file, all `0600`: `noise_key` (this
+  client's static X25519 key), `noise_pins.json` (the hub keys it has pinned),
+  and `noise_psks.json` (cached derived credentials indexed by hub node ID).
+  `WssTransport::set_noise_state_dir` overrides the location; `forget_cached_psk`
+  removes one derived credential without removing keys or pins.
 - Trust on first use: the first hub key seen for a node id is pinned, and a
   later connection presenting a different key is refused with an error naming
   `forget_noise_pin`, rather than silently re-pinned. A failed `KKpsk0`
