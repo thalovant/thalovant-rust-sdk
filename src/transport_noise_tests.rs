@@ -224,6 +224,7 @@ struct HttpFixtureState {
     unsupported: bool,
     connected: bool,
     pause_send: Option<(Arc<Notify>, Arc<Notify>)>,
+    pause_poll: Option<(Arc<Notify>, Arc<Notify>)>,
     tamper: bool,
     plaintext: bool,
 }
@@ -329,6 +330,7 @@ impl HttpFixture {
             unsupported: false,
             connected: false,
             pause_send: None,
+            pause_poll: None,
             tamper: false,
             plaintext: false,
         }));
@@ -372,6 +374,8 @@ impl HttpFixture {
                     let cookie = lower.contains("hivemind_http_replica=test-replica");
                     let pause = if path == "/send_message" {
                         state.lock().await.pause_send.take()
+                    } else if path == "/get_messages" {
+                        state.lock().await.pause_poll.take()
                     } else {
                         None
                     };
@@ -955,5 +959,48 @@ async fn http_reconnect_waits_for_failed_inflight_send_cleanup() {
         .unwrap();
     transport.poll_once().await.unwrap();
     assert_eq!(events.recv().await.unwrap().name, "new");
+    transport.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn http_reconnect_waits_for_failed_caller_poll_cleanup() {
+    let fixture = HttpFixture::new().await;
+    let transport = fixture.transport();
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    transport.connect().await.unwrap();
+    transport.stop_polling().await;
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    {
+        let mut state = fixture.state.lock().await;
+        state.pause_poll = Some((entered.clone(), resume.clone()));
+        state.reject = Some("/get_messages".into());
+    }
+    let poller = transport.clone();
+    let poll = tokio::spawn(async move { poller.poll_once().await });
+    timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    let connector = transport.clone();
+    let reconnect = tokio::spawn(async move { connector.connect().await });
+    sleep(Duration::from_millis(50)).await;
+    assert!(!reconnect.is_finished());
+    assert_eq!(
+        fixture.state.lock().await.responder.patterns,
+        vec!["XXpsk2"]
+    );
+    resume.notify_one();
+    assert!(poll.await.unwrap().is_err());
+    timeout(Duration::from_secs(10), reconnect)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(transport.healthcheck().await.handshake_complete);
+    assert_eq!(
+        fixture.state.lock().await.responder.patterns,
+        vec!["XXpsk2", "KKpsk0"]
+    );
     transport.disconnect().await.unwrap();
 }

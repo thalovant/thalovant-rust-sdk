@@ -378,7 +378,7 @@ impl HttpTransport {
             health.connection.transport_open_ms = Some(elapsed_ms(started, opened));
         }
         while !self.is_handshake_complete().await {
-            self.poll_once().await?;
+            self.poll_current_session().await?;
             if !self.is_handshake_complete().await {
                 sleep(Duration::from_millis(100)).await;
             }
@@ -466,6 +466,11 @@ impl HttpTransport {
     }
 
     pub async fn poll_once(&self) -> Result<()> {
+        let _lifecycle = self.state.lifecycle.lock().await;
+        self.poll_current_session().await
+    }
+
+    async fn poll_current_session(&self) -> Result<()> {
         let _poll = self.state.poll.lock().await;
         let result = self.poll_inner().await;
         if let Err(error) = &result {
