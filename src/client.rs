@@ -599,7 +599,11 @@ async fn collect_query_reply(
         utterances: fragments,
         handled: failure_event.is_none(),
         ok: failure_event.is_none(),
-        session_id: Some(session_id),
+        session_id: events
+            .iter()
+            .filter_map(Event::session_id)
+            .find(|id| !id.trim().is_empty())
+            .or(Some(session_id)),
         request_id: Some(request_id),
         events,
         failure_event,
@@ -1049,6 +1053,60 @@ mod tests {
                 .unwrap()
                 .clone(),
             ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn query_reports_the_first_accepted_hub_session_or_requested_fallback() {
+        for assigned in [None, Some("assigned-by-hub")] {
+            for hard in [false, true] {
+                let (tx, mut rx) = broadcast::channel(8);
+                let mut foreign = fixture_query_event(EVENT_SPEAK, "foreign");
+                foreign
+                    .metadata
+                    .insert("query_id".into(), "other-query".into());
+                foreign.payload.insert(
+                    "context".into(),
+                    json!({"session":{"session_id":"foreign-session"}}),
+                );
+                tx.send(foreign).unwrap();
+                let mut blank = fixture_query_event(EVENT_SPEAK, "first");
+                blank
+                    .payload
+                    .insert("context".into(), json!({"session":{"session_id":"  "}}));
+                tx.send(blank).unwrap();
+                let mut accepted = fixture_query_event(EVENT_SPEAK, "second");
+                if let Some(id) = assigned {
+                    accepted
+                        .payload
+                        .insert("context".into(), json!({"session":{"session_id":id}}));
+                }
+                tx.send(accepted).unwrap();
+                tx.send(fixture_query_event(
+                    if hard {
+                        EVENT_POLICY_DENIED
+                    } else {
+                        "hive.query.complete"
+                    },
+                    "",
+                ))
+                .unwrap();
+                let reply = collect_query_reply(
+                    &mut rx,
+                    "fixture",
+                    "requested".into(),
+                    "request".into(),
+                    Duration::from_secs(1),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    reply.session_id.as_deref(),
+                    Some(assigned.unwrap_or("requested"))
+                );
+                assert_eq!(reply.text, "first second");
+                assert_eq!(reply.ok, !hard);
+            }
         }
     }
 
