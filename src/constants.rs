@@ -29,6 +29,10 @@ pub fn is_failure_event(name: &str) -> bool {
     )
 }
 
+/// Optional OVOS fallback skill discovery.
+pub const EVENT_FALLBACK_LIST: &str = "ovos.skills.fallback.list";
+pub const EVENT_FALLBACK_LIST_RESPONSE: &str = "ovos.skills.fallback.list.response";
+
 #[cfg(test)]
 mod tests {
     use super::*;

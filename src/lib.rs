@@ -18,8 +18,8 @@ pub mod transport;
 pub mod wire;
 
 pub use client::{
-    ActionOptions, Client, CodeOptions, Conversation, ConversationOptions, QueryOptions,
-    RequestOptions,
+    ActionOptions, AskOptions, Client, CodeOptions, Conversation, ConversationOptions,
+    QueryOptions, RequestOptions,
 };
 pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
@@ -36,9 +36,10 @@ pub use events::{
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use intents::{
-    HubIntent, HubIntentInventory, HubSkillIntents, IntentDefinition, IntentDescribeOptions,
-    IntentInventoryOptions, IntentInventorySource, IntentListOptions, IntentRegistration,
-    DEFAULT_INTENT_TIMEOUT, DESCRIBE_BATCH,
+    HubFallback, HubIntent, HubIntentCapabilities, HubIntentInventory, HubSkillIntents,
+    IntentDefinition, IntentDescribeOptions, IntentInventoryOptions, IntentInventorySource,
+    IntentListOptions, IntentRegistration, DEFAULT_INTENT_TIMEOUT, DESCRIBE_BATCH,
+    FALLBACK_PROBE_TIMEOUT,
 };
 pub use noise::{
     canonical_json, derive_psk, noise_protocol_name, select_noise_options, NoiseFrame,

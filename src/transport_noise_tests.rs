@@ -225,6 +225,7 @@ struct HttpFixtureState {
     connected: bool,
     pause_send: Option<(Arc<Notify>, Arc<Notify>)>,
     pause_poll: Option<(Arc<Notify>, Arc<Notify>)>,
+    pause_disconnect: Option<(Arc<Notify>, Arc<Notify>)>,
     tamper: bool,
     plaintext: bool,
 }
@@ -331,6 +332,7 @@ impl HttpFixture {
             connected: false,
             pause_send: None,
             pause_poll: None,
+            pause_disconnect: None,
             tamper: false,
             plaintext: false,
         }));
@@ -376,6 +378,8 @@ impl HttpFixture {
                         state.lock().await.pause_send.take()
                     } else if path == "/get_messages" {
                         state.lock().await.pause_poll.take()
+                    } else if path == "/disconnect" {
+                        state.lock().await.pause_disconnect.take()
                     } else {
                         None
                     };
@@ -397,8 +401,12 @@ impl HttpFixture {
                         ""
                     };
                     let headers=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",encoded.len(),cookie_header);
-                    stream.write_all(headers.as_bytes()).await.unwrap();
-                    stream.write_all(&encoded).await.unwrap();
+                    if stream.write_all(headers.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(&encoded).await.is_err() {
+                        return;
+                    }
                     let _ = stream.shutdown().await;
                 });
             }
@@ -1214,4 +1222,232 @@ fn shared_noise_rederives_after_peer_rejects_kk_before_responding() {
         Some(current)
     );
     assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), pin);
+}
+
+#[tokio::test]
+async fn concurrent_connect_waits_for_authentication_and_joiner_timeout_is_local() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let identity = Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"wss":endpoint}})).unwrap();
+    let wss = WssTransport::new(identity.clone());
+    let dir = FixtureDir::new();
+    wss.set_noise_state_dir(Some(dir.0.clone())).await;
+    let client = crate::Client {
+        identity,
+        transport: RuntimeTransport::Wss(wss.clone()),
+    };
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    let server_entered = entered.clone();
+    let server_resume = resume.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+        server_entered.notify_one();
+        server_resume.notified().await;
+        let mut responder = Responder::new();
+        for write in responder.reset() {
+            stream
+                .send(WebSocketMessage::Text(
+                    String::from_utf8(write.payload).unwrap(),
+                ))
+                .await
+                .unwrap();
+        }
+        while let Some(message) = stream.next().await {
+            let (raw, binary) = match message.unwrap() {
+                WebSocketMessage::Text(text) => (text.into_bytes(), false),
+                WebSocketMessage::Binary(bytes) => (bytes, true),
+                WebSocketMessage::Close(_) => break,
+                _ => continue,
+            };
+            for write in responder.receive(&raw, binary).unwrap() {
+                stream
+                    .send(if write.binary {
+                        WebSocketMessage::Binary(write.payload)
+                    } else {
+                        WebSocketMessage::Text(String::from_utf8(write.payload).unwrap())
+                    })
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(
+            timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err(),
+            "a joining caller created another socket"
+        );
+        responder.patterns
+    });
+    let initiator = {
+        let client = client.clone();
+        tokio::spawn(async move { client.connect_with_timeout(Duration::from_secs(12)).await })
+    };
+    entered.notified().await;
+    while !wss.state.health.lock().await.connected {
+        tokio::task::yield_now().await;
+    }
+    assert!(!client.healthcheck().await.handshake_complete);
+    assert!(matches!(
+        client.connect_with_timeout(Duration::from_millis(30)).await,
+        Err(ThalovantError::Timeout(_))
+    ));
+    assert!(!initiator.is_finished());
+    assert!(client
+        .list_fallbacks(Some(Duration::from_millis(30)))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        client
+            .ask(
+                "hello",
+                crate::RequestOptions {
+                    timeout: Some(Duration::from_millis(30)),
+                    ..Default::default()
+                }
+            )
+            .await,
+        Err(ThalovantError::Timeout(_))
+    ));
+    assert!(!initiator.is_finished());
+    let joiner = {
+        let client = client.clone();
+        tokio::spawn(async move { client.connect_with_timeout(Duration::from_secs(12)).await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!joiner.is_finished());
+    resume.notify_one();
+    initiator.await.unwrap().unwrap();
+    joiner.await.unwrap().unwrap();
+    assert!(client.healthcheck().await.handshake_complete);
+    client.connect().await.unwrap();
+    client.close().await.unwrap();
+    assert_eq!(server.await.unwrap(), vec!["XXpsk2"]);
+}
+
+#[tokio::test]
+async fn cancelling_initiator_retires_its_generation_and_next_connect_recovers() {
+    for explicit_close in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let identity = Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"wss":endpoint}})).unwrap();
+        let wss = WssTransport::new(identity);
+        let dir = FixtureDir::new();
+        wss.set_noise_state_dir(Some(dir.0.clone())).await;
+        let transport = RuntimeTransport::Wss(wss.clone());
+        let opened = Arc::new(Notify::new());
+        let server_opened = opened.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut first = tokio_tungstenite::accept_async(stream).await.unwrap();
+            server_opened.notify_one();
+            // Deliberately never offer Noise on the first socket.
+            while let Some(message) = first.next().await {
+                if matches!(message, Ok(WebSocketMessage::Close(_)) | Err(_)) {
+                    break;
+                }
+            }
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut responder = Responder::new();
+            for write in responder.reset() {
+                stream
+                    .send(WebSocketMessage::Text(
+                        String::from_utf8(write.payload).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            while let Some(message) = stream.next().await {
+                let (raw, binary) = match message.unwrap() {
+                    WebSocketMessage::Text(text) => (text.into_bytes(), false),
+                    WebSocketMessage::Binary(bytes) => (bytes, true),
+                    WebSocketMessage::Close(_) => break,
+                    _ => continue,
+                };
+                for write in responder.receive(&raw, binary).unwrap() {
+                    stream
+                        .send(if write.binary {
+                            WebSocketMessage::Binary(write.payload)
+                        } else {
+                            WebSocketMessage::Text(String::from_utf8(write.payload).unwrap())
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let initiator = {
+            let transport = transport.clone();
+            tokio::spawn(async move { transport.connect().await })
+        };
+        opened.notified().await;
+        while !wss.state.health.lock().await.connected {
+            tokio::task::yield_now().await;
+        }
+        let joiner = {
+            let transport = transport.clone();
+            tokio::spawn(async move { transport.connect().await })
+        };
+        tokio::task::yield_now().await;
+        if explicit_close {
+            transport.disconnect().await.unwrap();
+            assert!(initiator.await.unwrap().is_err());
+        } else {
+            initiator.abort();
+            assert!(initiator.await.unwrap_err().is_cancelled());
+        }
+        assert!(joiner.await.unwrap().is_err());
+        assert!(!transport.healthcheck().await.connected);
+        transport.connect().await.unwrap();
+        assert!(transport.healthcheck().await.handshake_complete);
+        transport.disconnect().await.unwrap();
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn http_cleanup_deadline_preserves_admission_until_acknowledged_retry() {
+    let fixture = HttpFixture::new().await;
+    let transport = fixture.transport();
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    transport.connect().await.unwrap();
+    let entered = Arc::new(Notify::new());
+    let resume = Arc::new(Notify::new());
+    fixture.state.lock().await.pause_disconnect = Some((entered.clone(), resume.clone()));
+    let closing = {
+        let transport = transport.clone();
+        tokio::spawn(async move { transport.disconnect().await })
+    };
+    timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(3), closing)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ThalovantError::Timeout(_))
+    ));
+    assert!(transport.state.admitted.load(Ordering::Acquire));
+    assert!(!transport.healthcheck().await.connected);
+    assert!(fixture.state.lock().await.connected);
+    resume.notify_one();
+    timeout(Duration::from_secs(2), async {
+        while fixture.state.lock().await.connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    transport.connect().await.unwrap();
+    assert!(transport.healthcheck().await.handshake_complete);
+    assert_eq!(
+        fixture.state.lock().await.responder.patterns,
+        vec!["XXpsk2", "KKpsk0"]
+    );
+    transport.disconnect().await.unwrap();
 }

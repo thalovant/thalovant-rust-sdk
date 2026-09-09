@@ -37,9 +37,10 @@
 
 use crate::{
     constants::{
-        EVENT_ADAPT_MANIFEST, EVENT_ADAPT_MANIFEST_GET, EVENT_INTENT_DESCRIBE,
-        EVENT_INTENT_DESCRIBE_RESPONSE, EVENT_INTENT_LIST, EVENT_INTENT_LIST_RESPONSE,
-        EVENT_PADATIOUS_MANIFEST, EVENT_PADATIOUS_MANIFEST_GET, EVENT_POLICY_DENIED,
+        EVENT_ADAPT_MANIFEST, EVENT_ADAPT_MANIFEST_GET, EVENT_FALLBACK_LIST,
+        EVENT_FALLBACK_LIST_RESPONSE, EVENT_INTENT_DESCRIBE, EVENT_INTENT_DESCRIBE_RESPONSE,
+        EVENT_INTENT_LIST, EVENT_INTENT_LIST_RESPONSE, EVENT_PADATIOUS_MANIFEST,
+        EVENT_PADATIOUS_MANIFEST_GET, EVENT_POLICY_DENIED,
     },
     errors::{Result, ThalovantError},
     events::{
@@ -53,7 +54,10 @@ use std::{
     fmt,
     time::Duration,
 };
-use tokio::{sync::broadcast, time::timeout};
+use tokio::{
+    sync::broadcast,
+    time::{timeout, timeout_at, Instant},
+};
 
 /// How long each intent query waits for its reply unless an option says otherwise.
 pub const DEFAULT_INTENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -75,7 +79,7 @@ pub(crate) const DEFAULT_LANG: &str = "en-us";
 /// Options for [`Client::intents`](crate::Client::intents).
 ///
 /// The default describes every template registration for its sentences and
-/// falls back to the engines' manifests when the hub refuses `ovos.intent.list`.
+/// falls back to the engines' manifests when `ovos.intent.list` is denied or silent.
 #[derive(Clone, Debug)]
 pub struct IntentInventoryOptions {
     /// Deadline for each listing, and for the whole batch of describes. Default 5s.
@@ -83,9 +87,9 @@ pub struct IntentInventoryOptions {
     /// Ask for the sentences behind every template intent. Off, the inventory
     /// carries the intents and their engines but no phrases.
     pub describe: bool,
-    /// When the hub refuses `ovos.intent.list`, read the engines' own manifests
+    /// When `ovos.intent.list` is denied or silent, read the engines' own manifests
     /// instead and return names only, marked `engine-manifests`. Off, the
-    /// refusal is returned as [`ThalovantError::PolicyDenied`].
+    /// refusal or silence is returned as [`ThalovantError::PolicyDenied`] or [`ThalovantError::Timeout`].
     pub fallback: bool,
 }
 
@@ -373,7 +377,7 @@ pub struct HubIntentInventory {
     /// Sorted by skill id.
     pub skills: Vec<HubSkillIntents>,
     pub source: IntentInventorySource,
-    /// The queries the hub refused on the way to this inventory.
+    /// Legacy name: queries unavailable through denial or silence, not proof of an ACL denial.
     pub denied: Vec<String>,
 }
 
@@ -410,6 +414,120 @@ impl Serialize for HubIntentInventory {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         self.as_value().serialize(serializer)
     }
+}
+
+/// A skill that may answer after the ordinary intent engines do not match.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct HubFallback {
+    pub skill_id: String,
+    pub priority: i64,
+}
+
+/// An intent inventory with separately discovered fallback capabilities.
+///
+/// This additive wrapper keeps existing `HubIntentInventory` struct literals
+/// source compatible. Unknown fallback support must not be treated as absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HubIntentCapabilities {
+    pub inventory: HubIntentInventory,
+    pub fallbacks: Vec<HubFallback>,
+    pub fallbacks_known: bool,
+}
+
+impl HubIntentCapabilities {
+    /// Conservative language availability, not a guarantee of an answer.
+    pub fn may_answer(&self, lang: &str) -> bool {
+        !self.fallbacks_known
+            || !self.fallbacks.is_empty()
+            || self
+                .inventory
+                .intents()
+                .any(|intent| intent.enabled && !intent.phrases_for(lang).is_empty())
+    }
+
+    pub fn as_value(&self) -> Value {
+        let mut value = self.inventory.as_value();
+        value["fallbacks"] = json!(self.fallbacks);
+        value["fallbacks_known"] = json!(self.fallbacks_known);
+        value
+    }
+}
+
+impl Serialize for HubIntentCapabilities {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        self.as_value().serialize(serializer)
+    }
+}
+
+/// Optional fallback discovery has its own small budget after the inventory.
+pub const FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+pub(crate) async fn inventory_with_capabilities<L, I, S>(
+    link: &L,
+    languages: I,
+    opts: &IntentInventoryOptions,
+) -> Result<HubIntentCapabilities>
+where
+    L: HubLink,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let inventory = inventory(link, languages, opts).await?;
+    let deadline = opts
+        .timeout
+        .unwrap_or(DEFAULT_INTENT_TIMEOUT)
+        .min(FALLBACK_PROBE_TIMEOUT);
+    let fallbacks = list_fallbacks(link, deadline).await?;
+    Ok(HubIntentCapabilities {
+        inventory,
+        fallbacks_known: fallbacks.is_some(),
+        fallbacks: fallbacks.unwrap_or_default(),
+    })
+}
+
+pub(crate) async fn list_fallbacks<L: HubLink>(
+    link: &L,
+    deadline: Duration,
+) -> Result<Option<Vec<HubFallback>>> {
+    let event = match request_reply(
+        link,
+        EVENT_FALLBACK_LIST,
+        EVENT_FALLBACK_LIST_RESPONSE,
+        Data::new(),
+        DEFAULT_LANG,
+        deadline,
+    )
+    .await
+    {
+        Ok(event) => event,
+        Err(ThalovantError::PolicyDenied { .. } | ThalovantError::Timeout(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if event.data.get("ok") == Some(&Value::Bool(false)) {
+        return Ok(None);
+    }
+    let Some(rows) = event.data.get("fallbacks").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    let mut fallbacks: Vec<_> = rows
+        .iter()
+        .filter_map(|row| {
+            let row = row.as_object()?;
+            let skill_id = string_field(row, "skill_id");
+            if skill_id.is_empty() {
+                return None;
+            }
+            let priority = row
+                .get("priority")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| {
+                    row.get("priority").and_then(Value::as_f64).unwrap_or(0.0) as i64
+                });
+            Some(HubFallback { skill_id, priority })
+        })
+        .collect();
+    fallbacks.sort_by(|a, b| (a.priority, &a.skill_id).cmp(&(b.priority, &b.skill_id)));
+    Ok(Some(fallbacks))
 }
 
 fn string_field(map: &Map<String, Value>, key: &str) -> String {
@@ -529,6 +647,7 @@ async fn await_reply<T>(
     receiver: &mut broadcast::Receiver<Event>,
     deadline: Duration,
     query_type: &str,
+    correlates: impl Fn(&Event) -> bool,
     mut accept: impl FnMut(&Event) -> Option<T>,
 ) -> Result<T> {
     timeout(deadline, async {
@@ -545,7 +664,7 @@ async fn await_reply<T>(
                     ))
                 }
             };
-            if denied_type_of(&event) == Some(query_type) {
+            if denied_type_of(&event) == Some(query_type) && correlates(&event) {
                 return Err(policy_denied(&event));
             }
             if let Some(found) = accept(&event) {
@@ -577,12 +696,22 @@ async fn request_reply<L: HubLink>(
     let request_id = new_request_id();
     let context = query_context(link, lang, &request_id);
     let mut receiver = link.subscribe();
-    link.emit_bus(query_type, data, context.clone()).await?;
-    await_reply(&mut receiver, deadline, query_type, |event| {
-        (event.name == reply_type && event_matches_context(event, Some(&context)))
-            .then(|| event.clone())
+    timeout(deadline, async {
+        link.emit_bus(query_type, data, context.clone()).await?;
+        await_reply(
+            &mut receiver,
+            deadline,
+            query_type,
+            |event| event_matches_context(event, Some(&context)),
+            |event| {
+                (event.name == reply_type && event_matches_context(event, Some(&context)))
+                    .then(|| event.clone())
+            },
+        )
+        .await
     })
     .await
+    .map_err(|_| ThalovantError::Timeout(format!("hub request {query_type} timed out")))?
 }
 
 fn registrations_of(event: &Event) -> Vec<IntentRegistration> {
@@ -755,44 +884,61 @@ async fn describe_one_batch<L: HubLink>(
 
     let mut receiver = link.subscribe();
     let mut by_request: HashMap<String, Wanted> = HashMap::new();
+    let end = Instant::now() + deadline;
     for key in unique {
         let (skill_id, intent_name, lang) = key;
         let request_id = new_request_id();
         by_request.insert(request_id.clone(), key.clone());
-        link.emit_bus(
-            EVENT_INTENT_DESCRIBE,
-            describe_payload(skill_id, intent_name, lang),
-            query_context(link, lang, &request_id),
+        timeout_at(
+            end,
+            link.emit_bus(
+                EVENT_INTENT_DESCRIBE,
+                describe_payload(skill_id, intent_name, lang),
+                query_context(link, lang, &request_id),
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| ThalovantError::Timeout("intent describe send timed out".into()))??;
     }
 
-    let waited = await_reply(&mut receiver, deadline, EVENT_INTENT_DESCRIBE, |event| {
-        if event.name != EVENT_INTENT_DESCRIBE_RESPONSE {
-            return None;
-        }
-        let definitions = definitions_of(event);
-        let key = event
-            .request_id()
-            .and_then(|request_id| by_request.get(&request_id).cloned())
-            .or_else(|| {
-                // No request id came back: the definition names what it describes.
-                let first = definitions.first()?;
-                unique
-                    .iter()
-                    .find(|(skill_id, intent_name, lang)| {
-                        *skill_id == first.skill_id
-                            && *intent_name == first.intent_name
-                            && same_language(lang, &first.lang)
-                    })
-                    .cloned()
-            })?;
-        if found.contains_key(&key) {
-            return None;
-        }
-        found.insert(key, definitions);
-        (found.len() == unique.len()).then_some(())
-    })
+    let waited = await_reply(
+        &mut receiver,
+        end.saturating_duration_since(Instant::now()),
+        EVENT_INTENT_DESCRIBE,
+        |event| {
+            event
+                .request_id()
+                .map(|id| by_request.contains_key(&id))
+                .unwrap_or(true)
+        },
+        |event| {
+            if event.name != EVENT_INTENT_DESCRIBE_RESPONSE {
+                return None;
+            }
+            let definitions = definitions_of(event);
+            let key = match event.request_id() {
+                Some(request_id) => by_request.get(&request_id).cloned(),
+                None => {
+                    // Content fallback is only for a response with no request ID.
+                    // A foreign ID remains foreign even if its definition matches.
+                    let first = definitions.first()?;
+                    unique
+                        .iter()
+                        .find(|(skill_id, intent_name, lang)| {
+                            *skill_id == first.skill_id
+                                && *intent_name == first.intent_name
+                                && same_language(lang, &first.lang)
+                        })
+                        .cloned()
+                }
+            }?;
+            if found.contains_key(&key) {
+                return None;
+            }
+            found.insert(key, definitions);
+            (found.len() == unique.len()).then_some(())
+        },
+    )
     .await;
     match waited {
         Ok(()) => Ok(found),
@@ -922,7 +1068,9 @@ where
                     ThalovantError::PolicyDenied { denied_type, .. }
                         if denied_type == EVENT_INTENT_LIST
                 );
-                if !(opts.fallback && listing_refused) {
+                if !(opts.fallback
+                    && (listing_refused || matches!(error, ThalovantError::Timeout(_))))
+                {
                     return Err(error);
                 }
                 // Names carry no language, so the engines are asked once.
@@ -1099,6 +1247,10 @@ mod tests {
         silent: Vec<&'static str>,
         /// Answer the listing `{"ok": false, "error": ...}` instead of rows.
         listing_fails_with: Option<Value>,
+        fallback_response: Value,
+        blocked_send: bool,
+        foreign_denial: bool,
+        foreign_describes_only: bool,
         definitions_in_list: bool,
         echo_request_id: bool,
         repeats: usize,
@@ -1126,6 +1278,10 @@ mod tests {
                 refuse: Vec::new(),
                 silent: Vec::new(),
                 listing_fails_with: None,
+                fallback_response: json!({"fallbacks": []}),
+                blocked_send: false,
+                foreign_denial: false,
+                foreign_describes_only: false,
                 definitions_in_list: false,
                 echo_request_id: true,
                 repeats: 2,
@@ -1198,6 +1354,9 @@ mod tests {
         }
 
         async fn emit_bus(&self, event_type: &str, data: Data, context: Context) -> Result<()> {
+            if self.blocked_send {
+                std::future::pending::<()>().await;
+            }
             self.emitted.lock().unwrap().push((
                 event_type.to_string(),
                 data.clone(),
@@ -1207,6 +1366,20 @@ mod tests {
                 if let Some(window) = self.windows.lock().unwrap().last_mut() {
                     *window += 1;
                 }
+            }
+            if self.foreign_denial {
+                let foreign = query_context(self, DEFAULT_LANG, "another-request");
+                self.deliver(
+                    EVENT_POLICY_DENIED,
+                    json!({"denied_type":event_type}),
+                    &foreign,
+                );
+            }
+            if self.foreign_describes_only && event_type == EVENT_INTENT_DESCRIBE {
+                let foreign = query_context(self, DEFAULT_LANG, "another-request");
+                self.deliver(EVENT_INTENT_DESCRIBE_RESPONSE, json!({"ok":true,"definitions":[{"method":"template","definition":Self::definition(
+                    data["lang"].as_str().unwrap(), data["skill_id"].as_str().unwrap(), data["intent_name"].as_str().unwrap(), &["foreign speech".into()])}]}), &foreign);
+                return Ok(());
             }
             if self.refuse.contains(&event_type) {
                 self.deliver(
@@ -1230,6 +1403,11 @@ mod tests {
                 .unwrap_or_default()
                 .to_string();
             match event_type {
+                EVENT_FALLBACK_LIST => self.deliver(
+                    EVENT_FALLBACK_LIST_RESPONSE,
+                    self.fallback_response.clone(),
+                    &context,
+                ),
                 EVENT_INTENT_LIST => {
                     if let Some(error) = &self.listing_fails_with {
                         self.deliver(
@@ -1590,14 +1768,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_silent_hub_times_out_on_the_listing() {
+    async fn a_silent_hub_times_out_when_fallback_is_disabled() {
         let hub = FakeHub {
             silent: vec![EVENT_INTENT_LIST],
             ..Default::default()
         };
-        let error = inventory(&hub, ["en-us"], &options(Some(Duration::from_millis(200))))
-            .await
-            .unwrap_err();
+        let error = inventory(
+            &hub,
+            ["en-us"],
+            &IntentInventoryOptions {
+                fallback: false,
+                ..options(Some(Duration::from_millis(20)))
+            },
+        )
+        .await
+        .unwrap_err();
         match error {
             ThalovantError::Timeout(message) => {
                 assert!(message.contains(EVENT_INTENT_LIST), "{message}")
@@ -2146,12 +2331,158 @@ mod tests {
         .unwrap();
         let client = Client::new(identity);
         assert_send(client.intents(["en-us"], IntentInventoryOptions::default()));
+        assert_send(client.intents_with_capabilities(["en-us"], IntentInventoryOptions::default()));
+        assert_send(client.list_fallbacks(None));
+        assert_send(client.ask_with_options("hello", crate::AskOptions::default()));
         assert_send(client.list_intents("en-us", IntentListOptions::default()));
         assert_send(client.describe_intent(
             WEATHER,
             "current.weather",
             "en-us",
             IntentDescribeOptions::default(),
+        ));
+    }
+    #[tokio::test]
+    async fn silent_listing_uses_engine_names_and_records_the_unavailable_query() {
+        let hub = FakeHub {
+            silent: vec![EVENT_INTENT_LIST],
+            ..Default::default()
+        };
+        let result = inventory(&hub, ["en-us"], &options(Some(Duration::from_millis(20))))
+            .await
+            .unwrap();
+        assert_eq!(result.source, IntentInventorySource::EngineManifests);
+        assert!(!result.skills.is_empty());
+        assert_eq!(result.denied, vec![EVENT_INTENT_LIST]);
+        let hub = FakeHub {
+            silent: vec![
+                EVENT_INTENT_LIST,
+                EVENT_ADAPT_MANIFEST_GET,
+                EVENT_PADATIOUS_MANIFEST_GET,
+            ],
+            ..Default::default()
+        };
+        assert!(matches!(
+            inventory(&hub, ["en-us"], &options(Some(Duration::from_millis(20)))).await,
+            Err(ThalovantError::Timeout(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn capability_probe_distinguishes_unknown_empty_and_registered_fallbacks() {
+        let opts = options(Some(Duration::from_millis(20)));
+        for response in [
+            json!({}),
+            json!({"fallbacks":null}),
+            json!({"fallbacks":{}}),
+            json!({"ok":false,"fallbacks":[]}),
+        ] {
+            let hub = FakeHub {
+                fallback_response: response,
+                ..Default::default()
+            };
+            let result = inventory_with_capabilities(&hub, ["de-de"], &opts)
+                .await
+                .unwrap();
+            assert!(!result.fallbacks_known);
+            assert!(result.may_answer("de-de"));
+        }
+        for (refuse, silent) in [
+            (vec![EVENT_FALLBACK_LIST], vec![]),
+            (vec![], vec![EVENT_FALLBACK_LIST]),
+        ] {
+            let hub = FakeHub {
+                refuse,
+                silent,
+                ..Default::default()
+            };
+            let result = inventory_with_capabilities(&hub, ["de-de"], &opts)
+                .await
+                .unwrap();
+            assert!(!result.fallbacks_known);
+            assert!(result.may_answer("de-de"));
+        }
+        let mut result = inventory_with_capabilities(&FakeHub::default(), ["en-us"], &opts)
+            .await
+            .unwrap();
+        assert!(result.fallbacks_known);
+        assert!(result.may_answer("en_US"));
+        assert!(!result.may_answer("de-de"));
+        for skill in &mut result.inventory.skills {
+            for intent in &mut skill.intents {
+                intent.enabled = false;
+            }
+        }
+        assert!(!result.may_answer("en-us"));
+        let hub = FakeHub {
+            fallback_response: json!({"fallbacks":[null, {}, {"skill_id":""}, {"skill_id":"z", "priority":12}, {"skill_id":"b", "priority":1.9}, {"skill_id":"a", "priority":1}]}),
+            ..Default::default()
+        };
+        let result = inventory_with_capabilities(&hub, ["de-de"], &opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            result
+                .fallbacks
+                .iter()
+                .map(|row| row.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "z"]
+        );
+        assert!(result.may_answer("de-de"));
+        assert_eq!(result.as_value()["fallbacks_known"], true);
+    }
+
+    #[tokio::test]
+    async fn request_timeout_also_bounds_a_blocked_send() {
+        let hub = FakeHub {
+            blocked_send: true,
+            ..Default::default()
+        };
+        assert!(list_fallbacks(&hub, Duration::from_millis(20))
+            .await
+            .unwrap()
+            .is_none());
+    }
+    #[tokio::test]
+    async fn foreign_policy_denial_does_not_cancel_a_correlated_request() {
+        let hub = FakeHub {
+            foreign_denial: true,
+            ..Default::default()
+        };
+        let result = inventory_with_capabilities(
+            &hub,
+            ["en-us"],
+            &options(Some(Duration::from_millis(100))),
+        )
+        .await
+        .unwrap();
+        assert!(result.inventory.has_phrases());
+        assert!(result.fallbacks_known);
+    }
+
+    #[tokio::test]
+    async fn foreign_describe_id_never_falls_back_to_matching_definition_content() {
+        let hub = FakeHub {
+            foreign_describes_only: true,
+            ..Default::default()
+        };
+        let wanted = vec![(
+            WEATHER.to_string(),
+            "current.weather".into(),
+            "en-us".into(),
+        )];
+        assert!(matches!(
+            describe_many(&hub, &wanted, Duration::from_millis(20), 32).await,
+            Err(ThalovantError::Timeout(_))
+        ));
+        let blocked = FakeHub {
+            blocked_send: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            describe_many(&blocked, &wanted, Duration::from_millis(20), 32).await,
+            Err(ThalovantError::Timeout(_))
         ));
     }
 }

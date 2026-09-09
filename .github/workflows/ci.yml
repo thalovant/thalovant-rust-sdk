@@ -13,7 +13,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -21,7 +25,8 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+      # Limit expensive Argon2 fixtures competing for CPU on smaller runners.
+      - run: cargo test --all-features -- --test-threads=2
       - run: cargo package --allow-dirty --list
 
   minimum-rust:
@@ -30,5 +35,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
-          toolchain: "1.85.0"
-      - run: cargo test --all-targets --all-features
+          toolchain: "1.88.0"
+      - run: cargo test --all-targets --all-features -- --test-threads=2
+
+  security:
+    name: RustSec dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - run: cargo generate-lockfile
+      - run: cargo install cargo-audit --version 0.22.2 --locked --no-default-features
+      - run: cargo audit

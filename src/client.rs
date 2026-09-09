@@ -6,20 +6,24 @@ use crate::{
     },
     errors::{Result, ThalovantError},
     events::{
-        context_with_correlation, event_matches_context, merge_context, new_request_id,
-        new_session_id, utterance_payload, Context, Data, Event, Reply,
+        context_with_correlation, merge_context, new_request_id, new_session_id, utterance_payload,
+        Context, Data, Event, Reply,
     },
     identity::Identity,
     intents::{
-        self, HubIntentInventory, HubLink, IntentDefinition, IntentDescribeOptions,
-        IntentInventoryOptions, IntentListOptions, IntentRegistration, DEFAULT_INTENT_TIMEOUT,
+        self, HubFallback, HubIntentCapabilities, HubIntentInventory, HubLink, IntentDefinition,
+        IntentDescribeOptions, IntentInventoryOptions, IntentListOptions, IntentRegistration,
+        DEFAULT_INTENT_TIMEOUT,
     },
     protocols::{HubProtocol, DEFAULT_PROTOCOL_PREFERENCE},
     transport::{HiveMessage, RuntimeTransport, TransportConnectionInfo, TransportHealth},
 };
 use serde_json::{Map, Value};
 use std::{path::Path, time::Duration};
-use tokio::{sync::broadcast, time::timeout};
+use tokio::{
+    sync::broadcast,
+    time::{timeout, timeout_at, Instant},
+};
 
 #[derive(Clone)]
 pub struct Client {
@@ -34,6 +38,26 @@ pub struct RequestOptions {
     pub context: Option<Context>,
     pub session_id: Option<String>,
     pub request_id: Option<String>,
+}
+
+/// Reply collection controls without changing existing `RequestOptions` literals.
+#[derive(Clone, Debug)]
+pub struct AskOptions {
+    pub request: RequestOptions,
+    /// Wait for delayed speech after a handled event or a soft intent miss.
+    pub empty_reply_wait: Duration,
+    /// Collect adjacent speech fragments after the first answer.
+    pub reply_settle: Duration,
+}
+
+impl Default for AskOptions {
+    fn default() -> Self {
+        Self {
+            request: RequestOptions::default(),
+            empty_reply_wait: Duration::from_secs(5),
+            reply_settle: Duration::from_millis(250),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -123,19 +147,7 @@ impl Client {
     }
 
     pub async fn connect_with_timeout(&self, timeout_duration: Duration) -> Result<()> {
-        if self.healthcheck().await.connected {
-            return Ok(());
-        }
-        match timeout(timeout_duration, self.transport.connect()).await {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = self.transport.disconnect().await;
-                Err(ThalovantError::Timeout(format!(
-                    "hub connection did not complete within {}ms",
-                    timeout_duration.as_millis()
-                )))
-            }
-        }
+        self.transport.connect_with_timeout(timeout_duration).await
     }
 
     pub async fn connect_with_info(&self) -> Result<TransportConnectionInfo> {
@@ -269,89 +281,64 @@ impl Client {
             .await
     }
 
+    /// Ask within one deadline covering connection, send, and reply collection.
     pub async fn ask(&self, text: &str, opts: RequestOptions) -> Result<Reply> {
+        self.ask_with_options(
+            text,
+            AskOptions {
+                request: opts,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Configure bounded delayed-speech and fragment collection explicitly.
+    pub async fn ask_with_options(&self, text: &str, options: AskOptions) -> Result<Reply> {
         let prompt = text.trim();
         if prompt.is_empty() {
             return Err(ThalovantError::Runtime(
-                "ask requires non-empty text".to_string(),
+                "ask requires non-empty text".into(),
             ));
         }
-        self.connect().await?;
-        let lang = opts.lang.as_deref().unwrap_or("en-us");
-        let timeout_duration = opts.timeout.unwrap_or(Duration::from_secs(12));
-        let request_id = opts.request_id.unwrap_or_else(new_request_id);
-        let context = context_with_correlation(
-            opts.context.as_ref(),
-            opts.session_id.as_deref(),
-            Some(&self.identity.site_id),
-            Some(lang),
-            Some(&request_id),
-        );
-        let mut receiver = self.transport.subscribe();
-        self.transport
-            .emit_bus(
-                EVENT_RECOGNIZER_LOOP_UTTERANCE,
-                utterance_payload(prompt, lang),
-                context.clone(),
-            )
-            .await?;
-        let mut events = Vec::new();
-        let mut fragments = Vec::new();
-        let mut failure_event = None;
-        timeout(timeout_duration, async {
-            loop {
-                let event = receiver
-                    .recv()
-                    .await
-                    .map_err(|err| ThalovantError::Runtime(err.to_string()))?;
-                if !event_matches_context(&event, Some(&context)) {
-                    continue;
-                }
-                events.push(event.clone());
-                match event.name.as_str() {
-                    EVENT_SPEAK | EVENT_OVOS_UTTERANCE_SPEAK => {
-                        let text = event.text();
-                        if !text.is_empty() {
-                            fragments.push(text);
-                        }
-                    }
-                    EVENT_INTENT_FAILURE
-                    | EVENT_INTENT_UNMATCHED
-                    | EVENT_POLICY_DENIED
-                    | EVENT_QUERY_TIMEOUT => failure_event = Some(event),
-                    EVENT_UTTERANCE_HANDLED => break,
-                    _ => {}
-                }
-            }
-            Ok::<(), ThalovantError>(())
+        let deadline = Instant::now() + options.request.timeout.unwrap_or(Duration::from_secs(12));
+        timeout_at(deadline, async {
+            self.connect_with_timeout(deadline.saturating_duration_since(Instant::now()))
+                .await?;
+            let opts = &options.request;
+            let lang = opts.lang.as_deref().unwrap_or("en-us");
+            let request_id = opts.request_id.clone().unwrap_or_else(new_request_id);
+            let context = context_with_correlation(
+                opts.context.as_ref(),
+                opts.session_id.as_deref(),
+                Some(&self.identity.site_id),
+                Some(lang),
+                Some(&request_id),
+            );
+            let mut receiver = self.transport.subscribe();
+            self.transport
+                .emit_bus(
+                    EVENT_RECOGNIZER_LOOP_UTTERANCE,
+                    utterance_payload(prompt, lang),
+                    context.clone(),
+                )
+                .await?;
+            collect_ask_reply(&mut receiver, &context, &request_id, deadline, &options).await
         })
         .await
-        .map_err(|_| ThalovantError::Timeout("utterance handling timed out".to_string()))??;
-        if failure_event.is_some() && fragments.is_empty() {
-            return Err(ThalovantError::Runtime(
-                failure_event
-                    .as_ref()
-                    .map(|event| event.name.clone())
-                    .unwrap_or_default(),
-            ));
-        }
-        Ok(Reply {
-            text: fragments.join(" "),
-            utterances: fragments,
-            handled: failure_event.is_none(),
-            ok: failure_event.is_none(),
-            session_id: context
-                .get("session")
-                .and_then(|value| value.get("session_id"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string),
-            request_id: Some(request_id),
-            events,
-            failure_event,
-        })
+        .map_err(|_| ThalovantError::Timeout("utterance handling timed out".into()))?
     }
 
     pub async fn query(&self, text: &str, opts: QueryOptions) -> Result<Reply> {
+        timeout(
+            opts.timeout.unwrap_or(Duration::from_secs(12)),
+            self.query_inner(text, opts),
+        )
+        .await
+        .map_err(|_| ThalovantError::Timeout("query timed out".into()))?
+    }
+
+    async fn query_inner(&self, text: &str, opts: QueryOptions) -> Result<Reply> {
         let prompt = text.trim();
         if prompt.is_empty() {
             return Err(ThalovantError::Runtime(
@@ -413,6 +400,7 @@ impl Client {
         let mut events = Vec::new();
         let mut fragments = Vec::new();
         let mut failure_event = None;
+        let mut soft_failure = None;
         timeout(timeout_duration, async {
             loop {
                 let message = receiver
@@ -433,10 +421,10 @@ impl Client {
                     EVENT_SPEAK | EVENT_OVOS_UTTERANCE_SPEAK => {
                         push_fragment(&mut fragments, &event.text());
                     }
-                    EVENT_INTENT_FAILURE
-                    | EVENT_INTENT_UNMATCHED
-                    | EVENT_POLICY_DENIED
-                    | EVENT_QUERY_TIMEOUT => {
+                    EVENT_INTENT_FAILURE | EVENT_INTENT_UNMATCHED => {
+                        soft_failure = Some(event.clone())
+                    }
+                    EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => {
                         failure_event = Some(event.clone());
                     }
                     _ => {}
@@ -447,6 +435,9 @@ impl Client {
         })
         .await
         .map_err(|_| ThalovantError::Timeout("query timed out".to_string()))??;
+        if fragments.is_empty() {
+            failure_event = failure_event.or(soft_failure);
+        }
         if failure_event.is_some() && fragments.is_empty() {
             return Err(ThalovantError::Runtime(
                 failure_event
@@ -488,7 +479,7 @@ impl Client {
     /// a person says to reach it, as the skill wrote them, `{slot}`
     /// placeholders included. `languages` defaults to `en-us` when empty.
     ///
-    /// The connection must always be allowed to publish `ovos.intent.list`.
+    /// The preferred listing is `ovos.intent.list`; silence or denial may use engine manifests.
     /// `ovos.intent.describe` is needed only when the client has to ask for
     /// the definitions itself: `describe` is on (the default) *and* the
     /// runtime did not attach each row's `definition` to the listing. A
@@ -502,7 +493,7 @@ impl Client {
     /// A hub that answers the listing `ok: false` fails with
     /// [`ThalovantError::Runtime`] carrying the hub's wording: a query that
     /// failed is not an empty hub, and the fallback answers a refusal, not a
-    /// failure.
+    /// failure. A silent listing also uses the fallback when enabled.
     pub async fn intents<I, S>(
         &self,
         languages: I,
@@ -514,6 +505,41 @@ impl Client {
     {
         self.connect().await?;
         intents::inventory(self, languages, &opts).await
+    }
+
+    /// Inventory plus optional fallback handlers and conservative language availability.
+    /// The fallback probe adds at most 1.5 seconds after the inventory query.
+    pub async fn intents_with_capabilities<I, S>(
+        &self,
+        languages: I,
+        opts: IntentInventoryOptions,
+    ) -> Result<HubIntentCapabilities>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.connect().await?;
+        intents::inventory_with_capabilities(self, languages, &opts).await
+    }
+
+    /// Registered fallback skills, or `None` when permission/support is unknown.
+    pub async fn list_fallbacks(
+        &self,
+        timeout_duration: Option<Duration>,
+    ) -> Result<Option<Vec<HubFallback>>> {
+        let budget = timeout_duration
+            .unwrap_or(intents::FALLBACK_PROBE_TIMEOUT)
+            .min(intents::FALLBACK_PROBE_TIMEOUT);
+        let deadline = Instant::now() + budget;
+        match timeout_at(deadline, async {
+            self.connect_with_timeout(budget).await?;
+            intents::list_fallbacks(self, deadline.saturating_duration_since(Instant::now())).await
+        })
+        .await
+        {
+            Err(_) | Ok(Err(ThalovantError::Timeout(_))) => Ok(None),
+            Ok(result) => result,
+        }
     }
 
     /// The hub's intent manifest for one language, one row per registration.
@@ -550,6 +576,85 @@ impl Client {
         )
         .await
     }
+}
+
+async fn collect_ask_reply(
+    receiver: &mut broadcast::Receiver<Event>,
+    context: &Context,
+    request_id: &str,
+    deadline: Instant,
+    options: &AskOptions,
+) -> Result<Reply> {
+    let mut events = Vec::new();
+    let mut fragments = Vec::new();
+    let mut hard_failure = None;
+    let mut soft_failure = None;
+    let mut empty_deadline = None;
+    let mut settle_deadline = None;
+    loop {
+        let wake = settle_deadline
+            .or(empty_deadline)
+            .unwrap_or(deadline)
+            .min(deadline);
+        let event = match timeout_at(wake, receiver.recv()).await {
+            Err(_) => break,
+            Ok(Ok(event)) => event,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Closed)) => {
+                return Err(ThalovantError::Connection(
+                    "hub session closed while collecting a reply".into(),
+                ))
+            }
+        };
+        // A runtime may replace the session ID. The request ID is required:
+        // ambient or uncorrelated events must never satisfy a concurrent Ask.
+        if event.request_id().as_deref() != Some(request_id) {
+            continue;
+        }
+        match event.name.as_str() {
+            EVENT_SPEAK | EVENT_OVOS_UTTERANCE_SPEAK => {
+                push_fragment(&mut fragments, &event.text());
+                if !fragments.is_empty() && settle_deadline.is_none() {
+                    settle_deadline = Some(Instant::now() + options.reply_settle);
+                }
+            }
+            EVENT_INTENT_FAILURE | EVENT_INTENT_UNMATCHED => {
+                soft_failure = Some(event.clone());
+                empty_deadline.get_or_insert(Instant::now() + options.empty_reply_wait);
+            }
+            EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => hard_failure = Some(event.clone()),
+            EVENT_UTTERANCE_HANDLED => {
+                empty_deadline.get_or_insert(Instant::now() + options.empty_reply_wait);
+            }
+            _ => {}
+        }
+        events.push(event);
+        if hard_failure.is_some() {
+            break;
+        }
+    }
+    let failure_event =
+        hard_failure.or_else(|| fragments.is_empty().then_some(soft_failure).flatten());
+    if fragments.is_empty() {
+        return Err(match failure_event {
+            Some(event) => ThalovantError::Runtime(event.name),
+            None => ThalovantError::Timeout("hub finished without a speak reply".into()),
+        });
+    }
+    Ok(Reply {
+        text: fragments.join(" "),
+        utterances: fragments,
+        handled: failure_event.is_none(),
+        ok: failure_event.is_none(),
+        session_id: context
+            .get("session")
+            .and_then(|value| value.get("session_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        request_id: Some(request_id.to_string()),
+        events,
+        failure_event,
+    })
 }
 
 fn lang_or_default(lang: &str) -> &str {
@@ -755,5 +860,110 @@ mod tests {
         assert_eq!(event.text(), "direct answer");
         assert_eq!(event.session_id().as_deref(), Some("session-1"));
         assert_eq!(event.request_id().as_deref(), Some("request-1"));
+    }
+    fn reply_context(id: &str) -> Context {
+        context_with_correlation(None, Some("shared-session"), None, None, Some(id))
+    }
+
+    #[tokio::test]
+    async fn handled_and_soft_miss_wait_for_late_speech_without_losing_concurrent_replies() {
+        let (tx, _) = broadcast::channel(32);
+        let mut first = tx.subscribe();
+        let mut second = tx.subscribe();
+        let options = AskOptions {
+            empty_reply_wait: Duration::from_millis(100),
+            reply_settle: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let first_context = reply_context("first");
+        let second_context = reply_context("second");
+        let producer = tokio::spawn(async move {
+            tx.send(Event::new(
+                EVENT_SPEAK,
+                json!({"utterance":"ambient"}).as_object().unwrap().clone(),
+                Context::new(),
+                None,
+            ))
+            .unwrap();
+            for id in ["first", "second"] {
+                for name in [EVENT_INTENT_UNMATCHED, EVENT_UTTERANCE_HANDLED] {
+                    tx.send(Event::new(name, Data::new(), reply_context(id), None))
+                        .unwrap();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            for id in ["second", "first"] {
+                tx.send(Event::new(
+                    EVENT_SPEAK,
+                    json!({"utterance":id}).as_object().unwrap().clone(),
+                    reply_context(id),
+                    None,
+                ))
+                .unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (a, b) = tokio::join!(
+            collect_ask_reply(&mut first, &first_context, "first", deadline, &options),
+            collect_ask_reply(&mut second, &second_context, "second", deadline, &options)
+        );
+        for (reply, expected) in [(a.unwrap(), "first"), (b.unwrap(), "second")] {
+            assert_eq!(reply.text, expected);
+            assert!(reply.ok);
+            assert!(reply.failure_event.is_none());
+            assert_eq!(reply.events.len(), 3);
+        }
+        producer.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_success_is_timeout_and_hard_failure_is_not_recovered_by_speech() {
+        for hard in [false, true] {
+            let (tx, mut receiver) = broadcast::channel(8);
+            let context = reply_context("test");
+            tx.send(Event::new(
+                EVENT_UTTERANCE_HANDLED,
+                Data::new(),
+                context.clone(),
+                None,
+            ))
+            .unwrap();
+            if hard {
+                tx.send(Event::new(
+                    EVENT_SPEAK,
+                    json!({"utterance":"partial"}).as_object().unwrap().clone(),
+                    context.clone(),
+                    None,
+                ))
+                .unwrap();
+                tx.send(Event::new(
+                    EVENT_POLICY_DENIED,
+                    Data::new(),
+                    context.clone(),
+                    None,
+                ))
+                .unwrap();
+            }
+            let options = AskOptions {
+                empty_reply_wait: Duration::from_secs(5),
+                ..Default::default()
+            };
+            let result = collect_ask_reply(
+                &mut receiver,
+                &context,
+                "test",
+                Instant::now() + Duration::from_millis(20),
+                &options,
+            )
+            .await;
+            if hard {
+                let reply = result.unwrap();
+                assert!(!reply.ok);
+                assert_eq!(reply.failure_event.unwrap().name, EVENT_POLICY_DENIED);
+            } else {
+                assert!(matches!(result, Err(ThalovantError::Timeout(_))));
+            }
+        }
     }
 }
