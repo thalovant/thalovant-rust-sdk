@@ -13,6 +13,7 @@ pub mod noise_store;
 pub mod protocols;
 mod redact;
 pub mod rich;
+pub mod stream;
 mod tls;
 pub mod transport;
 pub mod wire;
@@ -55,6 +56,7 @@ pub use protocols::{
     HubProtocolSettings, SelectedHubEndpoint, DEFAULT_PROTOCOL_PREFERENCE,
 };
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
+pub use stream::{EventPredicate, EventStream, ListenOptions};
 pub use transport::{
     mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport, RuntimeTransport,
     TransportConnectionInfo, TransportConnectionPhase, TransportHealth, WssTransport,

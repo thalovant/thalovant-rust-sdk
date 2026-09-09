@@ -428,6 +428,14 @@ impl ControlPlane {
             )
             .await?;
         let grant = DeviceAuthorization::from_value(grant)?;
+        if browser_command(&grant.verification_uri, "linux").is_none()
+            || grant
+                .verification_uri_complete
+                .as_ref()
+                .is_some_and(|uri| browser_command(uri, "linux").is_none())
+        {
+            return Err(ThalovantError::Api("device authorization requires HTTP(S) verification URLs without embedded credentials".into()));
+        }
         match prompt.as_ref() {
             Some(prompt) => prompt(&grant),
             None => println!(
@@ -1554,17 +1562,42 @@ fn required_device_field(raw: &Map<String, Value>, key: &str) -> Result<String> 
 /// Best-effort attempt to open `url` in the local browser. Failure to launch a
 /// browser is never fatal; the plain verification prompt already covers it.
 fn open_url_in_browser(url: &str) {
-    for command in ["xdg-open", "open"] {
-        let launched = std::process::Command::new(command)
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if launched.is_ok() {
-            return;
-        }
+    let Some((command, arguments)) = browser_command(url, std::env::consts::OS) else {
+        return;
+    };
+    let _ = std::process::Command::new(command)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+fn browser_command(raw: &str, os: &str) -> Option<(&'static str, Vec<String>)> {
+    if raw
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return None;
     }
+    let url = url::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "https" | "http")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    // Never route an API-provided URI through a shell or accept an executable
+    // path/custom scheme as a browser destination.
+    Some(match os {
+        "windows" => (
+            "rundll32.exe",
+            vec!["url.dll,FileProtocolHandler".into(), url.to_string()],
+        ),
+        "macos" => ("open", vec![url.to_string()]),
+        _ => ("xdg-open", vec![url.to_string()]),
+    })
 }
 
 fn new_secret() -> String {
@@ -1685,6 +1718,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_launch_accepts_only_web_urls_and_never_uses_a_shell() {
+        for os in ["windows", "macos", "linux"] {
+            for raw in [
+                "cmd.exe",
+                "--help",
+                "file:///tmp/program",
+                "javascript:alert(1)",
+                "https://user:password@example.invalid",
+                "https://",
+                "https://example.invalid/\ncommand",
+                "https://example.invalid/ bad",
+            ] {
+                assert!(browser_command(raw, os).is_none());
+            }
+            let raw = "https://example.invalid/activate?code=abc&other=one;two";
+            let (command, args) = browser_command(raw, os).unwrap();
+            assert!(!["cmd", "cmd.exe", "sh", "bash", "powershell"].contains(&command));
+            assert_eq!(args.last().unwrap(), raw);
+            assert_eq!(args.len(), if os == "windows" { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_device_urls_fail_before_prompt_browser_or_poll() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for field in ["verification_uri", "verification_uri_complete"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let mut grant = json!({"device_code":Uuid::new_v4().to_string(),"user_code":"test",
+                "verification_uri":"https://example.invalid/activate", "verification_uri_complete":"https://example.invalid/activate?code=test"});
+            grant[field] = "file:///tmp/program".into();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 8192];
+                assert!(stream.read(&mut buffer).await.unwrap() > 0);
+                let body = grant.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                        .await
+                        .is_err()
+                );
+            });
+            let error = ControlPlane::new(endpoint, None)
+                .login_with_browser(DeviceLoginOptions {
+                    prompt: Some(Box::new(|_| panic!("invalid URL reached the prompt"))),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("requires HTTP(S) verification URLs"));
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
     fn a_callers_legacy_crypto_key_never_reaches_the_request() {
         let caller = serde_json::json!({
             "cryptoKey": "caller-supplied-SECRET",
@@ -1743,6 +1835,7 @@ mod tests {
 
     #[tokio::test]
     async fn control_credentials_require_tls_before_network_io() {
+        let secret = Uuid::new_v4().to_string();
         for endpoint in [
             "http://api.example.invalid",
             "http://localhost.example.invalid",
@@ -1750,9 +1843,9 @@ mod tests {
             "ftp://localhost",
             "https://user:SECRET@example.invalid",
         ] {
-            let mut control = ControlPlane::new(endpoint, Some("SECRET".into()));
+            let mut control = ControlPlane::new(endpoint, Some(secret.clone()));
             let error = control
-                .login("test@example.invalid", "SECRET", None)
+                .login("test@example.invalid", &secret, None)
                 .await
                 .unwrap_err();
             assert!(!error.to_string().contains("SECRET"));
@@ -1781,6 +1874,7 @@ mod tests {
     #[tokio::test]
     async fn control_redirects_never_forward_credentials_or_login_bodies() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let secret = Uuid::new_v4().to_string();
         for status in [301, 302, 303, 307, 308] {
             for login in [false, true] {
                 let receiver = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1797,9 +1891,9 @@ mod tests {
                     stream.write_all(format!("HTTP/1.1 {status} Redirect\r\nLocation: {destination}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
                     stream.shutdown().await.unwrap();
                 });
-                let mut control = ControlPlane::new(endpoint, Some("SECRET".into()));
+                let mut control = ControlPlane::new(endpoint, Some(secret.clone()));
                 let result = if login {
-                    control.login("test@example.invalid", "SECRET", None).await
+                    control.login("test@example.invalid", &secret, None).await
                 } else {
                     control.request("GET", "/v1/me", None, None, true).await
                 };

@@ -492,6 +492,95 @@ async fn http_noise_tls_cookie_reconnect_and_concurrent_chunks() {
 }
 
 #[tokio::test]
+async fn client_event_stream_uses_authenticated_http_and_reports_disconnect() {
+    let fixture = HttpFixture::new().await;
+    let transport = fixture.transport();
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    let client = crate::Client {
+        identity: transport.identity().clone(),
+        transport: RuntimeTransport::Http(transport.clone()),
+    };
+    let mut events = client
+        .listen(
+            "echo",
+            crate::ListenOptions {
+                timeout: Some(Duration::from_secs(12)),
+                request_id: Some("ours".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(client.healthcheck().await.handshake_complete);
+    let waiting_client = client.clone();
+    let waiting = tokio::spawn(async move {
+        waiting_client
+            .wait_for_event("never", crate::ListenOptions::default())
+            .await
+    });
+    timeout(Duration::from_secs(2), async {
+        while transport.state.bus_tx.receiver_count() < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert_eq!(transport.state.bus_tx.receiver_count(), 1);
+    assert!(client.healthcheck().await.handshake_complete);
+    for id in ["foreign", "ours"] {
+        client
+            .emit(
+                "echo",
+                Map::new(),
+                json!({"request_id": id}).as_object().unwrap().clone(),
+            )
+            .await
+            .unwrap();
+    }
+    transport.poll_once().await.unwrap();
+    assert_eq!(
+        events
+            .recv()
+            .await
+            .unwrap()
+            .unwrap()
+            .request_id()
+            .as_deref(),
+        Some("ours")
+    );
+    let mut deadline_stream = client
+        .listen(
+            "never",
+            crate::ListenOptions {
+                timeout: Some(Duration::from_millis(250)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let held_noise = transport.state.noise.lock().await;
+    assert!(matches!(
+        timeout(Duration::from_secs(2), deadline_stream.recv())
+            .await
+            .unwrap(),
+        Err(ThalovantError::Timeout(_))
+    ));
+    drop(held_noise);
+    assert_eq!(transport.state.bus_tx.receiver_count(), 1);
+    client.close().await.unwrap();
+    assert!(matches!(
+        timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap(),
+        Err(ThalovantError::Connection(_))
+    ));
+    assert!(events.recv().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn http_noise_rejects_errors_plaintext_tampering_and_changed_pin() {
     for failure in [
         "wrong-password",
@@ -1325,6 +1414,22 @@ async fn concurrent_connect_waits_for_authentication_and_joiner_timeout_is_local
         .await
         .unwrap()
         .is_none());
+    assert!(matches!(
+        client
+            .wait_for_event(
+                "echo",
+                crate::ListenOptions {
+                    timeout: Some(Duration::from_millis(30)),
+                    ..Default::default()
+                }
+            )
+            .await,
+        Err(ThalovantError::Timeout(_))
+    ));
+    assert!(
+        !initiator.is_finished(),
+        "queued event wait cancelled the connection owner"
+    );
     assert!(matches!(
         client
             .ask(

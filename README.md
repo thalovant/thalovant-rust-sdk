@@ -873,3 +873,27 @@ resending. Per-plan limits are listed in the dashboard and at
 ```bash
 cargo test
 ```
+
+### Scoped event waits and streams
+
+`wait_for_event(name, ListenOptions)` waits for one event with a twelve-second
+budget by default, including connection. `listen(name, ListenOptions)` returns
+an `EventStream` whose `recv().await` yields `Result<Option<Event>>`. Its optional
+timeout covers the stream's whole lifetime; without one it listens until closed.
+Set `max_events`, `request_id`, `session_id`, or a fast nonblocking `predicate`
+when needed. Matching request IDs take precedence over a rewritten hub session.
+
+```rust
+use thalovant::ListenOptions;
+let mut events = client.listen("speak", ListenOptions {
+    max_events: Some(2),
+    timeout: Some(std::time::Duration::from_secs(20)),
+    ..Default::default()
+}).await?;
+while let Some(event) = events.recv().await? { println!("{}", event.name); }
+```
+
+Each stream owns a bounded transport subscription. Overflow and connection loss
+are explicit errors. Drop or `close()` the stream to unsubscribe without closing
+the shared client. Cancelling an individual `recv` future leaves the stream
+usable; dropping a `wait_for_event` future releases its subscription.
