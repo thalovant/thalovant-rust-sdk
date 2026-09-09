@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.8
+
+- Drive WSS, HTTP, and MQTT through one Noise handshake, authenticated framing, and hub trust implementation. Preserve WSS writer ordering and cancellation poisoning, and keep HTTP/MQTT lifecycle ownership unchanged.
+- Reuse the protected persisted PSK cache across all runtime transports. A rejected or abandoned unfinished handshake discards the derived cache entry while preserving the authenticated hub pin, so the next connection can derive from the current password.
+- Share transport health reporting and validate cached-credential recovery, changed-peer rejection, and a canceled chunked WSS send followed by a fresh authenticated reconnect.
+
 ## 0.4.7
 
 - Correct the declared minimum Rust version to 1.85, already required by the

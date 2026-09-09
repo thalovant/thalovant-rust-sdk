@@ -423,16 +423,7 @@ impl HttpTransport {
             .await
             .as_ref()
             .is_some_and(NoiseChannel::ready);
-        let mut health = self.state.health.lock().await.clone();
-        health.handshake_complete &= ready;
-        if !ready && health.connection.phase == TransportConnectionPhase::Ready {
-            health.connected = false;
-            health.transport_alive = false;
-            health.connection.phase = TransportConnectionPhase::Error;
-            health.last_error = Some("Noise session interrupted; reconnect required".into());
-            health.connection.last_error = health.last_error.clone();
-        }
-        health
+        noise_health(self.state.health.lock().await.clone(), ready)
     }
 
     pub async fn connection_info(&self) -> TransportConnectionInfo {
@@ -708,21 +699,9 @@ struct WssTransportState {
     /// Overrides where the static key and the pin file live. `None` uses the
     /// directory holding the SDK config file.
     noise_state_dir: Mutex<Option<PathBuf>>,
-    /// The hub's cleartext HELLO payload, kept verbatim because it is bound
-    /// into the Noise prologue rather than read for the node id alone.
-    server_hello: Mutex<Option<Map<String, Value>>>,
-    node_id: Mutex<String>,
-    noise_handshake: Mutex<Option<NoiseHandshake>>,
-    session: Mutex<Option<Arc<NoiseSession>>>,
-    /// Deriving the pre-shared key costs 64 MiB and a few hundred
-    /// milliseconds, and the result is fixed for a (password, node id) pair,
-    /// so a reconnect to the same hub reuses it.
-    /// (node id, password) -> PSK. The password is part of the key: a caller
-    /// that swaps it and reconnects on this same transport would otherwise be
-    /// handed the previous one's key, which the hub refuses exactly as it
-    /// refuses a wrong password. It is held in memory only -- the identity
-    /// already carries it there -- and never written beside the key.
-    psk_cache: Mutex<Option<(String, String, [u8; 32])>>,
+    /// Shared handshake, trust and framing state. The writer lock is always
+    /// acquired first and held through delivery of every generated frame.
+    noise: Mutex<Option<NoiseChannel>>,
 }
 
 impl WssTransport {
@@ -743,11 +722,7 @@ impl WssTransport {
                 read_task: Mutex::new(None),
                 handshake_notify: Notify::new(),
                 noise_state_dir: Mutex::new(None),
-                server_hello: Mutex::new(None),
-                node_id: Mutex::new(String::new()),
-                noise_handshake: Mutex::new(None),
-                session: Mutex::new(None),
-                psk_cache: Mutex::new(None),
+                noise: Mutex::new(None),
             }),
         }
     }
@@ -765,15 +740,11 @@ impl WssTransport {
     /// The hub's Noise static public key for the current session, hex encoded.
     /// `None` before the handshake completes.
     pub async fn remote_static_key(&self) -> Option<String> {
+        let channel = self.state.noise.lock().await;
         if !self.state.session_valid.load(Ordering::Acquire) {
             return None;
         }
-        self.state
-            .session
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|session| session.remote_static_key().map(str::to_string))
+        channel.as_ref().and_then(NoiseChannel::remote_key)
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -787,6 +758,8 @@ impl WssTransport {
     pub async fn connect(&self) -> Result<()> {
         let _lifecycle = self.state.lifecycle.lock().await;
         self.disconnect_inner().await?;
+        let dir = self.state.noise_state_dir.lock().await.clone();
+        *self.state.noise.lock().await = Some(NoiseChannel::new(self.state.identity.clone(), dir));
         *self.state.health.lock().await = TransportHealth::default();
         let started = Instant::now();
         self.set_connection(connecting_connection()).await;
@@ -842,15 +815,16 @@ impl WssTransport {
             while let Some(message) = reader.next().await {
                 match message {
                     Ok(WebSocketMessage::Text(payload)) => {
-                        if let Err(error) =
-                            transport.handle_socket_message(payload.into_bytes()).await
+                        if let Err(error) = transport
+                            .handle_socket_message(payload.into_bytes(), false)
+                            .await
                         {
                             transport.mark_error(&error).await;
                             break;
                         }
                     }
                     Ok(WebSocketMessage::Binary(payload)) => {
-                        if let Err(error) = transport.handle_socket_message(payload).await {
+                        if let Err(error) = transport.handle_socket_message(payload, true).await {
                             transport.mark_error(&error).await;
                             break;
                         }
@@ -914,17 +888,12 @@ impl WssTransport {
     }
 
     pub async fn healthcheck(&self) -> TransportHealth {
-        let mut health = self.state.health.lock().await.clone();
-        health.handshake_complete &= self.state.session_valid.load(Ordering::Acquire);
-        if !health.handshake_complete && health.connection.phase == TransportConnectionPhase::Ready
-        {
-            health.connected = false;
-            health.transport_alive = false;
-            health.connection.phase = TransportConnectionPhase::Error;
-            health.last_error = Some("Noise session interrupted; reconnect required".into());
-            health.connection.last_error = health.last_error.clone();
-        }
-        health
+        // Keep health inspection independent of a backpressured writer. The
+        // send guard and receive/reset paths invalidate this flag atomically.
+        noise_health(
+            self.state.health.lock().await.clone(),
+            self.state.session_valid.load(Ordering::Acquire),
+        )
     }
 
     pub async fn connection_info(&self) -> TransportConnectionInfo {
@@ -965,334 +934,77 @@ impl WssTransport {
     }
 
     async fn is_handshake_complete(&self) -> bool {
-        self.state.health.lock().await.handshake_complete
+        self.healthcheck().await.handshake_complete
     }
 
-    /// Handle one websocket message.
-    ///
-    /// Before the Noise session exists the frames are cleartext JSON handshake
-    /// traffic. After it they are Noise transport messages, and the plaintext
-    /// underneath is what gets parsed.
-    async fn handle_socket_message(&self, data: Vec<u8>) -> Result<()> {
-        let session = self.state.session.lock().await.clone();
-
-        let authenticated = session.is_some();
-        if authenticated && !self.state.session_valid.load(Ordering::Acquire) {
+    /// Drive the common Noise handshake and framing policy while retaining
+    /// WebSocket writer serialization and cancellation poisoning.
+    async fn handle_socket_message(&self, data: Vec<u8>, binary: bool) -> Result<()> {
+        let mut writer = self.state.writer.lock().await;
+        let mut slot = self.state.noise.lock().await;
+        let channel = slot.as_mut().ok_or_else(|| {
+            ThalovantError::Connection("HiveMind WSS transport is not connected".into())
+        })?;
+        if channel.session.is_some() && !self.state.session_valid.load(Ordering::Acquire) {
             return Err(ThalovantError::Connection(
                 "Noise session interrupted; reconnect required".into(),
             ));
         }
-        let raw = match session {
-            Some(session) => match session.decrypt_frame(&data)? {
-                NoiseFrame::Partial => return Ok(()),
-                NoiseFrame::Message {
-                    payload,
-                    is_json: true,
-                } => payload,
-                NoiseFrame::Message {
-                    payload,
-                    is_json: false,
-                } => serde_json::to_vec(&decode_hive_binary_frame(&payload)?)?,
-            },
-            None => data,
+        let mut guard = NoiseSendGuard {
+            valid: &self.state.session_valid,
+            committed: false,
         };
-
-        let decoded: Value = serde_json::from_slice(&raw)?;
-        let msg_type = decoded
-            .get("msg_type")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let payload = decoded
-            .get("payload")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-
-        if !authenticated && !matches!(msg_type.as_str(), "hello" | "shake" | "handshake") {
-            return Err(ThalovantError::Connection(
-                "application traffic received before Noise negotiation".into(),
-            ));
-        }
-        match msg_type.as_str() {
-            "hello" => self.handle_hello(payload).await,
-            "handshake" | "shake" => self.handle_handshake(payload).await,
-            "bus" => {
-                let event = event_from_bus_payload(&payload, Some(decoded));
-                let _ = self.state.bus_tx.send(event);
-                Ok(())
-            }
-            "query" | "cascade" => {
-                let message: HiveMessage = serde_json::from_value(decoded)?;
-                let _ = self.state.hive_tx.send(message);
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Record the hub's cleartext HELLO. Both its payload and the parameter
-    /// HANDSHAKE payload are bound into the Noise prologue, so it is kept
-    /// whole rather than reduced to the node id.
-    async fn handle_hello(&self, payload: Map<String, Value>) -> Result<()> {
-        if self.state.session.lock().await.is_some() {
-            return Ok(());
-        }
-        let mut hello = self.state.server_hello.lock().await;
-        if hello.is_none() {
-            *self.state.node_id.lock().await = payload
-                .get("node_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            *hello = Some(payload);
-        }
-        Ok(())
-    }
-
-    async fn handle_handshake(&self, payload: Map<String, Value>) -> Result<()> {
-        let noise_params = payload.get("noise").and_then(Value::as_object).cloned().ok_or_else(|| {
-            ThalovantError::Connection(
-                "this hub did not offer the v3 Noise handshake; the SDK requires a hub running HiveMind-core 5.x or newer".to_string(),
-            )
-        })?;
-
-        if noise_params.contains_key("msg") {
-            self.continue_noise_handshake(&noise_params).await
-        } else {
-            self.start_noise_handshake(&payload, &noise_params).await
-        }
-    }
-
-    /// Select a pattern and suite, bind the negotiation into the prologue, and
-    /// send Noise message 1.
-    async fn start_noise_handshake(
-        &self,
-        handshake_payload: &Map<String, Value>,
-        noise_params: &Map<String, Value>,
-    ) -> Result<()> {
-        let node_id = self.state.node_id.lock().await.clone();
-        if node_id.is_empty() {
-            return Err(ThalovantError::Connection(
-                "the hub sent its HANDSHAKE parameters before a HELLO carrying node_id".to_string(),
-            ));
-        }
-        let server_hello = self
-            .state
-            .server_hello
-            .lock()
-            .await
-            .clone()
-            .unwrap_or_default();
-
-        let state_dir = self.state.noise_state_dir.lock().await.clone();
-        let pinned = load_noise_pin(state_dir.as_deref(), &node_id)?;
-
-        let (pattern, suite) = select_noise_options(
-            &string_list(noise_params.get("patterns")),
-            &string_list(noise_params.get("suites")),
-            pinned.as_deref(),
-        )
-        .ok_or_else(|| {
-            ThalovantError::Connection(
-                "no Noise pattern and suite this SDK supports are on offer from the hub"
-                    .to_string(),
-            )
-        })?;
-
-        let protocol_name = noise_protocol_name(&pattern, &suite);
-        let prologue = build_prologue(&server_hello, handshake_payload, &protocol_name);
-        let static_key = load_or_create_noise_key(state_dir.as_deref())?;
-        let psk = self.psk_for(&node_id).await?;
-
-        let mut handshake = NoiseHandshake::new(
-            &pattern,
-            &suite,
-            &psk,
-            &prologue,
-            &static_key,
-            pinned.as_deref(),
-        )?;
-
-        // Message 1 carries this node's binarize capability and its
-        // preference-ordered encodings, canonicalized so both peers hash the
-        // same bytes.
-        let noise_payload = canonical_json(&json!({"binarize": false, "encodings": []}));
-        let message = handshake.write_message(noise_payload.as_bytes())?;
-        *self.state.noise_handshake.lock().await = Some(handshake);
-
-        self.send_cleartext(HiveMessage {
-            msg_type: "shake".to_string(),
-            payload: json!({"noise": {
-                "pattern": pattern,
-                "suite": suite,
-                "msg": hex::encode(&message),
-            }})
-            .as_object()
-            .cloned()
-            .unwrap_or_default(),
-            ..Default::default()
-        })
-        .await
-    }
-
-    /// Consume the hub's Noise message, send the final one where the pattern
-    /// needs it, and bring the transport up.
-    async fn continue_noise_handshake(&self, noise_params: &Map<String, Value>) -> Result<()> {
-        let node_id = self.state.node_id.lock().await.clone();
-        let state_dir = self.state.noise_state_dir.lock().await.clone();
-
-        let encoded = noise_params
-            .get("msg")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let message = hex::decode(encoded).map_err(|_| {
-            ThalovantError::Connection("malformed Noise handshake envelope".to_string())
-        })?;
-
-        let mut slot = self.state.noise_handshake.lock().await;
-        let handshake = slot.as_mut().ok_or_else(|| {
-            ThalovantError::Connection(
-                "the hub sent a Noise handshake message before its parameters".to_string(),
-            )
-        })?;
-
-        if let Err(error) = handshake.read_message(&message) {
-            // A failed authentication must not remove trust. A key rotation
-            // requires an explicit forget_noise_pin after verifying the hub.
-            // The PSK is the other thing this message authenticates, so a
-            // rejection may mean the stored key came from a password that has
-            // since been rotated. Drop it; the next attempt derives again.
-            let _ = forget_cached_psk(state_dir.as_deref(), &node_id);
-            *self.state.psk_cache.lock().await = None;
-            return Err(error);
-        }
-
-        let mut pending_final = None;
-        if !handshake.is_finished() {
-            // XXpsk2 message 3: our encrypted static key and the final DH mix.
-            // The pattern and suite are named only on message 1.
-            pending_final = Some(handshake.write_message(&[])?);
-        }
-        let handshake = slot.take().expect("checked above");
+        let (message, writes) = channel.receive(&data, binary)?;
+        channel.failed = true;
+        Self::write_noise_frames(&mut writer, writes).await?;
+        channel.failed = false;
+        let ready = channel.ready();
+        self.state.session_valid.store(ready, Ordering::Release);
+        guard.committed = true;
         drop(slot);
-
-        if let Some(final_message) = pending_final {
-            self.send_cleartext(HiveMessage {
-                msg_type: "shake".to_string(),
-                payload: json!({"noise": {"msg": hex::encode(&final_message)}})
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_default(),
-                ..Default::default()
-            })
-            .await?;
+        drop(writer);
+        dispatch_noise_message(&self.state.bus_tx, &self.state.hive_tx, message);
+        if ready {
+            let mut health = self.state.health.lock().await;
+            health.handshake_complete = true;
+            health.transport_alive = true;
+            drop(health);
+            self.state.handshake_notify.notify_waiters();
         }
-
-        let session = handshake.into_session()?;
-        if let Some(remote) = session.remote_static_key() {
-            pin_hub_key(state_dir.as_deref(), &node_id, remote)?;
-        }
-        *self.state.session.lock().await = Some(Arc::new(session));
-        self.state.session_valid.store(true, Ordering::Release);
-
-        // The first Noise transport message is the encrypted HELLO.
-        self.send_hive_message(
-            hello_hive_message(&self.state.identity, "thalovant-rust-"),
-            false,
-        )
-        .await?;
-
-        let mut health = self.state.health.lock().await;
-        health.handshake_complete = true;
-        health.transport_alive = true;
-        drop(health);
-        self.state.handshake_notify.notify_waiters();
         Ok(())
     }
 
-    /// Enforce trust on first use: the first key seen for a node id is
-    /// recorded, and a later key that does not match it is refused.
-    ///
-    /// A changed key means the hub was reinstalled or another machine is
-    /// answering at the address. The SDK cannot tell those apart, so it refuses
-    /// and leaves clearing the pin as a deliberate act.
-    /// Derive, or reuse, the pre-shared key for a hub.
-    async fn psk_for(&self, node_id: &str) -> Result<[u8; 32]> {
-        let password = &self.state.identity.password;
-        if password.is_empty() {
-            return Err(ThalovantError::MissingIdentityField(
-                "password: the v3 Noise handshake derives its pre-shared key from it",
-            ));
-        }
-        let derived_here_for_this_hub = {
-            let cache = self.state.psk_cache.lock().await;
-            match cache.as_ref() {
-                Some((cached_node, cached_password, psk)) if cached_node == node_id => {
-                    if cached_password == password {
-                        return Ok(*psk);
-                    }
-                    true
-                }
-                _ => false,
-            }
-        };
-
-        let state_dir = self.state.noise_state_dir.lock().await.clone();
-        // Having already derived for this hub under a different password means
-        // the stored key belongs to that one, so the disk read would only
-        // return something known to be stale.
-        let stored = if derived_here_for_this_hub {
-            None
-        } else {
-            // On disk before deriving: argon2id at 64 MiB gives the same answer
-            // for a password and hub every time, so a restart should not pay it
-            // again. A key left from a password rotated elsewhere is caught by
-            // the handshake, which forgets it.
-            load_cached_psk(state_dir.as_deref(), node_id)?
-        };
-        let psk = match stored {
-            Some(psk) => psk,
-            None => {
-                let derived = derive_psk(password, node_id)?;
-                // Persisting is an optimisation, never a reason to fail.
-                let _ = save_cached_psk(state_dir.as_deref(), node_id, &derived);
-                derived
-            }
-        };
-        *self.state.psk_cache.lock().await = Some((node_id.to_string(), password.clone(), psk));
-        Ok(psk)
-    }
-
-    /// Write a handshake message as a cleartext JSON text frame. Only the
-    /// handshake exchange travels this way; everything after it goes through
-    /// the Noise session.
-    async fn send_cleartext(&self, message: HiveMessage) -> Result<()> {
-        let payload = serde_json::to_string(&message)?;
-        let mut writer = self.state.writer.lock().await;
+    async fn write_noise_frames(
+        writer: &mut Option<WssWriter>,
+        writes: Vec<NoiseWrite>,
+    ) -> Result<()> {
         let writer = writer.as_mut().ok_or_else(|| {
-            ThalovantError::Connection("HiveMind WSS transport is not connected".to_string())
+            ThalovantError::Connection("HiveMind WSS transport is not connected".into())
         })?;
-        writer
-            .send(WebSocketMessage::Text(payload))
-            .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()))
+        for write in writes {
+            let frame = if write.binary {
+                WebSocketMessage::Binary(write.payload)
+            } else {
+                WebSocketMessage::Text(String::from_utf8(write.payload).map_err(|_| {
+                    ThalovantError::Connection("invalid Noise handshake JSON".into())
+                })?)
+            };
+            writer
+                .send(frame)
+                .await
+                .map_err(|error| ThalovantError::Connection(error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
+        // Acquire the writer before cipher advancement. Holding both locks
+        // through every chunk preserves counter order and connection ownership.
         let mut writer = self.state.writer.lock().await;
-        let session = self.state.session.lock().await.clone().ok_or_else(|| {
-            ThalovantError::Connection(
-                "refusing to send before the v3 Noise session is established".to_string(),
-            )
+        let mut slot = self.state.noise.lock().await;
+        let channel = slot.as_mut().ok_or_else(|| {
+            ThalovantError::Connection("HiveMind WSS transport is not connected".into())
         })?;
-        let raw = serde_json::to_vec(&message)?;
-
-        // Take the writer *before* encrypting. encrypt_message advances the
-        // cipher state nonce counter, and the hub decrypts strictly in counter
-        // order -- so encrypting outside this lock lets two concurrent senders
-        // consume their nonces in one order and reach the wire in the other,
-        // which the hub treats as tampering and drops the session for.
         if !self.state.session_valid.load(Ordering::Acquire) {
             return Err(ThalovantError::Connection(
                 "Noise session interrupted; reconnect required".into(),
@@ -1302,26 +1014,17 @@ impl WssTransport {
             valid: &self.state.session_valid,
             committed: false,
         };
-        let frames = session.encrypt_message(&raw, true)?;
-        let writer = writer.as_mut().ok_or_else(|| {
-            ThalovantError::Connection("HiveMind WSS transport is not connected".to_string())
-        })?;
-        for frame in frames {
-            writer
-                .send(WebSocketMessage::Binary(frame))
-                .await
-                .map_err(|err| ThalovantError::Connection(err.to_string()))?;
-        }
+        let writes = channel.encode(&message)?;
+        channel.failed = true;
+        Self::write_noise_frames(&mut writer, writes).await?;
+        channel.failed = false;
         guard.committed = true;
         Ok(())
     }
 
     async fn reset_noise(&self) {
         self.state.session_valid.store(false, Ordering::Release);
-        *self.state.session.lock().await = None;
-        *self.state.noise_handshake.lock().await = None;
-        *self.state.server_hello.lock().await = None;
-        self.state.node_id.lock().await.clear();
+        *self.state.noise.lock().await = None;
     }
 
     async fn mark_error(&self, error: &ThalovantError) {
@@ -1650,16 +1353,7 @@ impl MqttTransport {
             .await
             .as_ref()
             .is_some_and(NoiseChannel::ready);
-        let mut health = self.state.health.lock().await.clone();
-        health.handshake_complete &= ready;
-        if !ready && health.connection.phase == TransportConnectionPhase::Ready {
-            health.connected = false;
-            health.transport_alive = false;
-            health.connection.phase = TransportConnectionPhase::Error;
-            health.last_error = Some("Noise session interrupted; reconnect required".into());
-            health.connection.last_error = health.last_error.clone();
-        }
-        health
+        noise_health(self.state.health.lock().await.clone(), ready)
     }
 
     pub async fn connection_info(&self) -> TransportConnectionInfo {
@@ -1834,6 +1528,17 @@ struct NoiseWrite {
     binary: bool,
 }
 
+impl Drop for NoiseChannel {
+    fn drop(&mut self) {
+        // KK authenticates the first message: a peer may reject a stale PSK by
+        // closing before sending any response. An abandoned initial handshake
+        // must not keep retrying that provisional credential indefinitely.
+        if self.handshake.is_some() && self.session.is_none() {
+            let _ = forget_cached_psk(self.state_dir.as_deref(), &self.node_id);
+        }
+    }
+}
+
 impl NoiseChannel {
     fn new(identity: Identity, state_dir: Option<PathBuf>) -> Self {
         Self {
@@ -2004,7 +1709,16 @@ impl NoiseChannel {
             &noise_protocol_name(&pattern, &suite),
         );
         let key = load_or_create_noise_key(self.state_dir.as_deref())?;
-        let psk = derive_psk(&self.identity.password, &self.node_id)?;
+        let psk = match load_cached_psk(self.state_dir.as_deref(), &self.node_id)? {
+            Some(psk) => psk,
+            None => {
+                let derived = derive_psk(&self.identity.password, &self.node_id)?;
+                // Persistence is an optimization; a failed cache write does not
+                // prevent an otherwise valid handshake.
+                let _ = save_cached_psk(self.state_dir.as_deref(), &self.node_id, &derived);
+                derived
+            }
+        };
         let mut handshake =
             NoiseHandshake::new(&pattern, &suite, &psk, &prologue, &key, pin.as_deref())?;
         let preferences = canonical_json(&json!({"binarize":false,"encodings":[]}));
@@ -2026,7 +1740,14 @@ impl NoiseChannel {
         let handshake = self.handshake.as_mut().ok_or_else(|| {
             ThalovantError::Connection("Noise response before negotiation".into())
         })?;
-        handshake.read_message(&msg)?;
+        if let Err(error) = handshake.read_message(&msg) {
+            // Cache entries are derived credentials, not trust decisions. A
+            // rejected stale PSK can be recomputed on the next connection, but
+            // an authenticated hub pin must never be discarded on failure.
+            let _ = forget_cached_psk(self.state_dir.as_deref(), &self.node_id);
+            self.handshake = None;
+            return Err(error);
+        }
         let mut writes = vec![];
         if !handshake.is_finished() {
             writes.push(Self::clear(
@@ -2046,6 +1767,18 @@ impl NoiseChannel {
         writes.extend(self.encode(&hello_hive_message(&self.identity, "thalovant-rust-"))?);
         Ok(writes)
     }
+}
+
+fn noise_health(mut health: TransportHealth, ready: bool) -> TransportHealth {
+    health.handshake_complete &= ready;
+    if !ready && health.connection.phase == TransportConnectionPhase::Ready {
+        health.connected = false;
+        health.transport_alive = false;
+        health.connection.phase = TransportConnectionPhase::Error;
+        health.last_error = Some("Noise session interrupted; reconnect required".into());
+        health.connection.last_error = health.last_error.clone();
+    }
+    health
 }
 
 fn dispatch_noise_message(

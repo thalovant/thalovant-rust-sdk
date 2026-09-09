@@ -526,9 +526,25 @@ use thalovant::forget_noise_pin;
 forget_noise_pin(None, &node_id)?;
 ```
 
-The derivation costs 64 MiB and a few hundred milliseconds. WSS caches the
-result per hub; HTTP and MQTT derive from the current password for each fresh
-connection. Failed authentication never removes the trusted hub pin.
+Argon2id uses 64 MiB for derivation. WSS, HTTP, and MQTT share the protected
+persisted PSK cache, indexed by hub node ID. A cached PSK is itself a credential:
+changing only the identity password does not replace a cached key the hub still
+accepts. Failed handshake authentication or an abandoned unfinished handshake
+(including peer closure or timeout) evicts that derived entry, so the next
+connection derives from the current password. Client static keys and trusted
+hub pins are retained.
+
+To deliberately derive again, remove only the PSK cache entry before reconnecting:
+
+```rust
+use thalovant::forget_cached_psk;
+
+forget_cached_psk(None, &node_id)?; // Or Some(state_dir.as_path()).
+```
+
+All three transports use the same Noise negotiation, authenticated framing, and
+peer pinning implementation; transport-specific connection and send ownership
+remain separate.
 
 HTTP reconnect resets this object's prior admission before asking for a new
 Noise offer, so it can recover when a failed poll leaves the old peer registered.
