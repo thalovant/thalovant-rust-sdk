@@ -845,7 +845,16 @@ impl HttpTransport {
             .json()
             .await
             .map_err(|_| ThalovantError::Connection(format!("malformed HTTP {path} response")))?;
-        if !body.is_object() || body.get("error").is_some() {
+        let already_disconnected = path == "/disconnect"
+            && body.as_object().is_some_and(|object| object.len() == 1)
+            && matches!(
+                body.get("error").and_then(Value::as_str),
+                Some("Already Disconnected" | "Client is not connected")
+            );
+        if !body.is_object()
+            || (path == "/disconnect" && body.get("ok") == Some(&Value::Bool(false)))
+            || (body.get("error").is_some() && !already_disconnected)
+        {
             return Err(ThalovantError::Runtime(format!(
                 "HTTP {path} rejected by the hub"
             )));
@@ -853,7 +862,7 @@ impl HttpTransport {
         let status = body.get("status").and_then(Value::as_str);
         let acknowledged = match path {
             "/connect" => status == Some("Connected"),
-            "/disconnect" => status == Some("Disconnected"),
+            "/disconnect" => status == Some("Disconnected") || already_disconnected,
             "/send_message" => matches!(status, Some("message sent" | "buffered")),
             _ => true,
         };

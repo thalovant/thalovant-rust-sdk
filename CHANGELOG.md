@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- Recover HTTP cleanup after a lost disconnect response by accepting the hub's exact `Already Disconnected` and `Client is not connected` acknowledgments on successful disconnect responses. Preserve replica affinity and Noise trust across explicit cleanup retry or reconnect; other errors, unsuccessful HTTP responses and `ok: false` remain failures.
+
 ## 0.5.0
 
 - Share one absolute timeout across every intent-description window, retain earlier answers, and stop publishing after the budget expires.

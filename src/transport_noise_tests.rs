@@ -226,6 +226,9 @@ struct HttpFixtureState {
     pause_send: Option<(Arc<Notify>, Arc<Notify>)>,
     pause_poll: Option<(Arc<Notify>, Arc<Notify>)>,
     pause_disconnect: Option<(Arc<Notify>, Arc<Notify>)>,
+    lose_disconnect_response: bool,
+    disconnect_requests: usize,
+    response_override: Option<(String, u16, Value)>,
     tamper: bool,
     plaintext: bool,
 }
@@ -242,6 +245,14 @@ impl HttpFixtureState {
         }
     }
     fn request(&mut self, path: &str, body: &[u8], cookie: bool) -> Value {
+        if path == "/disconnect" {
+            self.disconnect_requests += 1;
+        }
+        if let Some((override_path, _, value)) = &self.response_override {
+            if override_path == path {
+                return value.clone();
+            }
+        }
         if self.reject.as_deref() == Some(path) {
             return json!({"error":"synthetic error"});
         }
@@ -265,6 +276,9 @@ impl HttpFixtureState {
                 json!({"status":"Connected"})
             }
             "/disconnect" => {
+                if !self.connected {
+                    return json!({"error":"Already Disconnected"});
+                }
                 self.connected = false;
                 json!({"status":"Disconnected"})
             }
@@ -333,6 +347,9 @@ impl HttpFixture {
             pause_send: None,
             pause_poll: None,
             pause_disconnect: None,
+            lose_disconnect_response: false,
+            disconnect_requests: 0,
+            response_override: None,
             tamper: false,
             plaintext: false,
         }));
@@ -387,10 +404,22 @@ impl HttpFixture {
                         entered.notify_one();
                         resume.notified().await;
                     }
-                    let body = state
-                        .lock()
-                        .await
-                        .request(path, &bytes[header_end..], cookie);
+                    let (body, status, lose_response) = {
+                        let mut state = state.lock().await;
+                        let body = state.request(path, &bytes[header_end..], cookie);
+                        let status = state
+                            .response_override
+                            .as_ref()
+                            .filter(|(override_path, _, _)| override_path == path)
+                            .map_or(200, |(_, status, _)| *status);
+                        let lose_response = path == "/disconnect"
+                            && std::mem::take(&mut state.lose_disconnect_response);
+                        (body, status, lose_response)
+                    };
+                    if lose_response {
+                        // Remote cleanup completed, but its acknowledgment never reached the client.
+                        return;
+                    }
                     if pause.is_some() {
                         state.lock().await.reject = None;
                     }
@@ -400,7 +429,7 @@ impl HttpFixture {
                     } else {
                         ""
                     };
-                    let headers=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",encoded.len(),cookie_header);
+                    let headers=format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",encoded.len(),cookie_header);
                     if stream.write_all(headers.as_bytes()).await.is_err() {
                         return;
                     }
@@ -434,6 +463,78 @@ impl HttpFixture {
 impl Drop for HttpFixture {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn http_disconnect_lost_acknowledgment_retries_without_resetting_trust() {
+    for reconnect_directly in [false, true] {
+        let fixture = HttpFixture::new().await;
+        let transport = fixture.transport();
+        let dir = FixtureDir::new();
+        transport.set_noise_state_dir(Some(dir.0.clone())).await;
+        transport.connect().await.unwrap();
+        let pin = load_noise_pin(Some(&dir.0), "test-hub").unwrap();
+        fixture.state.lock().await.lose_disconnect_response = true;
+        assert!(transport.disconnect().await.is_err());
+        assert!(transport.state.admitted.load(Ordering::Acquire));
+        assert!(!fixture.state.lock().await.connected);
+        if !reconnect_directly {
+            transport.disconnect().await.unwrap();
+            assert!(!transport.state.admitted.load(Ordering::Acquire));
+        }
+        transport.connect().await.unwrap();
+        assert!(transport.healthcheck().await.handshake_complete);
+        assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), pin);
+        {
+            let state = fixture.state.lock().await;
+            assert_eq!(state.disconnect_requests, 2);
+            assert_eq!(state.responder.patterns, vec!["XXpsk2", "KKpsk0"]);
+        }
+        transport.disconnect().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn http_disconnect_idempotent_acknowledgments_are_narrowly_scoped() {
+    let fixture = HttpFixture::new().await;
+    let transport = fixture.transport();
+    // Use a real admission/Noise session to establish affinity and owned state.
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    transport.connect().await.unwrap();
+    for (status, body) in [
+        (200, json!({"error":"synthetic refusal"})),
+        (200, json!({"error":"Already Disconnected", "ok":false})),
+        (
+            200,
+            json!({"error":"Already Disconnected", "status":"Connected"}),
+        ),
+        (200, json!({"error":"Already Disconnected", "ok":true})),
+        (200, json!({"status":"Disconnected", "ok":false})),
+        (503, json!({"error":"Already Disconnected"})),
+        (200, json!({"error":"already disconnected"})),
+    ] {
+        fixture.state.lock().await.response_override = Some(("/disconnect".into(), status, body));
+        assert!(transport.disconnect().await.is_err());
+        assert!(transport.state.admitted.load(Ordering::Acquire));
+        assert!(fixture.state.lock().await.connected);
+    }
+    for path in ["/connect", "/send_message", "/get_messages"] {
+        fixture.state.lock().await.response_override =
+            Some((path.into(), 200, json!({"error":"Already Disconnected"})));
+        assert!(transport
+            .request(reqwest::Method::POST, path, None)
+            .await
+            .is_err());
+    }
+    fixture.state.lock().await.connected = false;
+    for message in ["Already Disconnected", "Client is not connected"] {
+        transport.state.admitted.store(true, Ordering::Release);
+        fixture.state.lock().await.response_override =
+            Some(("/disconnect".into(), 200, json!({"error":message})));
+        transport.disconnect().await.unwrap();
+        assert!(!transport.state.admitted.load(Ordering::Acquire));
     }
 }
 
