@@ -5,15 +5,15 @@ use crate::{
     identity::{Identity, MqttBrokerCredentials},
     noise::{
         build_prologue, canonical_json, derive_psk, noise_protocol_name, select_noise_options,
-        NoiseFrame, NoiseHandshake, NoiseSession, NOISE_PATTERN_KK,
+        NoiseFrame, NoiseHandshake, NoiseSession,
     },
     noise_store::{
-        forget_cached_psk, forget_noise_pin, load_cached_psk, load_noise_pin,
-        load_or_create_noise_key, pin_hub_key, save_cached_psk,
+        forget_cached_psk, load_cached_psk, load_noise_pin, load_or_create_noise_key, pin_hub_key,
+        save_cached_psk,
     },
     protocols::HubProtocol,
     tls::ensure_rustls_provider,
-    wire::{decode_hive_binary_frame, encode_hive_binary_frame},
+    wire::decode_hive_binary_frame,
 };
 use base64::{engine::general_purpose, Engine as _};
 use futures_util::{SinkExt, StreamExt};
@@ -25,7 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 use tokio::{
@@ -216,6 +219,10 @@ struct HttpTransportState {
     hive_tx: broadcast::Sender<HiveMessage>,
     health: Mutex<TransportHealth>,
     poll_task: Mutex<Option<JoinHandle<()>>>,
+    noise: Mutex<Option<NoiseChannel>>,
+    noise_state_dir: Mutex<Option<PathBuf>>,
+    lifecycle: Mutex<()>,
+    poll: Mutex<()>,
 }
 
 impl HttpTransport {
@@ -229,20 +236,62 @@ impl HttpTransport {
         poll_interval: Duration,
     ) -> Self {
         ensure_rustls_provider();
+        Self::with_options_and_http_client_builder(
+            identity,
+            user_agent,
+            poll_interval,
+            reqwest::Client::builder().timeout(Duration::from_secs(20)),
+        )
+        .expect("valid HTTP client configuration")
+    }
+
+    /// Supply custom TLS roots or HTTP settings. Replica cookies are enabled
+    /// and redirects refused regardless of the builder's previous settings.
+    pub fn with_options_and_http_client_builder(
+        identity: Identity,
+        user_agent: impl Into<String>,
+        poll_interval: Duration,
+        builder: reqwest::ClientBuilder,
+    ) -> Result<Self> {
+        ensure_rustls_provider();
+        let http_client = builder
+            .cookie_store(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| ThalovantError::Connection(err.without_url().to_string()))?;
         let (bus_tx, _) = broadcast::channel(64);
         let (hive_tx, _) = broadcast::channel(64);
-        Self {
+        Ok(Self {
             state: Arc::new(HttpTransportState {
                 identity,
                 user_agent: user_agent.into(),
                 poll_interval,
-                http_client: reqwest::Client::new(),
+                http_client,
                 bus_tx,
                 hive_tx,
                 health: Mutex::new(TransportHealth::default()),
                 poll_task: Mutex::new(None),
+                noise: Mutex::new(None),
+                noise_state_dir: Mutex::new(None),
+                lifecycle: Mutex::new(()),
+                poll: Mutex::new(()),
             }),
-        }
+        })
+    }
+
+    /// Select a persistent directory for the client static key and hub pins.
+    pub async fn set_noise_state_dir(&self, dir: Option<PathBuf>) {
+        *self.state.noise_state_dir.lock().await = dir;
+    }
+
+    /// Authenticated hub static key, or `None` outside a working session.
+    pub async fn remote_static_key(&self) -> Option<String> {
+        self.state
+            .noise
+            .lock()
+            .await
+            .as_ref()
+            .and_then(NoiseChannel::remote_key)
     }
 
     pub fn identity(&self) -> &Identity {
@@ -269,40 +318,43 @@ impl HttpTransport {
     }
 
     pub async fn connect(&self) -> Result<()> {
-        let started = Instant::now();
-        self.set_connection(connecting_connection()).await;
-        // TLS is the only confidentiality on this path. The identity crypto key
-        // that once sealed HTTP payloads separately is gone with v3, so a plain
-        // http:// hub would put every message, and the access key in the
-        // authorization query, on the wire in the clear.
-        if let Err(error) = require_tls_endpoint(&self.base_url()) {
-            self.mark_connection_error(&error).await;
-            return Err(error);
-        }
-        let response = self
-            .state
-            .http_client
-            .post(self.endpoint("/connect"))
-            .send()
-            .await
-            // `endpoint(..)` carries the access key in a `?authorization=`
-            // query; strip the URL so it never reaches `last_error`.
-            .map_err(|err| ThalovantError::Connection(err.without_url().to_string()));
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                self.mark_connection_error(&error).await;
-                return Err(error);
-            }
+        let _lifecycle = self.state.lifecycle.lock().await;
+        self.stop_polling().await;
+        *self.state.noise.lock().await = None;
+        *self.state.health.lock().await = TransportHealth {
+            connection: connecting_connection(),
+            ..Default::default()
         };
-        if !response.status().is_success() {
-            let error = ThalovantError::Connection(format!(
-                "HiveMind HTTP connect status {}",
-                response.status()
-            ));
-            self.mark_connection_error(&error).await;
-            return Err(error);
+        let result = timeout(Duration::from_secs(20), self.connect_inner())
+            .await
+            .unwrap_or_else(|_| {
+                Err(ThalovantError::Timeout(
+                    "HiveMind HTTP Noise handshake timed out".into(),
+                ))
+            });
+        if let Err(error) = &result {
+            self.mark_connection_error(error).await;
+            let _ = timeout(
+                Duration::from_secs(2),
+                self.request(reqwest::Method::POST, "/disconnect", None),
+            )
+            .await;
         }
+        result
+    }
+
+    async fn connect_inner(&self) -> Result<()> {
+        let started = Instant::now();
+        require_tls_endpoint(&self.base_url())?;
+        if self.state.identity.password.is_empty() {
+            return Err(ThalovantError::MissingIdentityField(
+                "password: v3 Noise requires the identity password",
+            ));
+        }
+        let dir = self.state.noise_state_dir.lock().await.clone();
+        *self.state.noise.lock().await = Some(NoiseChannel::new(self.state.identity.clone(), dir));
+        self.request(reqwest::Method::POST, "/connect", None)
+            .await?;
         let opened = Instant::now();
         {
             let mut health = self.state.health.lock().await;
@@ -311,46 +363,59 @@ impl HttpTransport {
             health.connection.phase = TransportConnectionPhase::Handshake;
             health.connection.transport_open_ms = Some(elapsed_ms(started, opened));
         }
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while !self.is_handshake_complete().await && Instant::now() < deadline {
-            if let Err(error) = self.poll_once().await {
-                self.mark_connection_error(&error).await;
-                return Err(error);
-            }
+        while !self.is_handshake_complete().await {
+            self.poll_once().await?;
             if !self.is_handshake_complete().await {
                 sleep(Duration::from_millis(100)).await;
             }
-        }
-        if !self.is_handshake_complete().await {
-            let error = ThalovantError::Timeout("HiveMind HTTP handshake timed out".to_string());
-            self.mark_connection_error(&error).await;
-            return Err(error);
         }
         self.mark_connection_ready(started, opened).await;
         self.start_polling().await;
         Ok(())
     }
 
-    pub async fn disconnect(&self) -> Result<()> {
+    async fn stop_polling(&self) {
         if let Some(task) = self.state.poll_task.lock().await.take() {
             task.abort();
+            let _ = task.await;
         }
-        let _ = self
-            .state
-            .http_client
-            .post(self.endpoint("/disconnect"))
-            .send()
-            .await;
-        let mut health = self.state.health.lock().await;
-        health.connected = false;
-        health.handshake_complete = false;
-        health.transport_alive = false;
-        health.connection.phase = TransportConnectionPhase::Closed;
-        Ok(())
+    }
+
+    pub async fn disconnect(&self) -> Result<()> {
+        let _lifecycle = self.state.lifecycle.lock().await;
+        self.stop_polling().await;
+        let _poll = self.state.poll.lock().await;
+        *self.state.noise.lock().await = None;
+        {
+            let mut health = self.state.health.lock().await;
+            health.connected = false;
+            health.handshake_complete = false;
+            health.transport_alive = false;
+            health.connection.phase = TransportConnectionPhase::Closed;
+        }
+        self.request(reqwest::Method::POST, "/disconnect", None)
+            .await
+            .map(|_| ())
     }
 
     pub async fn healthcheck(&self) -> TransportHealth {
-        self.state.health.lock().await.clone()
+        let ready = self
+            .state
+            .noise
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(NoiseChannel::ready);
+        let mut health = self.state.health.lock().await.clone();
+        health.handshake_complete &= ready;
+        if !ready && health.connection.phase == TransportConnectionPhase::Ready {
+            health.connected = false;
+            health.transport_alive = false;
+            health.connection.phase = TransportConnectionPhase::Error;
+            health.last_error = Some("Noise session interrupted; reconnect required".into());
+            health.connection.last_error = health.last_error.clone();
+        }
+        health
     }
 
     pub async fn connection_info(&self) -> TransportConnectionInfo {
@@ -384,23 +449,46 @@ impl HttpTransport {
     }
 
     pub async fn poll_once(&self) -> Result<()> {
-        if !self.healthcheck().await.connected {
+        let _poll = self.state.poll.lock().await;
+        let result = self.poll_inner().await;
+        if let Err(error) = &result {
+            self.mark_connection_error(error).await;
+        }
+        result
+    }
+
+    async fn poll_inner(&self) -> Result<()> {
+        if !self.state.health.lock().await.connected {
             return Ok(());
         }
-        let response = self
-            .state
-            .http_client
-            .get(self.endpoint("/get_messages"))
-            .send()
-            .await
-            // Strip the `?authorization=` URL before it reaches `last_error`.
-            .map_err(|err| ThalovantError::Connection(err.without_url().to_string()))?;
-        let body: PollResponse = response.json().await?;
-        if let Some(error) = body.error.filter(|value| !value.is_empty()) {
-            return Err(ThalovantError::Runtime(error));
+        let body = self
+            .request(reqwest::Method::GET, "/get_messages", None)
+            .await?;
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ThalovantError::Connection("malformed HTTP message queue".into()))?;
+        for raw in messages {
+            self.handle_raw_message(raw.clone()).await?;
         }
-        for raw in body.messages {
-            self.handle_raw_message(raw).await?;
+        if !self.is_handshake_complete().await {
+            return Ok(());
+        }
+        let body = self
+            .request(reqwest::Method::GET, "/get_binary_messages", None)
+            .await?;
+        let frames = body
+            .get("b64_messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ThalovantError::Connection("malformed HTTP binary queue".into()))?;
+        for frame in frames {
+            let encoded = frame
+                .as_str()
+                .ok_or_else(|| ThalovantError::Connection("malformed HTTP binary frame".into()))?;
+            let raw = general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| ThalovantError::Connection("malformed HTTP binary frame".into()))?;
+            self.receive_frame(&raw, true).await?;
         }
         Ok(())
     }
@@ -428,91 +516,119 @@ impl HttpTransport {
     }
 
     async fn is_handshake_complete(&self) -> bool {
-        self.state.health.lock().await.handshake_complete
+        self.healthcheck().await.handshake_complete
     }
 
     async fn handle_raw_message(&self, raw: Value) -> Result<()> {
-        let decoded = match raw {
-            Value::String(raw) => serde_json::from_str(&raw)?,
-            other => other,
+        let bytes = match raw {
+            Value::String(raw) => raw.into_bytes(),
+            other => serde_json::to_vec(&other)?,
         };
-        let message: HiveMessage = serde_json::from_value(decoded.clone())?;
-        match message.msg_type.as_str() {
-            "handshake" | "shake" => self.handle_handshake(message.payload).await,
-            "bus" => {
-                let event = event_from_bus_payload(&message.payload, Some(decoded));
-                let _ = self.state.bus_tx.send(event);
-                Ok(())
-            }
-            "query" | "cascade" => {
-                let _ = self.state.hive_tx.send(message);
-                Ok(())
-            }
-            _ => Ok(()),
-        }
+        self.receive_frame(&bytes, false).await
     }
 
-    /// Complete the HTTP handshake.
-    ///
-    /// HTTP runs no Noise session: it authenticates with the identity
-    /// credentials and takes its confidentiality from TLS, so there is no key
-    /// exchange here.
-    async fn handle_handshake(&self, _payload: Map<String, Value>) -> Result<()> {
-        // The capability flags in this payload are not ours to negotiate. A 5.x
-        // hub sends `{"noise": {...}}` and a 4.x one sends
-        // `{"handshake": true, "min_protocol_version": ...}`; either way HTTP
-        // runs no key exchange, so the answer is the same. Requiring both
-        // fields to be ABSENT accepted only the 5.x shape and returned
-        // "unexpected HiveMind HTTP handshake envelope" against a 4.x hub,
-        // leaving connect() to time out. The Go SDK ignores the payload here
-        // for the same reason.
-        {
-            self.send_hive_message(
-                HiveMessage {
-                    msg_type: "hello".to_string(),
-                    payload: Map::from_iter([
-                        (
-                            "pubkey".to_string(),
-                            Value::String(self.state.identity.public_key.clone().unwrap_or_default()),
-                        ),
-                        ("session".to_string(), json!({"session_id": format!("thalovant-rust-{}", uuid::Uuid::new_v4().simple())})),
-                        ("site_id".to_string(), Value::String(self.state.identity.site_id.clone())),
-                    ]),
-                    metadata: Map::new(),
-                    route: vec![],
-                    node: None,
-                    target_site_id: None,
-                    target_pubkey: None,
-                    source_peer: None,
-                },
-                false,
-            )
-            .await?;
-            let mut health = self.state.health.lock().await;
-            health.handshake_complete = true;
-            health.transport_alive = true;
-            Ok(())
+    async fn receive_frame(&self, raw: &[u8], binary: bool) -> Result<()> {
+        let mut slot = self.state.noise.lock().await;
+        let channel = slot
+            .as_mut()
+            .ok_or_else(|| ThalovantError::Connection("HTTP transport is not connected".into()))?;
+        let (message, writes) = channel.receive(raw, binary)?;
+        channel.failed = true;
+        for write in writes {
+            self.write_frame(write).await?;
         }
+        channel.failed = false;
+        let ready = channel.ready();
+        drop(slot);
+        dispatch_noise_message(&self.state.bus_tx, &self.state.hive_tx, message);
+        if ready {
+            self.state.health.lock().await.handshake_complete = true;
+        }
+        Ok(())
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
-        let payload = serde_json::to_string(&message)?;
-        let response = self
-            .state
-            .http_client
-            .post(self.endpoint("/send_message"))
-            .form(&[("message", payload)])
+        let result = self.send_encrypted(message).await;
+        if let Err(error) = &result {
+            self.mark_connection_error(error).await;
+        }
+        result
+    }
+
+    async fn send_encrypted(&self, message: HiveMessage) -> Result<()> {
+        let mut slot = self.state.noise.lock().await;
+        let channel = slot
+            .as_mut()
+            .ok_or_else(|| ThalovantError::Connection("HTTP transport is not connected".into()))?;
+        let writes = channel.encode(&message)?;
+        channel.failed = true;
+        for write in writes {
+            self.write_frame(write).await?;
+        }
+        channel.failed = false;
+        Ok(())
+    }
+
+    async fn write_frame(&self, write: NoiseWrite) -> Result<()> {
+        let form = if write.binary {
+            vec![
+                ("message", general_purpose::STANDARD.encode(write.payload)),
+                ("binary", "1".into()),
+            ]
+        } else {
+            vec![(
+                "message",
+                String::from_utf8(write.payload)
+                    .map_err(|_| ThalovantError::Connection("invalid handshake JSON".into()))?,
+            )]
+        };
+        self.request(reqwest::Method::POST, "/send_message", Some(&form))
+            .await
+            .map(|_| ())
+    }
+
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        form: Option<&Vec<(&str, String)>>,
+    ) -> Result<Value> {
+        let mut request = self.state.http_client.request(method, self.endpoint(path));
+        if let Some(form) = form {
+            request = request.form(form);
+        }
+        let response = request
             .send()
             .await
-            // Strip the `?authorization=` URL before it reaches `last_error`.
             .map_err(|err| ThalovantError::Connection(err.without_url().to_string()))?;
         if !response.status().is_success() {
             return Err(ThalovantError::Connection(format!(
-                "HiveMind HTTP send status {}",
+                "HTTP {path} status {}",
                 response.status()
             )));
         }
-        Ok(())
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|_| ThalovantError::Connection(format!("malformed HTTP {path} response")))?;
+        if !body.is_object() || body.get("error").is_some() {
+            return Err(ThalovantError::Runtime(format!(
+                "HTTP {path} rejected by the hub"
+            )));
+        }
+        let status = body.get("status").and_then(Value::as_str);
+        let acknowledged = match path {
+            "/connect" => status == Some("Connected"),
+            "/disconnect" => status == Some("Disconnected"),
+            "/send_message" => matches!(status, Some("message sent" | "buffered")),
+            _ => true,
+        };
+        if !acknowledged {
+            return Err(ThalovantError::Connection(format!(
+                "HTTP {path} was not acknowledged"
+            )));
+        }
+        Ok(body)
     }
 
     fn endpoint(&self, path: &str) -> String {
@@ -522,10 +638,6 @@ impl HttpTransport {
             path,
             urlencoding::encode(&self.authorization())
         )
-    }
-
-    async fn set_connection(&self, connection: TransportConnectionInfo) {
-        self.state.health.lock().await.connection = connection;
     }
 
     async fn mark_connection_ready(&self, started: Instant, opened: Instant) {
@@ -539,7 +651,11 @@ impl HttpTransport {
     }
 
     async fn mark_connection_error(&self, error: &ThalovantError) {
+        *self.state.noise.lock().await = None;
         let mut health = self.state.health.lock().await;
+        health.connected = false;
+        health.handshake_complete = false;
+        health.transport_alive = false;
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
         health.connection.last_error = Some(error.to_string());
@@ -555,7 +671,9 @@ pub struct WssTransport {
 }
 
 struct WssTransportState {
+    lifecycle: Mutex<()>,
     identity: Identity,
+    session_valid: AtomicBool,
     user_agent: String,
     bus_tx: broadcast::Sender<Event>,
     hive_tx: broadcast::Sender<HiveMessage>,
@@ -591,6 +709,8 @@ impl WssTransport {
         let (hive_tx, _) = broadcast::channel(64);
         Self {
             state: Arc::new(WssTransportState {
+                lifecycle: Mutex::new(()),
+                session_valid: AtomicBool::new(false),
                 identity,
                 user_agent: DEFAULT_USER_AGENT.to_string(),
                 bus_tx,
@@ -622,6 +742,9 @@ impl WssTransport {
     /// The hub's Noise static public key for the current session, hex encoded.
     /// `None` before the handshake completes.
     pub async fn remote_static_key(&self) -> Option<String> {
+        if !self.state.session_valid.load(Ordering::Acquire) {
+            return None;
+        }
         self.state
             .session
             .lock()
@@ -639,6 +762,9 @@ impl WssTransport {
     }
 
     pub async fn connect(&self) -> Result<()> {
+        let _lifecycle = self.state.lifecycle.lock().await;
+        self.disconnect_inner().await?;
+        *self.state.health.lock().await = TransportHealth::default();
         let started = Instant::now();
         self.set_connection(connecting_connection()).await;
         let endpoint_value = self
@@ -685,6 +811,9 @@ impl WssTransport {
             health.connection.transport_open_ms = Some(elapsed_ms(started, opened));
             health.connection.socket_open_ms = Some(elapsed_ms(started, opened));
         }
+        let notified = self.state.handshake_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let transport = self.clone();
         *self.state.read_task.lock().await = Some(tokio::spawn(async move {
             while let Some(message) = reader.next().await {
@@ -715,13 +844,14 @@ impl WssTransport {
                     }
                 }
             }
+            if transport.state.health.lock().await.connected {
+                transport.mark_disconnected().await;
+            }
             // Release a connect() still waiting on the handshake. A hub that
             // refuses one closes the socket, and reporting that as a timeout
             // would hide a wrong password behind the whole wait.
             transport.state.handshake_notify.notify_waiters();
         }));
-        let notified = self.state.handshake_notify.notified();
-        tokio::pin!(notified);
         if !self.is_handshake_complete().await {
             // The first handshake with a hub runs argon2id at 64 MiB, which
             // costs a few hundred milliseconds on top of the round trips.
@@ -729,7 +859,7 @@ impl WssTransport {
         }
         if !self.is_handshake_complete().await {
             let cause = self.state.health.lock().await.last_error.clone();
-            self.disconnect().await?;
+            self.disconnect_inner().await?;
             let error = match cause {
                 Some(reason) => ThalovantError::Connection(format!(
                     "v3 Noise handshake did not complete: {reason}"
@@ -744,8 +874,14 @@ impl WssTransport {
     }
 
     pub async fn disconnect(&self) -> Result<()> {
+        let _lifecycle = self.state.lifecycle.lock().await;
+        self.disconnect_inner().await
+    }
+
+    async fn disconnect_inner(&self) -> Result<()> {
         if let Some(task) = self.state.read_task.lock().await.take() {
             task.abort();
+            let _ = task.await;
         }
         if let Some(mut writer) = self.state.writer.lock().await.take() {
             let _ = writer.send(WebSocketMessage::Close(None)).await;
@@ -755,7 +891,17 @@ impl WssTransport {
     }
 
     pub async fn healthcheck(&self) -> TransportHealth {
-        self.state.health.lock().await.clone()
+        let mut health = self.state.health.lock().await.clone();
+        health.handshake_complete &= self.state.session_valid.load(Ordering::Acquire);
+        if !health.handshake_complete && health.connection.phase == TransportConnectionPhase::Ready
+        {
+            health.connected = false;
+            health.transport_alive = false;
+            health.connection.phase = TransportConnectionPhase::Error;
+            health.last_error = Some("Noise session interrupted; reconnect required".into());
+            health.connection.last_error = health.last_error.clone();
+        }
+        health
     }
 
     pub async fn connection_info(&self) -> TransportConnectionInfo {
@@ -807,6 +953,12 @@ impl WssTransport {
     async fn handle_socket_message(&self, data: Vec<u8>) -> Result<()> {
         let session = self.state.session.lock().await.clone();
 
+        let authenticated = session.is_some();
+        if authenticated && !self.state.session_valid.load(Ordering::Acquire) {
+            return Err(ThalovantError::Connection(
+                "Noise session interrupted; reconnect required".into(),
+            ));
+        }
         let raw = match session {
             Some(session) => match session.decrypt_frame(&data)? {
                 NoiseFrame::Partial => return Ok(()),
@@ -814,10 +966,10 @@ impl WssTransport {
                     payload,
                     is_json: true,
                 } => payload,
-                // A HIVEMIND-WIRE-1 binary frame. The Rust SDK does not decode
-                // binary bus payloads on this transport yet, so it is dropped
-                // rather than mis-parsed as JSON.
-                NoiseFrame::Message { is_json: false, .. } => return Ok(()),
+                NoiseFrame::Message {
+                    payload,
+                    is_json: false,
+                } => serde_json::to_vec(&decode_hive_binary_frame(&payload)?)?,
             },
             None => data,
         };
@@ -834,6 +986,11 @@ impl WssTransport {
             .cloned()
             .unwrap_or_default();
 
+        if !authenticated && !matches!(msg_type.as_str(), "hello" | "shake" | "handshake") {
+            return Err(ThalovantError::Connection(
+                "application traffic received before Noise negotiation".into(),
+            ));
+        }
         match msg_type.as_str() {
             "hello" => self.handle_hello(payload).await,
             "handshake" | "shake" => self.handle_handshake(payload).await,
@@ -978,13 +1135,8 @@ impl WssTransport {
         })?;
 
         if let Err(error) = handshake.read_message(&message) {
-            // KKpsk0 needs each side to hold the other's static key, but the
-            // client chose it knowing only that it had pinned the hub's. The
-            // failure is as likely to mean the hub no longer has this client's,
-            // so drop the pin and let the next attempt fall back to XXpsk2.
-            if handshake.pattern() == NOISE_PATTERN_KK {
-                let _ = forget_noise_pin(state_dir.as_deref(), &node_id);
-            }
+            // A failed authentication must not remove trust. A key rotation
+            // requires an explicit forget_noise_pin after verifying the hub.
             // The PSK is the other thing this message authenticates, so a
             // rejection may mean the stored key came from a password that has
             // since been rotated. Drop it; the next attempt derives again.
@@ -1019,6 +1171,7 @@ impl WssTransport {
             pin_hub_key(state_dir.as_deref(), &node_id, remote)?;
         }
         *self.state.session.lock().await = Some(Arc::new(session));
+        self.state.session_valid.store(true, Ordering::Release);
 
         // The first Noise transport message is the encrypted HELLO.
         self.send_hive_message(
@@ -1117,6 +1270,15 @@ impl WssTransport {
         // consume their nonces in one order and reach the wire in the other,
         // which the hub treats as tampering and drops the session for.
         let mut writer = self.state.writer.lock().await;
+        if !self.state.session_valid.load(Ordering::Acquire) {
+            return Err(ThalovantError::Connection(
+                "Noise session interrupted; reconnect required".into(),
+            ));
+        }
+        let mut guard = NoiseSendGuard {
+            valid: &self.state.session_valid,
+            committed: false,
+        };
         let frames = session.encrypt_message(&raw, true)?;
         let writer = writer.as_mut().ok_or_else(|| {
             ThalovantError::Connection("HiveMind WSS transport is not connected".to_string())
@@ -1127,12 +1289,23 @@ impl WssTransport {
                 .await
                 .map_err(|err| ThalovantError::Connection(err.to_string()))?;
         }
+        guard.committed = true;
         Ok(())
     }
 
+    async fn reset_noise(&self) {
+        self.state.session_valid.store(false, Ordering::Release);
+        *self.state.session.lock().await = None;
+        *self.state.noise_handshake.lock().await = None;
+        *self.state.server_hello.lock().await = None;
+        self.state.node_id.lock().await.clear();
+    }
+
     async fn mark_error(&self, error: &ThalovantError) {
+        self.reset_noise().await;
         let mut health = self.state.health.lock().await;
         health.connected = false;
+        health.handshake_complete = false;
         health.transport_alive = false;
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
@@ -1140,6 +1313,7 @@ impl WssTransport {
     }
 
     async fn mark_disconnected(&self) {
+        self.reset_noise().await;
         let mut health = self.state.health.lock().await;
         health.connected = false;
         health.handshake_complete = false;
@@ -1176,12 +1350,17 @@ pub struct MqttTransport {
 
 struct MqttTransportState {
     identity: Identity,
+    lifecycle: Mutex<()>,
+    noise: Mutex<Option<NoiseChannel>>,
+    noise_state_dir: Mutex<Option<PathBuf>>,
+    tls_config: Mutex<Option<TlsConfiguration>>,
     topics: MqttTopicSet,
     client: Mutex<Option<AsyncClient>>,
     bus_tx: broadcast::Sender<Event>,
     hive_tx: broadcast::Sender<HiveMessage>,
     health: Mutex<TransportHealth>,
     event_task: Mutex<Option<JoinHandle<()>>>,
+    incoming_task: Mutex<Option<JoinHandle<()>>>,
     handshake_notify: Notify,
 }
 
@@ -1193,6 +1372,10 @@ impl MqttTransport {
         let (hive_tx, _) = broadcast::channel(64);
         Ok(Self {
             state: Arc::new(MqttTransportState {
+                lifecycle: Mutex::new(()),
+                noise: Mutex::new(None),
+                noise_state_dir: Mutex::new(None),
+                tls_config: Mutex::new(None),
                 identity,
                 topics,
                 client: Mutex::new(None),
@@ -1200,9 +1383,30 @@ impl MqttTransport {
                 hive_tx,
                 health: Mutex::new(TransportHealth::default()),
                 event_task: Mutex::new(None),
+                incoming_task: Mutex::new(None),
                 handshake_notify: Notify::new(),
             }),
         })
+    }
+
+    /// Select a persistent directory for the client static key and hub pins.
+    pub async fn set_noise_state_dir(&self, dir: Option<PathBuf>) {
+        *self.state.noise_state_dir.lock().await = dir;
+    }
+
+    /// Configure broker trust roots or a TLS client certificate.
+    pub async fn set_tls_configuration(&self, config: Option<TlsConfiguration>) {
+        *self.state.tls_config.lock().await = config;
+    }
+
+    /// Authenticated hub static key, or `None` outside a working session.
+    pub async fn remote_static_key(&self) -> Option<String> {
+        self.state
+            .noise
+            .lock()
+            .await
+            .as_ref()
+            .and_then(NoiseChannel::remote_key)
     }
 
     pub fn identity(&self) -> &Identity {
@@ -1222,6 +1426,31 @@ impl MqttTransport {
     }
 
     pub async fn connect(&self) -> Result<()> {
+        let _lifecycle = self.state.lifecycle.lock().await;
+        self.disconnect_inner().await?;
+        *self.state.health.lock().await = TransportHealth::default();
+        let result = timeout(Duration::from_secs(20), self.connect_inner())
+            .await
+            .unwrap_or_else(|_| {
+                Err(ThalovantError::Timeout(
+                    "HiveMind MQTT Noise handshake timed out".into(),
+                ))
+            });
+        if let Err(error) = &result {
+            self.disconnect_inner().await?;
+            self.mark_error(error).await;
+        }
+        result
+    }
+
+    async fn connect_inner(&self) -> Result<()> {
+        if self.state.identity.password.is_empty() {
+            return Err(ThalovantError::MissingIdentityField(
+                "password: v3 Noise requires the identity password",
+            ));
+        }
+        let dir = self.state.noise_state_dir.lock().await.clone();
+        *self.state.noise.lock().await = Some(NoiseChannel::new(self.state.identity.clone(), dir));
         let started = Instant::now();
         self.set_connection(connecting_connection()).await;
         let credentials = self.state.identity.mqtt.as_ref().ok_or_else(|| {
@@ -1243,6 +1472,12 @@ impl MqttTransport {
                 return Err(error);
             }
         };
+        if let Some(config) = self.state.tls_config.lock().await.clone() {
+            options.set_transport(Transport::tls_with_config(config));
+        }
+        // A Noise frame may be 65,535 bytes, plus MQTT topic/header overhead.
+        // rumqttc's 10 KiB default otherwise rejects valid encrypted chunks.
+        options.set_max_packet_size(128 * 1024, 128 * 1024);
         options.set_keep_alive(Duration::from_secs(60));
         options.set_clean_session(true);
         options.set_credentials(credentials.username.clone(), credentials.password.clone());
@@ -1254,25 +1489,45 @@ impl MqttTransport {
         ));
         let (client, mut eventloop) = AsyncClient::new(options, 16);
         *self.state.client.lock().await = Some(client.clone());
+        let notified = self.state.handshake_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Keep polling the broker while the protocol worker publishes Noise
+        // replies. Waiting for a bounded publish queue from inside eventloop.poll
+        // would deadlock large concurrent messages or handshake continuations.
+        let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
         let transport = self.clone();
         *self.state.event_task.lock().await = Some(tokio::spawn(async move {
-            loop {
+            let error = loop {
                 match eventloop.poll().await {
                     Ok(MqttEvent::Incoming(Packet::Publish(publish))) => {
-                        if let Err(error) = transport
-                            .handle_raw_mqtt_payload(publish.payload.to_vec())
-                            .await
-                        {
-                            transport.mark_error(&error).await;
-                            break;
+                        if incoming_tx.try_send(publish.payload.to_vec()).is_err() {
+                            break ThalovantError::Connection(
+                                "MQTT receive queue overflow; reconnect required".into(),
+                            );
                         }
                     }
                     Ok(_) => {}
-                    Err(error) => {
-                        let error = ThalovantError::Connection(error.to_string());
-                        transport.mark_error(&error).await;
-                        break;
+                    Err(error) => break ThalovantError::Connection(error.to_string()),
+                }
+            };
+            // Drop the request receiver before acquiring protocol state so
+            // publishers awaiting queue space wake and release their lock.
+            drop(eventloop);
+            transport.mark_error(&error).await;
+            transport.state.handshake_notify.notify_waiters();
+        }));
+        let transport = self.clone();
+        *self.state.incoming_task.lock().await = Some(tokio::spawn(async move {
+            while let Some(payload) = incoming_rx.recv().await {
+                if let Err(error) = transport.handle_raw_mqtt_payload(payload).await {
+                    if let Some(task) = transport.state.event_task.lock().await.take() {
+                        task.abort();
+                        let _ = task.await;
                     }
+                    transport.mark_error(&error).await;
+                    transport.state.handshake_notify.notify_waiters();
+                    break;
                 }
             }
         }));
@@ -1305,52 +1560,83 @@ impl MqttTransport {
             health.connection.transport_open_ms = Some(elapsed_ms(started, Instant::now()));
         }
         let opened = Instant::now();
-        if let Err(error) = self
-            .send_hive_message(
-                hello_hive_message(&self.state.identity, "thalovant-rust-mqtt-"),
-                true,
-            )
-            .await
-        {
-            self.mark_error(&error).await;
-            return Err(error);
-        }
-        let notified = self.state.handshake_notify.notified();
-        tokio::pin!(notified);
-        if !self.is_handshake_complete().await {
-            let _ = timeout(Duration::from_secs(6), &mut notified).await;
+        // The first clear HELLO creates the MQTT peer and requests its offer.
+        self.publish_frame(NoiseWrite {
+            payload: serde_json::to_vec(&hello_hive_message(
+                &self.state.identity,
+                "thalovant-rust-mqtt-",
+            ))?,
+            binary: false,
+        })
+        .await?;
+        if !self.is_handshake_complete().await && self.state.health.lock().await.connected {
+            let _ = timeout(Duration::from_secs(20), &mut notified).await;
         }
         if !self.is_handshake_complete().await {
-            self.disconnect().await?;
-            let error = ThalovantError::Timeout("HiveMind MQTT handshake timed out".to_string());
-            self.mark_error(&error).await;
-            return Err(error);
+            let cause = self.state.health.lock().await.last_error.clone();
+            return Err(ThalovantError::Connection(cause.unwrap_or_else(|| {
+                "HiveMind MQTT Noise handshake did not complete".into()
+            })));
         }
         self.mark_connection_ready(started, opened).await;
         Ok(())
     }
 
     pub async fn disconnect(&self) -> Result<()> {
-        if let Some(task) = self.state.event_task.lock().await.take() {
-            task.abort();
-        }
+        let _lifecycle = self.state.lifecycle.lock().await;
+        self.disconnect_inner().await
+    }
+
+    async fn disconnect_inner(&self) -> Result<()> {
+        // Publish offline while the event loop still drives the connection.
         if let Some(client) = self.state.client.lock().await.take() {
-            let _ = client
-                .publish(
-                    self.state.topics.status.clone(),
-                    QoS::AtLeastOnce,
-                    true,
-                    "offline",
-                )
-                .await;
-            let _ = client.disconnect().await;
+            let _ = timeout(Duration::from_secs(1), async {
+                client
+                    .publish(
+                        self.state.topics.status.clone(),
+                        QoS::AtLeastOnce,
+                        true,
+                        "offline",
+                    )
+                    .await?;
+                client.disconnect().await
+            })
+            .await;
+        }
+        if let Some(mut task) = self.state.event_task.lock().await.take() {
+            // AsyncClient::disconnect only queues the packet. Let the event
+            // loop flush it and the retained offline status before closing TCP.
+            if timeout(Duration::from_secs(1), &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        if let Some(task) = self.state.incoming_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
         }
         self.mark_disconnected().await;
         Ok(())
     }
 
     pub async fn healthcheck(&self) -> TransportHealth {
-        self.state.health.lock().await.clone()
+        let ready = self
+            .state
+            .noise
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(NoiseChannel::ready);
+        let mut health = self.state.health.lock().await.clone();
+        health.handshake_complete &= ready;
+        if !ready && health.connection.phase == TransportConnectionPhase::Ready {
+            health.connected = false;
+            health.transport_alive = false;
+            health.connection.phase = TransportConnectionPhase::Error;
+            health.last_error = Some("Noise session interrupted; reconnect required".into());
+            health.connection.last_error = health.last_error.clone();
+        }
+        health
     }
 
     pub async fn connection_info(&self) -> TransportConnectionInfo {
@@ -1384,35 +1670,25 @@ impl MqttTransport {
     }
 
     async fn is_handshake_complete(&self) -> bool {
-        self.state.health.lock().await.handshake_complete
+        self.healthcheck().await.handshake_complete
     }
 
     async fn handle_raw_mqtt_payload(&self, raw: Vec<u8>) -> Result<()> {
-        let (message, decoded) = decode_mqtt_hive_message(&raw)?;
-        match message.msg_type.as_str() {
-            "handshake" | "shake" => {
-                // The capability flags here are not ours to negotiate. A 5.x
-                // hub sends `{"noise": {...}}` and a 4.x one sends
-                // `{"handshake": true, "min_protocol_version": ...}`; MQTT runs
-                // no key exchange either way -- the broker connection is
-                // authenticated with the per-client credentials and takes its
-                // confidentiality from TLS. Rejecting the frame when those
-                // fields were present accepted only the 5.x shape and left
-                // connect() to time out against a 4.x hub. The Go SDK ignores
-                // the payload here for the same reason.
-            }
-            "bus" => {
-                let event = event_from_bus_payload(&message.payload, Some(decoded));
-                let _ = self.state.bus_tx.send(event);
-                return Ok(());
-            }
-            "query" | "cascade" => {
-                let _ = self.state.hive_tx.send(message);
-                return Ok(());
-            }
-            _ => return Ok(()),
+        let mut slot = self.state.noise.lock().await;
+        let channel = slot
+            .as_mut()
+            .ok_or_else(|| ThalovantError::Connection("MQTT transport is not connected".into()))?;
+        let binary = channel.ready();
+        let (message, writes) = channel.receive(&raw, binary)?;
+        channel.failed = true;
+        for write in writes {
+            self.publish_frame(write).await?;
         }
-        {
+        channel.failed = false;
+        let ready = channel.ready();
+        drop(slot);
+        dispatch_noise_message(&self.state.bus_tx, &self.state.hive_tx, message);
+        if ready {
             let mut health = self.state.health.lock().await;
             health.handshake_complete = true;
             health.transport_alive = true;
@@ -1422,31 +1698,55 @@ impl MqttTransport {
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
-        let payload = encode_hive_binary_frame(&message)?;
-        let client = self.state.client.lock().await.clone().ok_or_else(|| {
-            ThalovantError::Connection("HiveMind MQTT transport is not connected".to_string())
-        })?;
+        let result = self.send_encrypted(message).await;
+        if let Err(error) = &result {
+            self.mark_error(error).await;
+        }
+        result
+    }
+
+    async fn send_encrypted(&self, message: HiveMessage) -> Result<()> {
+        let mut slot = self.state.noise.lock().await;
+        let channel = slot
+            .as_mut()
+            .ok_or_else(|| ThalovantError::Connection("MQTT transport is not connected".into()))?;
+        let writes = channel.encode(&message)?;
+        channel.failed = true;
+        for write in writes {
+            self.publish_frame(write).await?;
+        }
+        channel.failed = false;
+        Ok(())
+    }
+
+    async fn publish_frame(&self, write: NoiseWrite) -> Result<()> {
+        let client =
+            self.state.client.lock().await.clone().ok_or_else(|| {
+                ThalovantError::Connection("MQTT transport is not connected".into())
+            })?;
         let publish_qos = self
             .state
             .identity
             .mqtt
             .as_ref()
-            .map(|mqtt| mqtt.qos)
+            .map(|credentials| credentials.qos)
             .unwrap_or(1);
         client
             .publish(
                 self.state.topics.inbound.clone(),
                 qos(publish_qos),
                 false,
-                payload,
+                write.payload,
             )
             .await
             .map_err(|err| ThalovantError::Connection(err.to_string()))
     }
 
     async fn mark_error(&self, error: &ThalovantError) {
+        *self.state.noise.lock().await = None;
         let mut health = self.state.health.lock().await;
         health.connected = false;
+        health.handshake_complete = false;
         health.transport_alive = false;
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
@@ -1454,6 +1754,7 @@ impl MqttTransport {
     }
 
     async fn mark_disconnected(&self) {
+        *self.state.noise.lock().await = None;
         let mut health = self.state.health.lock().await;
         health.connected = false;
         health.handshake_complete = false;
@@ -1476,12 +1777,270 @@ impl MqttTransport {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct PollResponse {
-    #[serde(default)]
-    error: Option<String>,
-    #[serde(default)]
-    messages: Vec<Value>,
+// Cancellation after cipher advancement leaves delivery uncertain. Preserve
+// the static identity, but require a new session before any subsequent send.
+struct NoiseSendGuard<'a> {
+    valid: &'a AtomicBool,
+    committed: bool,
+}
+impl Drop for NoiseSendGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.valid.store(false, Ordering::Release);
+        }
+    }
+}
+
+// Transport-independent v3 negotiation. Callers hold their channel mutex across
+// encryption and delivery of all chunks so counter order matches wire order.
+// Set failed before an awaited write, and clear it only after every frame was
+// delivered: cancellation or an uncertain write must never reuse the session.
+struct NoiseChannel {
+    identity: Identity,
+    state_dir: Option<PathBuf>,
+    hello: Option<Map<String, Value>>,
+    node_id: String,
+    handshake: Option<NoiseHandshake>,
+    session: Option<NoiseSession>,
+    failed: bool,
+}
+
+struct NoiseWrite {
+    payload: Vec<u8>,
+    binary: bool,
+}
+
+impl NoiseChannel {
+    fn new(identity: Identity, state_dir: Option<PathBuf>) -> Self {
+        Self {
+            identity,
+            state_dir,
+            hello: None,
+            node_id: String::new(),
+            handshake: None,
+            session: None,
+            failed: false,
+        }
+    }
+
+    fn ready(&self) -> bool {
+        self.session.is_some() && !self.failed
+    }
+
+    fn remote_key(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .filter(|_| !self.failed)
+            .and_then(|session| session.remote_static_key().map(str::to_string))
+    }
+
+    fn encode(&self, message: &HiveMessage) -> Result<Vec<NoiseWrite>> {
+        if !self.ready() {
+            return Err(ThalovantError::Connection(
+                "refusing to send before the v3 Noise session is established".into(),
+            ));
+        }
+        let session = self.session.as_ref().expect("checked above");
+        Ok(session
+            .encrypt_message(&serde_json::to_vec(message)?, true)?
+            .into_iter()
+            .map(|payload| NoiseWrite {
+                payload,
+                binary: true,
+            })
+            .collect())
+    }
+
+    fn receive(
+        &mut self,
+        data: &[u8],
+        binary: bool,
+    ) -> Result<(Option<HiveMessage>, Vec<NoiseWrite>)> {
+        if self.failed {
+            return Err(ThalovantError::Connection(
+                "Noise session failed; reconnect required".into(),
+            ));
+        }
+        let result = self.receive_inner(data, binary);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    fn receive_inner(
+        &mut self,
+        data: &[u8],
+        binary: bool,
+    ) -> Result<(Option<HiveMessage>, Vec<NoiseWrite>)> {
+        if let Some(session) = &self.session {
+            if !binary {
+                return Err(ThalovantError::Connection(
+                    "plaintext received after Noise negotiation".into(),
+                ));
+            }
+            let message = match session.decrypt_frame(data)? {
+                NoiseFrame::Partial => return Ok((None, vec![])),
+                NoiseFrame::Message {
+                    payload,
+                    is_json: true,
+                } => serde_json::from_slice(&payload)?,
+                NoiseFrame::Message {
+                    payload,
+                    is_json: false,
+                } => decode_hive_binary_frame(&payload)?,
+            };
+            return Ok((Some(message), vec![]));
+        }
+        if binary {
+            return Err(ThalovantError::Connection(
+                "ciphertext arrived before Noise negotiation".into(),
+            ));
+        }
+        let message: HiveMessage = serde_json::from_slice(data)?;
+        match message.msg_type.as_str() {
+            "hello" => {
+                if self.hello.is_some() || self.handshake.is_some() {
+                    return Err(ThalovantError::Connection("duplicate Noise HELLO".into()));
+                }
+                self.node_id = message
+                    .payload
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if self.node_id.is_empty() {
+                    return Err(ThalovantError::Connection(
+                        "Noise HELLO lacks node_id".into(),
+                    ));
+                }
+                self.hello = Some(message.payload);
+                Ok((None, vec![]))
+            }
+            "shake" | "handshake" => {
+                let params = message
+                    .payload
+                    .get("noise")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        ThalovantError::Connection("the hub did not offer v3 Noise".into())
+                    })?;
+                let writes = if params.contains_key("msg") {
+                    self.continue_handshake(params)?
+                } else {
+                    self.start(&message.payload, params)?
+                };
+                Ok((None, writes))
+            }
+            _ => Err(ThalovantError::Connection(
+                "application traffic received before Noise negotiation".into(),
+            )),
+        }
+    }
+
+    fn clear(params: Value) -> Result<NoiseWrite> {
+        Ok(NoiseWrite {
+            payload: serde_json::to_vec(&HiveMessage {
+                msg_type: "shake".into(),
+                payload: json!({"noise":params})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                ..Default::default()
+            })?,
+            binary: false,
+        })
+    }
+
+    fn start(
+        &mut self,
+        offer: &Map<String, Value>,
+        params: &Map<String, Value>,
+    ) -> Result<Vec<NoiseWrite>> {
+        if self.node_id.is_empty() || self.handshake.is_some() {
+            return Err(ThalovantError::Connection(
+                "unexpected Noise capability offer".into(),
+            ));
+        }
+        if self.identity.password.is_empty() {
+            return Err(ThalovantError::MissingIdentityField(
+                "password: v3 Noise requires the identity password",
+            ));
+        }
+        let pin = load_noise_pin(self.state_dir.as_deref(), &self.node_id)?;
+        let (pattern, suite) = select_noise_options(
+            &string_list(params.get("patterns")),
+            &string_list(params.get("suites")),
+            pin.as_deref(),
+        )
+        .ok_or_else(|| ThalovantError::Connection("no supported Noise pattern and suite".into()))?;
+        let prologue = build_prologue(
+            self.hello.as_ref().expect("HELLO checked above"),
+            offer,
+            &noise_protocol_name(&pattern, &suite),
+        );
+        let key = load_or_create_noise_key(self.state_dir.as_deref())?;
+        let psk = derive_psk(&self.identity.password, &self.node_id)?;
+        let mut handshake =
+            NoiseHandshake::new(&pattern, &suite, &psk, &prologue, &key, pin.as_deref())?;
+        let preferences = canonical_json(&json!({"binarize":false,"encodings":[]}));
+        let msg = handshake.write_message(preferences.as_bytes())?;
+        self.handshake = Some(handshake);
+        Ok(vec![Self::clear(
+            json!({"pattern":pattern,"suite":suite,"msg":hex::encode(msg)}),
+        )?])
+    }
+
+    fn continue_handshake(&mut self, params: &Map<String, Value>) -> Result<Vec<NoiseWrite>> {
+        let encoded = params
+            .get("msg")
+            .and_then(Value::as_str)
+            .filter(|msg| !msg.is_empty())
+            .ok_or_else(|| ThalovantError::Connection("malformed Noise envelope".into()))?;
+        let msg = hex::decode(encoded)
+            .map_err(|_| ThalovantError::Connection("malformed Noise envelope".into()))?;
+        let handshake = self.handshake.as_mut().ok_or_else(|| {
+            ThalovantError::Connection("Noise response before negotiation".into())
+        })?;
+        handshake.read_message(&msg)?;
+        let mut writes = vec![];
+        if !handshake.is_finished() {
+            writes.push(Self::clear(
+                json!({"msg":hex::encode(handshake.write_message(&[])?) }),
+            )?);
+        }
+        let session = self
+            .handshake
+            .take()
+            .expect("checked above")
+            .into_session()?;
+        let remote = session.remote_static_key().ok_or_else(|| {
+            ThalovantError::Connection("Noise peer supplied no static identity".into())
+        })?;
+        pin_hub_key(self.state_dir.as_deref(), &self.node_id, remote)?;
+        self.session = Some(session);
+        writes.extend(self.encode(&hello_hive_message(&self.identity, "thalovant-rust-"))?);
+        Ok(writes)
+    }
+}
+
+fn dispatch_noise_message(
+    bus: &broadcast::Sender<Event>,
+    hive: &broadcast::Sender<HiveMessage>,
+    message: Option<HiveMessage>,
+) {
+    if let Some(message) = message {
+        match message.msg_type.as_str() {
+            "bus" => {
+                let raw = serde_json::to_value(&message).ok();
+                let _ = bus.send(event_from_bus_payload(&message.payload, raw));
+            }
+            "query" | "cascade" => {
+                let _ = hive.send(message);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn connecting_connection() -> TransportConnectionInfo {
@@ -1496,21 +2055,6 @@ fn elapsed_ms(start: Instant, end: Instant) -> f64 {
     end.saturating_duration_since(start).as_micros() as f64 / 1000.0
 }
 
-fn decode_mqtt_hive_message(raw: &[u8]) -> Result<(HiveMessage, Value)> {
-    if let Ok(text) = std::str::from_utf8(raw) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-            if parsed.get("msg_type").is_some() {
-                let message = serde_json::from_value(parsed.clone())?;
-                return Ok((message, parsed));
-            }
-        }
-    }
-    let message = decode_hive_binary_frame(raw)?;
-    let decoded = serde_json::to_value(&message)?;
-    Ok((message, decoded))
-}
-
-/// The string entries of a JSON array, ignoring anything else in it.
 fn string_list(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -1619,10 +2163,7 @@ fn mqtt_options_for_identity(identity: &Identity) -> Result<MqttOptions> {
         ThalovantError::Connection("MQTT endpoint must include a host".to_string())
     })?;
     let tls_enabled = mqtt_tls_enabled(credentials, parsed.scheme());
-    // TLS is the only confidentiality on this path. The identity crypto key
-    // that once sealed MQTT payloads separately is gone with v3, so a broker
-    // hop without TLS would put every message, and the broker password with
-    // them, on the wire in the clear.
+    // TLS protects broker credentials; Noise protects the hub session.
     if !tls_enabled {
         return Err(ThalovantError::Connection(
             "refusing to connect to an MQTT broker without TLS. Use an mqtts:// endpoint, or set tls: true on the identity's mqtt block"
@@ -1631,7 +2172,7 @@ fn mqtt_options_for_identity(identity: &Identity) -> Result<MqttOptions> {
     }
     let port = parsed.port().unwrap_or(mqtt_default_port(tls_enabled));
     let mut options = MqttOptions::new(
-        format!("thalovant-{}", safe_mqtt_client_id(&identity.access_key)),
+        format!("thalovant-{}", uuid::Uuid::new_v4().simple()),
         host,
         port,
     );
@@ -1678,25 +2219,6 @@ fn qos(value: u8) -> QoS {
         QoS::AtMostOnce
     } else {
         QoS::AtLeastOnce
-    }
-}
-
-fn safe_mqtt_client_id(value: &str) -> String {
-    let id = value
-        .chars()
-        .map(|char| {
-            if char.is_ascii_alphanumeric() || char == '_' || char == '-' {
-                char
-            } else {
-                '-'
-            }
-        })
-        .take(48)
-        .collect::<String>();
-    if id.is_empty() {
-        uuid::Uuid::new_v4().simple().to_string()
-    } else {
-        id
     }
 }
 
@@ -1901,3 +2423,7 @@ mod tests {
         assert!(require_tls_endpoint("not a url").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "transport_noise_tests.rs"]
+mod noise_transport_tests;
