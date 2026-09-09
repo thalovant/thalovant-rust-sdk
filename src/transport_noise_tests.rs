@@ -4,6 +4,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::{rustls::pki_types::PrivatePkcs8KeyDer, TlsAcceptor};
 
+fn test_password() -> &'static str {
+    static PASSWORD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PASSWORD.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 struct FixtureDir(PathBuf);
 impl FixtureDir {
     fn new() -> Self {
@@ -39,7 +44,7 @@ impl Responder {
         Self {
             key,
             peer: None,
-            psk: derive_psk("test-password", "test-hub").unwrap(),
+            psk: derive_psk(test_password(), "test-hub").unwrap(),
             hello: Map::new(),
             offer: Map::new(),
             handshake: None,
@@ -402,7 +407,7 @@ impl HttpFixture {
         }
     }
     fn transport(&self) -> HttpTransport {
-        let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":"test-password","default_master":self.endpoint,"data_plane_endpoints":{"https":self.endpoint}})).unwrap();
+        let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":self.endpoint,"data_plane_endpoints":{"https":self.endpoint}})).unwrap();
         HttpTransport::with_options_and_http_client_builder(
             identity,
             DEFAULT_USER_AGENT,
@@ -552,7 +557,7 @@ async fn noise_offer_alone_never_marks_transport_ready() {
     let mut responder = Responder::new();
     let writes = responder.reset();
     let dir = FixtureDir::new();
-    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":"test-password","default_master":"https://example.invalid"})).unwrap();
+    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":"https://example.invalid"})).unwrap();
     let mut channel = NoiseChannel::new(identity, Some(dir.0.clone()));
     let mut output = vec![];
     for write in writes {
@@ -667,7 +672,7 @@ async fn mqtt_noise_tls_broker_reconnect_and_wrong_password() {
     for wrong_password in [false, true] {
         let (acceptor, _, ca) = tls_fixture();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":if wrong_password{"wrong"}else{"test-password"},"default_master":"https://example.invalid","mqtt":{"endpoint":format!("mqtts://{}",listener.local_addr().unwrap()),"username":"broker-user","password":"broker-password","topic_prefix":"test","tls":true,"qos":1}})).unwrap();
+        let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":if wrong_password{"wrong"}else{test_password()},"default_master":"https://example.invalid","mqtt":{"endpoint":format!("mqtts://{}",listener.local_addr().unwrap()),"username":"broker-user","password":"broker-password","topic_prefix":"test","tls":true,"qos":1}})).unwrap();
         let transport = MqttTransport::new(identity).unwrap();
         let dir = FixtureDir::new();
         transport.set_noise_state_dir(Some(dir.0.clone())).await;
@@ -737,7 +742,7 @@ async fn mqtt_noise_tls_broker_reconnect_and_wrong_password() {
 async fn wss_noise_same_object_reconnect_after_encrypted_reply() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":"test-password","default_master":endpoint,"data_plane_endpoints":{"wss":endpoint}})).unwrap();
+    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"wss":endpoint}})).unwrap();
     let transport = WssTransport::new(identity);
     let dir = FixtureDir::new();
     transport.set_noise_state_dir(Some(dir.0.clone())).await;
@@ -834,7 +839,7 @@ async fn http_noise_refuses_redirect_even_with_permissive_custom_builder() {
             let _ = stream.read(&mut request).await.unwrap();
             stream.write_all(format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
         });
-        let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":"test-password","default_master":endpoint,"data_plane_endpoints":{"https":endpoint}})).unwrap();
+        let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"https":endpoint}})).unwrap();
         let transport = HttpTransport::with_options_and_http_client_builder(
             identity,
             DEFAULT_USER_AGENT,
@@ -858,7 +863,7 @@ async fn http_noise_refuses_redirect_even_with_permissive_custom_builder() {
 
 #[tokio::test]
 async fn wss_failed_kk_keeps_the_authenticated_hub_pin() {
-    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":"test-password","default_master":"https://example.invalid"})).unwrap();
+    let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":"https://example.invalid"})).unwrap();
     let transport = WssTransport::new(identity);
     let dir = FixtureDir::new();
     transport.set_noise_state_dir(Some(dir.0.clone())).await;
@@ -866,7 +871,7 @@ async fn wss_failed_kk_keeps_the_authenticated_hub_pin() {
     let pin = hex::encode(peer.public);
     pin_hub_key(Some(&dir.0), "test-hub", &pin).unwrap();
     let key = load_or_create_noise_key(Some(&dir.0)).unwrap();
-    let psk = derive_psk("test-password", "test-hub").unwrap();
+    let psk = derive_psk(test_password(), "test-hub").unwrap();
     let mut handshake = NoiseHandshake::new(
         "KKpsk0",
         "25519_ChaChaPoly_SHA256",
