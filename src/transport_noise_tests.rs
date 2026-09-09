@@ -1193,7 +1193,12 @@ fn shared_noise_rejects_duplicate_hello_and_a_changed_pinned_peer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // A small receive window makes backpressure independent of the host's
+    // loopback socket buffers. The peer signals an actual application chunk.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(128).unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"wss":endpoint}})).unwrap();
     let transport = WssTransport::new(identity);
@@ -1222,6 +1227,7 @@ async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers
                     WebSocketMessage::Close(_) => break,
                     _ => continue,
                 };
+                let application_chunk = attempt == 0 && responder.hellos == 1;
                 for write in responder.receive(&raw, binary).unwrap() {
                     stream
                         .send(if write.binary {
@@ -1232,7 +1238,7 @@ async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers
                         .await
                         .unwrap();
                 }
-                if attempt == 0 && responder.hellos == 1 {
+                if application_chunk {
                     server_paused.notify_one();
                     server_release.notified().await;
                     break;
@@ -1242,9 +1248,6 @@ async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers
         responder.patterns
     });
     transport.connect().await.unwrap();
-    timeout(Duration::from_secs(5), paused.notified())
-        .await
-        .unwrap();
     let sender = transport.clone();
     let send = tokio::spawn(async move {
         sender
@@ -1258,18 +1261,9 @@ async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers
             )
             .await
     });
-    timeout(Duration::from_secs(5), async {
-        loop {
-            if transport.state.writer.try_lock().is_err()
-                && transport.state.noise.try_lock().is_err()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    timeout(Duration::from_secs(5), paused.notified())
+        .await
+        .expect("peer must receive the first encrypted application chunk");
     assert!(!send.is_finished());
     send.abort();
     assert!(send.await.unwrap_err().is_cancelled());
