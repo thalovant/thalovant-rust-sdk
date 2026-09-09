@@ -560,14 +560,20 @@ forget_cached_psk(None, &node_id)?; // Or Some(state_dir.as_path()).
 
 Noise state operations use an OS lock shared across processes. A new static key
 is published only after complete bytes have been flushed; pin/cache updates are
-atomic transactions. Interrupted or malformed trust files are never silently
+atomic transactions. Use a state directory on a filesystem supporting hard links
+and atomic replacement (such as NTFS or native Unix filesystems); unsupported
+filesystems fail safely without publishing partial keys. Lock acquisition is
+bounded, and async handshake work runs away from Tokio workers so another
+process's lock cannot stall a caller deadline. Interrupted or malformed trust files are never silently
 replaced. Existing state files must be regular files and private on Unix.
 
 Concurrent `connect_with_timeout` calls join authenticated readiness rather than
 returning when a socket merely opens. A joining caller's timeout or cancellation
 leaves the initiating connection alone; cancelling the initiator invalidates its
 own generation. Transport sends default to a 20-second bound and cleanup to two
-seconds. An unacknowledged HTTP cleanup retains this object's admission marker,
+seconds for the caller; an owned worker continues cleanup after that deadline.
+MQTT allows its worker three seconds for offline publication and event-loop
+retirement. An unacknowledged HTTP cleanup retains this object's admission marker,
 so the next connection retries cleanup before admitting a fresh session.
 
 All three transports use the same Noise negotiation, authenticated framing, and

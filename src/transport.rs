@@ -162,7 +162,7 @@ impl Drop for ConnectionAttempt {
                 }
                 // Remote cleanup is owned but cannot extend the failed caller's
                 // deadline. HTTP retains unacknowledged admission for retry.
-                let _ = timeout(Duration::from_secs(2), transport.disconnect_locked()).await;
+                let _ = timeout(transport.cleanup_budget(), transport.disconnect_locked()).await;
             });
         }
     }
@@ -285,6 +285,14 @@ impl RuntimeTransport {
         result
     }
 
+    fn cleanup_budget(&self) -> Duration {
+        if matches!(self, Self::Mqtt(_)) {
+            Duration::from_secs(3)
+        } else {
+            Duration::from_secs(2)
+        }
+    }
+
     async fn disconnect_locked(&self) -> Result<()> {
         match self {
             Self::Http(transport) => transport.disconnect_inner().await,
@@ -299,16 +307,30 @@ impl RuntimeTransport {
         if let Self::Wss(wss) = self {
             wss.state.session_valid.store(false, Ordering::Release);
         }
-        timeout(Duration::from_secs(2), async {
-            let _guard = self.control().lock().await;
-            self.disconnect_locked().await
-        })
-        .await
-        .map_err(|_| {
-            ThalovantError::Timeout(
-                "transport cleanup timed out; reconnect retries owned cleanup".into(),
-            )
-        })?
+        let transport = self.clone();
+        let generation = self.control().generation.load(Ordering::Acquire);
+        // The worker retains cleanup ownership even if this caller stops waiting.
+        let worker = tokio::spawn(async move {
+            let _guard = transport.control().lock().await;
+            if transport.control().generation.load(Ordering::Acquire) != generation {
+                return Ok(());
+            }
+            timeout(transport.cleanup_budget(), transport.disconnect_locked())
+                .await
+                .map_err(|_| {
+                    ThalovantError::Timeout(
+                        "transport cleanup timed out; reconnect retries owned cleanup".into(),
+                    )
+                })?
+        });
+        timeout(Duration::from_secs(2), worker)
+            .await
+            .map_err(|_| {
+                ThalovantError::Timeout("transport cleanup continues after caller deadline".into())
+            })?
+            .map_err(|error| {
+                ThalovantError::Connection(format!("cleanup worker failed: {error}"))
+            })?
     }
 
     pub async fn healthcheck(&self) -> TransportHealth {
@@ -343,6 +365,27 @@ impl RuntimeTransport {
             Self::Mqtt(transport) => transport.send_hive_message(message, encrypt).await,
         }
     }
+}
+
+async fn send_with_deadline(
+    control: &ConnectionControl,
+    send: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let retired = control.retired.notified();
+    tokio::pin!(retired);
+    retired.as_mut().enable();
+    if control.cancelled.load(Ordering::Acquire) {
+        return Err(ThalovantError::Connection(
+            "transport retired; reconnect required".into(),
+        ));
+    }
+    timeout(Duration::from_secs(20), async {
+        tokio::select! {
+            biased;
+            _ = &mut retired => Err(ThalovantError::Connection("transport closed during send".into())),
+            result = send => result,
+        }
+    }).await.map_err(|_| ThalovantError::Timeout("Noise message send timed out".into()))?
 }
 
 fn connection_timeout() -> ThalovantError {
@@ -472,15 +515,19 @@ impl HttpTransport {
         if self.state.admitted.load(Ordering::Acquire) {
             // /connect does not issue a new offer for a peer still registered
             // locally. Reset only this object's previously admitted session.
-            timeout(
+            let reset = timeout(
                 Duration::from_secs(2),
                 self.request(reqwest::Method::POST, "/disconnect", None),
             )
             .await
-            .map_err(|_| connection_timeout())??;
+            .unwrap_or_else(|_| Err(connection_timeout()));
+            if let Err(error) = reset {
+                self.mark_connection_error(&error).await;
+                return Err(error);
+            }
             self.state.admitted.store(false, Ordering::Release);
         }
-        *self.state.noise.lock().await = None;
+        clear_noise(&self.state.noise).await;
         *self.state.health.lock().await = TransportHealth {
             connection: connecting_connection(),
             ..Default::default()
@@ -544,7 +591,7 @@ impl HttpTransport {
     async fn disconnect_inner(&self) -> Result<()> {
         self.stop_polling().await;
         let _poll = self.state.poll.lock().await;
-        *self.state.noise.lock().await = None;
+        clear_noise(&self.state.noise).await;
         {
             let mut health = self.state.health.lock().await;
             health.connected = false;
@@ -692,10 +739,10 @@ impl HttpTransport {
 
     async fn receive_frame(&self, raw: &[u8], binary: bool) -> Result<()> {
         let mut slot = self.state.noise.lock().await;
+        let (message, writes) = receive_noise(&mut slot, raw.to_vec(), binary).await?;
         let channel = slot
             .as_mut()
-            .ok_or_else(|| ThalovantError::Connection("HTTP transport is not connected".into()))?;
-        let (message, writes) = channel.receive(raw, binary)?;
+            .expect("successful receive restored its channel");
         channel.failed = true;
         for write in writes {
             self.write_frame(write).await?;
@@ -711,9 +758,7 @@ impl HttpTransport {
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
-        timeout(Duration::from_secs(20), self.send_message_inner(message))
-            .await
-            .map_err(|_| ThalovantError::Timeout("Noise message send timed out".into()))?
+        send_with_deadline(&self.state.lifecycle, self.send_message_inner(message)).await
     }
 
     async fn send_message_inner(&self, message: HiveMessage) -> Result<()> {
@@ -763,6 +808,20 @@ impl HttpTransport {
     }
 
     async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        form: Option<&Vec<(&str, String)>>,
+    ) -> Result<Value> {
+        timeout(
+            Duration::from_secs(20),
+            self.request_inner(method, path, form),
+        )
+        .await
+        .map_err(|_| ThalovantError::Timeout("HTTP transport request timed out".into()))?
+    }
+
+    async fn request_inner(
         &self,
         method: reqwest::Method,
         path: &str,
@@ -826,7 +885,7 @@ impl HttpTransport {
     }
 
     async fn mark_connection_error(&self, error: &ThalovantError) {
-        *self.state.noise.lock().await = None;
+        clear_noise(&self.state.noise).await;
         let mut health = self.state.health.lock().await;
         health.connected = false;
         health.handshake_complete = false;
@@ -1124,7 +1183,10 @@ impl WssTransport {
             valid: &self.state.session_valid,
             committed: false,
         };
-        let (message, writes) = channel.receive(&data, binary)?;
+        let (message, writes) = receive_noise(&mut slot, data, binary).await?;
+        let channel = slot
+            .as_mut()
+            .expect("successful receive restored its channel");
         channel.failed = true;
         Self::write_noise_frames(&mut writer, writes).await?;
         channel.failed = false;
@@ -1168,9 +1230,7 @@ impl WssTransport {
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
-        timeout(Duration::from_secs(20), self.send_message_inner(message))
-            .await
-            .map_err(|_| ThalovantError::Timeout("Noise message send timed out".into()))?
+        send_with_deadline(&self.state.lifecycle, self.send_message_inner(message)).await
     }
 
     async fn send_message_inner(&self, message: HiveMessage) -> Result<()> {
@@ -1200,7 +1260,7 @@ impl WssTransport {
 
     async fn reset_noise(&self) {
         self.state.session_valid.store(false, Ordering::Release);
-        *self.state.noise.lock().await = None;
+        clear_noise(&self.state.noise).await;
     }
 
     async fn mark_error(&self, error: &ThalovantError) {
@@ -1243,6 +1303,13 @@ pub struct MqttTopicSet {
     pub inbound: String,
     pub outbound: String,
     pub status: String,
+}
+
+struct AbortTaskOnDrop(JoinHandle<()>);
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Clone)]
@@ -1507,12 +1574,13 @@ impl MqttTransport {
             })
             .await;
         }
-        if let Some(mut task) = self.state.event_task.lock().await.take() {
+        if let Some(task) = self.state.event_task.lock().await.take() {
+            let mut task = AbortTaskOnDrop(task);
             // AsyncClient::disconnect only queues the packet. Let the event
             // loop flush it and the retained offline status before closing TCP.
-            if timeout(Duration::from_secs(1), &mut task).await.is_err() {
-                task.abort();
-                let _ = task.await;
+            if timeout(Duration::from_secs(1), &mut task.0).await.is_err() {
+                task.0.abort();
+                let _ = (&mut task.0).await;
             }
         }
         if let Some(task) = self.state.incoming_task.lock().await.take() {
@@ -1578,7 +1646,10 @@ impl MqttTransport {
             .as_mut()
             .ok_or_else(|| ThalovantError::Connection("MQTT transport is not connected".into()))?;
         let binary = channel.ready();
-        let (message, writes) = channel.receive(&raw, binary)?;
+        let (message, writes) = receive_noise(&mut slot, raw, binary).await?;
+        let channel = slot
+            .as_mut()
+            .expect("successful receive restored its channel");
         channel.failed = true;
         for write in writes {
             self.publish_frame(write).await?;
@@ -1597,9 +1668,7 @@ impl MqttTransport {
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
-        timeout(Duration::from_secs(20), self.send_message_inner(message))
-            .await
-            .map_err(|_| ThalovantError::Timeout("Noise message send timed out".into()))?
+        send_with_deadline(&self.state.lifecycle, self.send_message_inner(message)).await
     }
 
     async fn send_message_inner(&self, message: HiveMessage) -> Result<()> {
@@ -1654,7 +1723,7 @@ impl MqttTransport {
     }
 
     async fn mark_error(&self, error: &ThalovantError) {
-        *self.state.noise.lock().await = None;
+        clear_noise(&self.state.noise).await;
         let mut health = self.state.health.lock().await;
         health.connected = false;
         health.handshake_complete = false;
@@ -1665,7 +1734,7 @@ impl MqttTransport {
     }
 
     async fn mark_disconnected(&self) {
-        *self.state.noise.lock().await = None;
+        clear_noise(&self.state.noise).await;
         let mut health = self.state.health.lock().await;
         health.connected = false;
         health.handshake_complete = false;
@@ -1729,6 +1798,40 @@ impl Drop for NoiseChannel {
         if self.handshake.is_some() && self.session.is_none() {
             let _ = forget_cached_psk(self.state_dir.as_deref(), &self.node_id);
         }
+    }
+}
+
+// File locking, Argon2 and unfinished-handshake cache eviction must not block
+// a Tokio worker. A cancelled receiver leaves the old channel in its blocking
+// task; its result is dropped, never installed into a replacement generation.
+async fn receive_noise(
+    slot: &mut Option<NoiseChannel>,
+    data: Vec<u8>,
+    binary: bool,
+) -> Result<(Option<HiveMessage>, Vec<NoiseWrite>)> {
+    let channel = slot
+        .as_mut()
+        .ok_or_else(|| ThalovantError::Connection("Noise transport is not connected".into()))?;
+    if channel.session.is_some() {
+        return channel.receive(&data, binary);
+    }
+    let mut owned = slot.take().expect("checked above");
+    let (channel, result) = tokio::task::spawn_blocking(move || {
+        let result = owned.receive(&data, binary);
+        (owned, result)
+    })
+    .await
+    .map_err(|error| ThalovantError::Connection(format!("Noise worker failed: {error}")))?;
+    *slot = Some(channel);
+    result
+}
+
+async fn clear_noise(slot: &Mutex<Option<NoiseChannel>>) {
+    let channel = slot.lock().await.take();
+    if let Some(channel) = channel {
+        // Await when possible, but the worker remains owned if cleanup's
+        // caller deadline expires while it waits for another process's lock.
+        let _ = tokio::task::spawn_blocking(move || drop(channel)).await;
     }
 }
 

@@ -646,11 +646,17 @@ async fn collect_ask_reply(
         utterances: fragments,
         handled: failure_event.is_none(),
         ok: failure_event.is_none(),
-        session_id: context
-            .get("session")
-            .and_then(|value| value.get("session_id"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        session_id: events
+            .iter()
+            .filter_map(Event::session_id)
+            .find(|id| !id.trim().is_empty())
+            .or_else(|| {
+                context
+                    .get("session")
+                    .and_then(|value| value.get("session_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
         request_id: Some(request_id.to_string()),
         events,
         failure_event,
@@ -964,6 +970,40 @@ mod tests {
             } else {
                 assert!(matches!(result, Err(ThalovantError::Timeout(_))));
             }
+        }
+    }
+    #[tokio::test]
+    async fn ask_reports_the_hub_session_from_correlated_events() {
+        for requested in [None, Some("caller-session")] {
+            let context = context_with_correlation(None, requested, None, None, Some("request"));
+            let hub_context = context_with_correlation(
+                None,
+                Some("assigned-by-hub"),
+                None,
+                None,
+                Some("request"),
+            );
+            let (tx, mut receiver) = broadcast::channel(4);
+            tx.send(Event::new(
+                EVENT_SPEAK,
+                json!({"utterance":"reply"}).as_object().unwrap().clone(),
+                hub_context,
+                None,
+            ))
+            .unwrap();
+            let reply = collect_ask_reply(
+                &mut receiver,
+                &context,
+                "request",
+                Instant::now() + Duration::from_secs(1),
+                &AskOptions {
+                    reply_settle: Duration::ZERO,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(reply.session_id.as_deref(), Some("assigned-by-hub"));
         }
     }
 }

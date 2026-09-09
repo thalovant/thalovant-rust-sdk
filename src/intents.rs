@@ -517,12 +517,24 @@ pub(crate) async fn list_fallbacks<L: HubLink>(
             if skill_id.is_empty() {
                 return None;
             }
-            let priority = row
-                .get("priority")
-                .and_then(Value::as_i64)
-                .unwrap_or_else(|| {
-                    row.get("priority").and_then(Value::as_f64).unwrap_or(0.0) as i64
-                });
+            let priority = match row.get("priority") {
+                Some(Value::Bool(value)) => i64::from(*value),
+                Some(Value::Number(value)) => match value.as_i64() {
+                    Some(value) => value,
+                    None => {
+                        let value = value.as_f64()?;
+                        // Skip ranks that cannot be represented instead of
+                        // silently saturating and changing handler order.
+                        if !value.is_finite()
+                            || !(-9223372036854775808.0..9223372036854775808.0).contains(&value)
+                        {
+                            return None;
+                        }
+                        value as i64
+                    }
+                },
+                _ => 0,
+            };
             Some(HubFallback { skill_id, priority })
         })
         .collect();
@@ -2415,7 +2427,7 @@ mod tests {
         }
         assert!(!result.may_answer("en-us"));
         let hub = FakeHub {
-            fallback_response: json!({"fallbacks":[null, {}, {"skill_id":""}, {"skill_id":"z", "priority":12}, {"skill_id":"b", "priority":1.9}, {"skill_id":"a", "priority":1}]}),
+            fallback_response: json!({"fallbacks":[null, {}, {"skill_id":""}, {"skill_id":"z", "priority":12}, {"skill_id":"b", "priority":1.9}, {"skill_id":"a", "priority":1}, {"skill_id":"c", "priority":true}, {"skill_id":"d", "priority":false}, {"skill_id":"out-of-range", "priority":u64::MAX}]}),
             ..Default::default()
         };
         let result = inventory_with_capabilities(&hub, ["de-de"], &opts)
@@ -2427,7 +2439,15 @@ mod tests {
                 .iter()
                 .map(|row| row.skill_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["a", "b", "z"]
+            vec!["d", "a", "b", "c", "z"]
+        );
+        assert_eq!(
+            result
+                .fallbacks
+                .iter()
+                .map(|row| row.priority)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 1, 1, 12]
         );
         assert!(result.may_answer("de-de"));
         assert_eq!(result.as_value()["fallbacks_known"], true);

@@ -53,7 +53,18 @@ struct StateGuard {
 }
 
 fn lock_state(dir: Option<&Path>) -> Result<StateGuard> {
-    let thread = PIN_LOCK.lock().map_err(poisoned)?;
+    lock_state_with_timeout(dir, std::time::Duration::from_secs(5))
+}
+
+fn lock_state_with_timeout(dir: Option<&Path>, budget: std::time::Duration) -> Result<StateGuard> {
+    let deadline = std::time::Instant::now() + budget;
+    let thread = loop {
+        match PIN_LOCK.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => return Err(poisoned(error)),
+            Err(std::sync::TryLockError::WouldBlock) => wait_for_lock(deadline)?,
+        }
+    };
     let directory = resolve_dir(dir)?;
     let mut directories = fs::DirBuilder::new();
     directories.recursive(true);
@@ -81,11 +92,30 @@ fn lock_state(dir: Option<&Path>) -> Result<StateGuard> {
     }
     let file = options.open(&path)?;
     assert_secure_secret_file(&path, "Noise state lock")?;
-    fs2::FileExt::lock_exclusive(&file)?;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => break,
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                wait_for_lock(deadline)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     Ok(StateGuard {
         _thread: thread,
         _file: file,
     })
+}
+
+fn wait_for_lock(deadline: std::time::Instant) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(ThalovantError::Timeout(
+            "Noise state lock acquisition timed out".into(),
+        ));
+    }
+    std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+    Ok(())
 }
 
 /// Reject unexpected file types before reading any persisted trust or credentials.
@@ -302,23 +332,38 @@ fn publish_private(
 ) -> Result<()> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let unique = format!(
-        "{}.{}.{}.tmp",
+        "{}.{}.{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("noise"),
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        uuid::Uuid::new_v4(),
     );
     let temporary = directory.join(unique);
 
-    let result = write(&temporary, contents).and_then(|()| {
-        if exclusive {
-            fs::hard_link(&temporary, path)
-        } else {
-            fs::rename(&temporary, path)
+    // A staging collision is not a lost publication race and does not give
+    // this caller ownership of the existing staging file.
+    match write(&temporary, contents) {
+        Err(ThalovantError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ThalovantError::Io(std::io::Error::other(
+                "Noise staging path already exists; retry publication",
+            )));
         }
-        .map_err(ThalovantError::from)
-    });
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(()) => {}
+    }
+    let result = if exclusive {
+        fs::hard_link(&temporary, path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists { ThalovantError::Io(error) }
+            else { ThalovantError::Io(std::io::Error::new(error.kind(), format!("atomic Noise key publication requires a filesystem supporting hard links: {error}"))) }
+        })
+    } else {
+        fs::rename(&temporary, path).map_err(ThalovantError::from)
+    };
     let _ = fs::remove_file(&temporary);
     result
 }
@@ -773,5 +818,38 @@ mod tests {
         )
         .unwrap();
         assert!(load_noise_pin(Some(&dir), "hub").is_err());
+    }
+    #[test]
+    fn an_external_process_lock_has_a_finite_acquisition_budget() {
+        let dir = tempdir();
+        let mut holder = worker(&dir, "crash-static", 0);
+        wait_for_file(&dir.join("staged"));
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            lock_state_with_timeout(Some(&dir), std::time::Duration::from_millis(30)),
+            Err(ThalovantError::Timeout(_))
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
+        load_or_create_noise_key(Some(&dir)).unwrap();
+    }
+    #[test]
+    fn staging_collisions_do_not_claim_an_existing_published_key_or_remove_the_staging_file() {
+        let dir = tempdir();
+        let path = dir.join(NOISE_KEY_FILENAME);
+        let mut staged = None;
+        let error = publish_private(&path, "new-key", true, |temporary, _| {
+            write_private_at(temporary, "other-writer").unwrap();
+            staged = Some(temporary.to_path_buf());
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into())
+        })
+        .unwrap_err();
+        assert!(
+            !matches!(error, ThalovantError::Io(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(staged.unwrap()).unwrap(), "other-writer");
+        load_or_create_noise_key(Some(&dir)).unwrap();
     }
 }

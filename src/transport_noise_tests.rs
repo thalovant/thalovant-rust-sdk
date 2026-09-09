@@ -731,7 +731,9 @@ async fn mqtt_noise_tls_broker_reconnect_and_wrong_password() {
                 )
                 .await
                 .unwrap();
-            let event = timeout(Duration::from_secs(2), events.recv())
+            // This exchanges 1.2 MiB through native TLS and many Noise chunks;
+            // Windows SChannel runners need a transfer budget, not a 2s echo budget.
+            let event = timeout(Duration::from_secs(10), events.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -1285,9 +1287,13 @@ async fn concurrent_connect_waits_for_authentication_and_joiner_timeout_is_local
         tokio::spawn(async move { client.connect_with_timeout(Duration::from_secs(12)).await })
     };
     entered.notified().await;
-    while !wss.state.health.lock().await.connected {
-        tokio::task::yield_now().await;
-    }
+    timeout(Duration::from_secs(5), async {
+        while !wss.state.health.lock().await.connected {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the initiator never opened the socket");
     assert!(!client.healthcheck().await.handshake_complete);
     assert!(matches!(
         client.connect_with_timeout(Duration::from_millis(30)).await,
@@ -1384,9 +1390,13 @@ async fn cancelling_initiator_retires_its_generation_and_next_connect_recovers()
             tokio::spawn(async move { transport.connect().await })
         };
         opened.notified().await;
-        while !wss.state.health.lock().await.connected {
-            tokio::task::yield_now().await;
-        }
+        timeout(Duration::from_secs(5), async {
+            while !wss.state.health.lock().await.connected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the initiator never opened the socket");
         let joiner = {
             let transport = transport.clone();
             tokio::spawn(async move { transport.connect().await })
@@ -1450,4 +1460,129 @@ async fn http_cleanup_deadline_preserves_admission_until_acknowledged_retry() {
         vec!["XXpsk2", "KKpsk0"]
     );
     transport.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_external_store_lock_does_not_block_the_async_connection_deadline() {
+    struct Holder(std::process::Child);
+    impl Drop for Holder {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let fixture = HttpFixture::new().await;
+    let transport = fixture.transport();
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    let mut holder = Holder(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "noise_store::tests::store_process_worker",
+                "--nocapture",
+            ])
+            .env("THALOVANT_STORE_TEST_DIR", &dir.0)
+            .env("THALOVANT_STORE_TEST_OPERATION", "crash-static")
+            .env("THALOVANT_STORE_TEST_ID", "0")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    timeout(Duration::from_secs(10), async {
+        while !dir.0.join("staged").exists() {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let runtime = RuntimeTransport::Http(transport.clone());
+    let started = Instant::now();
+    let result = runtime
+        .connect_with_timeout(Duration::from_millis(50))
+        .await;
+    assert!(matches!(result, Err(ThalovantError::Timeout(_))));
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "a blocking file lock stalled the Tokio worker"
+    );
+    assert!(!transport.healthcheck().await.connected);
+    holder.0.kill().unwrap();
+    holder.0.wait().unwrap();
+    // A fresh attempt owns a new channel; the abandoned worker cannot install its result.
+    runtime
+        .connect_with_timeout(Duration::from_secs(12))
+        .await
+        .unwrap();
+    assert!(transport.healthcheck().await.handshake_complete);
+    transport.disconnect().await.unwrap();
+}
+
+#[tokio::test]
+async fn close_keeps_cleanup_owned_when_its_caller_stops_waiting() {
+    let fixture = HttpFixture::new().await;
+    let http = fixture.transport();
+    let transport = RuntimeTransport::Http(http.clone());
+    let gate = http.state.lifecycle.lock().await;
+    http.state.health.lock().await.connection.phase = TransportConnectionPhase::Ready;
+    assert!(timeout(Duration::from_millis(30), transport.disconnect())
+        .await
+        .is_err());
+    assert!(http.state.lifecycle.cancelled.load(Ordering::Acquire));
+    drop(gate);
+    timeout(Duration::from_secs(1), async {
+        while http.state.health.lock().await.connection.phase != TransportConnectionPhase::Closed {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_mqtt_cleanup_aborts_the_taken_event_loop_task() {
+    struct Signal(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for Signal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let identity = Identity::from_value(json!({"site_id":"test","key":"test","password":test_password(),"default_master":"https://example.invalid","mqtt":{"endpoint":"mqtts://example.invalid:8883","username":"test","password":"test","topic_prefix":"test","tls":true}})).unwrap();
+    let transport = MqttTransport::new(identity).unwrap();
+    let (stopped, receiver) = tokio::sync::oneshot::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    *transport.state.event_task.lock().await = Some(tokio::spawn(async move {
+        let _signal = Signal(Some(stopped));
+        let _ = started.send(());
+        std::future::pending::<()>().await;
+    }));
+    ready.await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(30), transport.disconnect_inner())
+            .await
+            .is_err()
+    );
+    timeout(Duration::from_secs(1), receiver)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(transport.state.event_task.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn failed_http_admission_reset_refreshes_both_health_errors() {
+    let fixture = HttpFixture::new().await;
+    let transport = fixture.transport();
+    transport.state.admitted.store(true, Ordering::Release);
+    fixture.state.lock().await.reject = Some("/disconnect".into());
+    let error = transport.connect_locked().await.unwrap_err();
+    let health = transport.healthcheck().await;
+    assert_eq!(
+        health.last_error.as_deref(),
+        Some(error.to_string().as_str())
+    );
+    assert_eq!(health.connection.last_error, health.last_error);
+    assert!(transport.state.admitted.load(Ordering::Acquire));
 }
