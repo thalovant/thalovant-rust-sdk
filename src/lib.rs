@@ -13,13 +13,14 @@ pub mod noise_store;
 pub mod protocols;
 mod redact;
 pub mod rich;
+pub mod stream;
 mod tls;
 pub mod transport;
 pub mod wire;
 
 pub use client::{
-    ActionOptions, Client, CodeOptions, Conversation, ConversationOptions, QueryOptions,
-    RequestOptions,
+    ActionOptions, AskOptions, Client, CodeOptions, Conversation, ConversationOptions,
+    QueryOptions, RequestOptions,
 };
 pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
@@ -36,9 +37,10 @@ pub use events::{
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use intents::{
-    HubIntent, HubIntentInventory, HubSkillIntents, IntentDefinition, IntentDescribeOptions,
-    IntentInventoryOptions, IntentInventorySource, IntentListOptions, IntentRegistration,
-    DEFAULT_INTENT_TIMEOUT, DESCRIBE_BATCH,
+    HubFallback, HubIntent, HubIntentCapabilities, HubIntentInventory, HubSkillIntents,
+    IntentDefinition, IntentDescribeOptions, IntentInventoryOptions, IntentInventorySource,
+    IntentListOptions, IntentRegistration, DEFAULT_INTENT_TIMEOUT, DESCRIBE_BATCH,
+    FALLBACK_PROBE_TIMEOUT,
 };
 pub use noise::{
     canonical_json, derive_psk, noise_protocol_name, select_noise_options, NoiseFrame,
@@ -54,6 +56,7 @@ pub use protocols::{
     HubProtocolSettings, SelectedHubEndpoint, DEFAULT_PROTOCOL_PREFERENCE,
 };
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
+pub use stream::{EventPredicate, EventStream, ListenOptions};
 pub use transport::{
     mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport, RuntimeTransport,
     TransportConnectionInfo, TransportConnectionPhase, TransportHealth, WssTransport,

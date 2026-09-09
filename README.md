@@ -9,7 +9,10 @@ Full docs: <https://docs.thalovant.com/developers/sdks/rust/>
 
 ## What You Need
 
-- Rust 1.85 or newer (tested in CI alongside the current stable compiler).
+- Rust 1.88 or newer (tested in CI alongside the current stable compiler).
+  Version 0.5.0 raises this minimum from 1.85 because the patched `time`
+  dependency required for HTTP replica cookies needs Rust 1.88. Upgrade your
+  compiler before upgrading the crate.
 - A Thalovant account with API access for authenticated control-plane actions.
 - A hub id or slug.
 - A client identity for that hub. You can create one through the API or use one
@@ -75,6 +78,11 @@ async fn main() -> thalovant::Result<()> {
 
 `ControlPlane::default()` uses `https://api.thalovant.com`. Use
 `ControlPlane::new(...)` only for local development or a self-hosted control plane.
+Control-plane requests never follow redirects: configure the final API URL.
+Authenticated requests and requests with a body require HTTPS. HTTP is allowed
+only for explicit `localhost`, `127.0.0.1`, and `[::1]` development endpoints.
+Credentials embedded in the API URL are refused, and HTTP transport errors omit
+the request URL.
 
 ## MFA Login
 
@@ -390,39 +398,54 @@ use thalovant::{Client, IntentInventoryOptions};
 
 let client = Client::from_file("_identity.json")?;
 let inventory = client
-    .intents(["en-us", "fr-fr"], IntentInventoryOptions::default())
+    .intents_with_capabilities(["en-us", "fr-fr"], IntentInventoryOptions::default())
     .await?;
-for skill in &inventory.skills {
+for skill in &inventory.inventory.skills {
     for intent in &skill.intents {
         println!("{} {:?}", intent.id(), intent.examples(Some("fr-fr"), 2));
     }
 }
+println!("French may be answered: {}", inventory.may_answer("fr-fr"));
 println!("{}", serde_json::to_string_pretty(&inventory)?);
 ```
 
 Each intent carries the sentences a person says to reach it, per language, as
 the skill wrote them (`{location}` marks a slot); `examples` shows whole
-sentences before ones with a slot. The hub's connection must always be allowed
-to publish `ovos.intent.list`. `ovos.intent.describe` is needed only when the
+sentences before ones with a slot. The preferred listing query is
+`ovos.intent.list`. `ovos.intent.describe` is needed only when the
 client has to ask for the definitions itself -- that is, `describe: true` (the
 default) *and* a runtime that did not attach each row's `definition` to the
 listing; a runtime that honours `include_definitions` is sent no describe at
 all. A hub that refuses answers `hive.policy.denied`, which the
 SDK returns at once as `ThalovantError::PolicyDenied` naming the type and the
-types the connection may publish. With the default `fallback: true`, a refused
-`ovos.intent.list` falls back to the engines' own manifests: the inventory then
+types the connection may publish. With the default `fallback: true`, a denied
+or silent `ovos.intent.list` falls back to the engines' own manifests: the inventory then
 lists intent names only, with `source` set to
-`IntentInventorySource::EngineManifests` and `denied` naming the refused query.
+`IntentInventorySource::EngineManifests` and `denied` naming the unavailable query.
+That legacy field is not proof of an ACL denial: a silent listing also records it.
 A listing the hub answers `ok: false` is a different thing -- the query failed,
 which is not an empty hub and not a refusal to fall back from -- and returns
 `ThalovantError::Runtime` carrying the hub's own wording.
+
+`intents_with_capabilities` additionally asks `ovos.skills.fallback.list` with a
+separate budget of at most 1.5 seconds. `fallbacks_known: false` means the hub
+could not report its fallback skills; `true` with an empty list means it reported
+none. `may_answer(lang)` is conservative: enabled phrases for that language,
+registered fallbacks, or unknown fallback support allow a request. It does not
+guarantee an answer. `list_fallbacks` exposes that optional query directly.
+The existing `intents` method still returns `HubIntentInventory` unchanged in
+shape; use the enriched method when deciding language availability.
 
 `list_intents(lang, IntentListOptions)` returns the manifest rows for one
 language and `describe_intent(skill_id, intent_name, lang, IntentDescribeOptions)`
 the registrations behind one intent, sentences included, for callers that want
 the two underlying queries. A large inventory is described in batches of
 `DESCRIBE_BATCH` (32) requests, so a hub with hundreds of intents neither
-outruns the bus channel nor receives the whole burst at once.
+outruns the bus channel nor receives the whole burst at once. All describe
+windows share one `IntentInventoryOptions::timeout` budget, including sends and
+reply collection. When that budget expires, earlier definitions remain and no
+later window is sent. Listing queries, initial connection, and the optional
+fallback probe have separate budgets.
 
 ## Use An Existing Identity
 
@@ -543,6 +566,24 @@ use thalovant::forget_cached_psk;
 
 forget_cached_psk(None, &node_id)?; // Or Some(state_dir.as_path()).
 ```
+
+Noise state operations use an OS lock shared across processes. A new static key
+is published only after complete bytes have been flushed; pin/cache updates are
+atomic transactions. Use a state directory on a filesystem supporting hard links
+and atomic replacement (such as NTFS or native Unix filesystems); unsupported
+filesystems fail safely without publishing partial keys. Lock acquisition is
+bounded, and async handshake work runs away from Tokio workers so another
+process's lock cannot stall a caller deadline. Interrupted or malformed trust files are never silently
+replaced. Existing state files must be regular files and private on Unix.
+
+Concurrent `connect_with_timeout` calls join authenticated readiness rather than
+returning when a socket merely opens. A joining caller's timeout or cancellation
+leaves the initiating connection alone; cancelling the initiator invalidates its
+own generation. Transport sends default to a 20-second bound and cleanup to two
+seconds for the caller; an owned worker continues cleanup after that deadline.
+MQTT allows its worker three seconds for offline publication and event-loop
+retirement. An unacknowledged HTTP cleanup retains this object's admission marker,
+so the next connection retries cleanup before admitting a fresh session.
 
 All three transports use the same Noise negotiation, authenticated framing, and
 peer pinning implementation; transport-specific connection and send ownership
@@ -743,7 +784,19 @@ for item in items {
   was created before that protocol was enabled.
 - MQTT fails immediately: create or download a fresh client identity after MQTT
   is enabled. MQTT needs the per-client `identity.mqtt` credentials.
-- A request times out: set `RequestOptions { timeout: Some(...), .. }`.
+- A request times out: set `RequestOptions { timeout: Some(...), .. }`. Ask and
+  Query use one deadline for connecting, writing, and collecting the answer.
+  `ask` waits briefly for delayed speech after a handled event or an intent miss;
+  recovered soft misses can succeed, while a policy denial remains a failure.
+  Empty completion is `ThalovantError::Timeout`. `ask_with_options(AskOptions)`
+  exposes `empty_reply_wait` (default five seconds) and `reply_settle` (default
+  250 milliseconds). Each window starts once, at the first qualifying event,
+  and stays within the request deadline. Ask collects while the write is pending
+  and returns available speech when that deadline expires. Hard policy denials or
+  query timeouts immediately freeze Ask/Query replies; later speech cannot change
+  the failed result. Ask reports a receive-buffer overflow as an error. Dropping
+  either request cancels its owned write and subscription; an uncertain Noise
+  write poisons only the captured session and is never replayed automatically.
 - `ThalovantError::PolicyDenied`: the hub's policy does not let this connection
   publish that message type (`ovos.intent.list`, say). Allow the type in the
   connection's settings in the dashboard; `allowed` lists what it may publish
@@ -814,10 +867,13 @@ resending. Per-plan limits are listed in the dashboard and at
 - `client.connection_info()`
 - `client.query(text, options)`
 - `client.ask(text, options)`
+- `client.ask_with_options(text, options)` (`AskOptions`; delayed speech and fragment collection)
 - `client.send_utterance(text, options)`
 - `client.send_action(payload, options)`
 - `client.send_code(value, options)`
 - `client.conversation(options)`
+- `client.intents_with_capabilities(languages, options)` (`HubIntentCapabilities`; fallback handlers and `may_answer`)
+- `client.list_fallbacks(timeout)` (optional fallback skill discovery)
 - `client.intents(languages, options)` (`IntentInventoryOptions`; the hub's intent manifest, sentences per language)
 - `client.list_intents(lang, options)` (`IntentListOptions`)
 - `client.describe_intent(skill_id, intent_name, lang, options)` (`IntentDescribeOptions`)
@@ -827,3 +883,27 @@ resending. Per-plan limits are listed in the dashboard and at
 ```bash
 cargo test
 ```
+
+### Scoped event waits and streams
+
+`wait_for_event(name, ListenOptions)` waits for one event with a twelve-second
+budget by default, including connection. `listen(name, ListenOptions)` returns
+an `EventStream` whose `recv().await` yields `Result<Option<Event>>`. Its optional
+timeout covers the stream's whole lifetime; without one it listens until closed.
+Set `max_events`, `request_id`, `session_id`, or a fast nonblocking `predicate`
+when needed. Matching request IDs take precedence over a rewritten hub session.
+
+```rust
+use thalovant::ListenOptions;
+let mut events = client.listen("speak", ListenOptions {
+    max_events: Some(2),
+    timeout: Some(std::time::Duration::from_secs(20)),
+    ..Default::default()
+}).await?;
+while let Some(event) = events.recv().await? { println!("{}", event.name); }
+```
+
+Each stream owns a bounded transport subscription. Overflow and connection loss
+are explicit errors. Drop or `close()` the stream to unsubscribe without closing
+the shared client. Cancelling an individual `recv` future leaves the stream
+usable; dropping a `wait_for_event` future releases its subscription.

@@ -2,13 +2,14 @@
 //! hub keys it has pinned, and the derived PSK credential cache.
 //!
 //! All three live beside the SDK config file, so `XDG_CONFIG_HOME` and the Windows
-//! `APPDATA` location are honored the same way, and all are written `0600`.
+//! `APPDATA` location are honored the same way. New files use `0600` on Unix;
+//! Windows files inherit the configuration directory's access controls.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use rand::RngCore;
 
@@ -41,14 +42,93 @@ pub const NOISE_PSK_FILENAME: &str = "noise_psks.json";
 /// Serializes the read-modify-write of the pin file, so two connections pinning
 /// different hubs at once cannot lose one another's entry.
 ///
-/// This coordinates threads in one process only. Two *processes* sharing a
-/// state directory can still each read the map, decide, and commit -- and the
-/// rename means the later commit wins, which can drop a pin the other just
-/// added and make that hub look like first contact again. Closing that needs an
-/// inter-process lock, which is a dependency this SDK does not carry today; the
-/// static key is handled separately, with `create_new`, because losing that
-/// race strands a client permanently rather than costing a re-pin.
+/// Each operation also holds an OS file lock, released even when its process
+/// exits. Keep the lock file in place: removing it could split concurrent
+/// callers across different inodes and lose the transaction boundary.
 static PIN_LOCK: Mutex<()> = Mutex::new(());
+
+struct StateGuard {
+    _thread: MutexGuard<'static, ()>,
+    _file: fs::File,
+}
+
+fn lock_state(dir: Option<&Path>) -> Result<StateGuard> {
+    lock_state_with_timeout(dir, std::time::Duration::from_secs(5))
+}
+
+fn lock_state_with_timeout(dir: Option<&Path>, budget: std::time::Duration) -> Result<StateGuard> {
+    let deadline = std::time::Instant::now() + budget;
+    let thread = loop {
+        match PIN_LOCK.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => return Err(poisoned(error)),
+            Err(std::sync::TryLockError::WouldBlock) => wait_for_lock(deadline)?,
+        }
+    };
+    let directory = resolve_dir(dir)?;
+    let mut directories = fs::DirBuilder::new();
+    directories.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directories.mode(0o700);
+    }
+    directories.create(&directory)?;
+    let path = directory.join(".noise.lock");
+    if let Ok(metadata) = path.symlink_metadata() {
+        if !metadata.file_type().is_file() {
+            return Err(ThalovantError::InvalidIdentity(
+                "Noise state lock must be a regular file".into(),
+            ));
+        }
+        assert_secure_secret_file(&path, "Noise state lock")?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&path)?;
+    assert_secure_secret_file(&path, "Noise state lock")?;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => break,
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                wait_for_lock(deadline)?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(StateGuard {
+        _thread: thread,
+        _file: file,
+    })
+}
+
+fn wait_for_lock(deadline: std::time::Instant) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(ThalovantError::Timeout(
+            "Noise state lock acquisition timed out".into(),
+        ));
+    }
+    std::thread::sleep(remaining.min(std::time::Duration::from_millis(10)));
+    Ok(())
+}
+
+/// Reject unexpected file types before reading any persisted trust or credentials.
+fn validate_state_file(path: &Path, label: &str) -> Result<()> {
+    match path.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_file() => assert_secure_secret_file(path, label),
+        Ok(_) => Err(ThalovantError::InvalidIdentity(format!(
+            "{label} must be a regular file"
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 
 /// The directory holding the static key and the pin file.
 pub fn noise_state_dir() -> Result<PathBuf> {
@@ -75,11 +155,11 @@ pub fn load_or_create_noise_key(dir: Option<&Path>) -> Result<[u8; 32]> {
     let dir = resolve_dir(dir)?;
     let path = dir.join(NOISE_KEY_FILENAME);
 
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let _guard = lock_state(Some(&dir))?;
 
+    validate_state_file(&path, "Noise key file")?;
     match fs::read_to_string(&path) {
         Ok(raw) => {
-            assert_secure_secret_file(&path, "Noise key file")?;
             let decoded = hex::decode(raw.trim()).map_err(|_| {
                 ThalovantError::InvalidIdentity(format!(
                     "Noise key file {} is not a 32-byte hex key",
@@ -98,12 +178,9 @@ pub fn load_or_create_noise_key(dir: Option<&Path>) -> Result<[u8; 32]> {
             let mut key = [0_u8; 32];
             rand::thread_rng().fill_bytes(&mut key);
             fs::create_dir_all(&dir)?;
-            // create_new at the final path, not a rename: PIN_LOCK only covers
-            // this process, so another process can be generating a key at the
-            // same moment. Renaming over the destination would leave one of
-            // them holding a key that is not the one on disk -- and the hub
-            // pins what it was shown, so that client would be refused for good.
-            // Losing the create means the other process won; read its key.
+            // Publish only complete, flushed bytes without replacing a winner.
+            // A killed writer leaves an untrusted temporary file, never a
+            // partially written static identity at the trusted path.
             match write_private_exclusive(&path, &hex::encode(key)) {
                 Ok(()) => Ok(key),
                 Err(ThalovantError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -118,7 +195,7 @@ pub fn load_or_create_noise_key(dir: Option<&Path>) -> Result<[u8; 32]> {
 
 /// Read a static key that is already on disk, enforcing its permissions.
 fn load_existing_noise_key(path: &Path) -> Result<[u8; 32]> {
-    assert_secure_secret_file(path, "Noise key file")?;
+    validate_state_file(path, "Noise key file")?;
     let raw = fs::read_to_string(path)?;
     let decoded = hex::decode(raw.trim()).map_err(|_| {
         ThalovantError::InvalidIdentity(format!(
@@ -137,7 +214,7 @@ fn load_existing_noise_key(path: &Path) -> Result<[u8; 32]> {
 /// The pinned hub static key for a node id, or `None` when this client has not
 /// seen that hub before.
 pub fn load_noise_pin(dir: Option<&Path>, node_id: &str) -> Result<Option<String>> {
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let _guard = lock_state(dir)?;
     let (pins, _) = read_pins(dir)?;
     Ok(pins.get(node_id).cloned())
 }
@@ -147,7 +224,7 @@ pub fn save_noise_pin(dir: Option<&Path>, node_id: &str, public_key: &str) -> Re
     if node_id.trim().is_empty() || public_key.trim().is_empty() {
         return Ok(());
     }
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let _guard = lock_state(dir)?;
     let (mut pins, path) = read_pins(dir)?;
     if pins
         .get(node_id)
@@ -173,7 +250,7 @@ pub fn pin_hub_key(dir: Option<&Path>, node_id: &str, remote_static_key: &str) -
     if remote_static_key.is_empty() {
         return Ok(());
     }
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let _guard = lock_state(dir)?;
     let (mut pins, path) = read_pins(dir)?;
     match pins.get(node_id) {
         None => {
@@ -193,7 +270,7 @@ pub fn pin_hub_key(dir: Option<&Path>, node_id: &str, remote_static_key: &str) -
 /// Use it when a hub was deliberately reinstalled or replaced. A pin that stops
 /// matching on its own is a failure to investigate, not one to clear.
 pub fn forget_noise_pin(dir: Option<&Path>, node_id: &str) -> Result<()> {
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let _guard = lock_state(dir)?;
     let (mut pins, path) = read_pins(dir)?;
     if pins.remove(node_id).is_none() {
         return Ok(());
@@ -203,6 +280,7 @@ pub fn forget_noise_pin(dir: Option<&Path>, node_id: &str) -> Result<()> {
 
 fn read_pins(dir: Option<&Path>) -> Result<(BTreeMap<String, String>, PathBuf)> {
     let path = resolve_dir(dir)?.join(NOISE_PINS_FILENAME);
+    validate_state_file(&path, "Noise pin file")?;
     match fs::read_to_string(&path) {
         Ok(raw) => {
             let pins = serde_json::from_str(&raw).map_err(|err| {
@@ -232,7 +310,7 @@ fn write_pins(path: &Path, pins: &BTreeMap<String, String>) -> Result<()> {
 /// Used where losing the race must be observable rather than silently
 /// overwriting: whoever creates the file first owns the value.
 fn write_private_exclusive(path: &Path, contents: &str) -> Result<()> {
-    write_private_at(path, contents)
+    publish_private(path, contents, true, write_private_at)
 }
 
 /// Write a secret file atomically: a uniquely named temporary file in the same
@@ -243,22 +321,50 @@ fn write_private_exclusive(path: &Path, contents: &str) -> Result<()> {
 /// the next connection look like first contact and silently re-pin whatever key
 /// it is offered.
 fn write_private(path: &Path, contents: &str) -> Result<()> {
+    publish_private(path, contents, false, write_private_at)
+}
+
+fn publish_private(
+    path: &Path,
+    contents: &str,
+    exclusive: bool,
+    write: impl FnOnce(&Path, &str) -> Result<()>,
+) -> Result<()> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let unique = format!(
-        "{}.{}.{}.tmp",
+        "{}.{}.{}.{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("noise"),
         std::process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed),
+        uuid::Uuid::new_v4(),
     );
     let temporary = directory.join(unique);
 
-    let result = write_private_at(&temporary, contents)
-        .and_then(|()| fs::rename(&temporary, path).map_err(ThalovantError::from));
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    // A staging collision is not a lost publication race and does not give
+    // this caller ownership of the existing staging file.
+    match write(&temporary, contents) {
+        Err(ThalovantError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(ThalovantError::Io(std::io::Error::other(
+                "Noise staging path already exists; retry publication",
+            )));
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(()) => {}
     }
+    let result = if exclusive {
+        fs::hard_link(&temporary, path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists { ThalovantError::Io(error) }
+            else { ThalovantError::Io(std::io::Error::new(error.kind(), format!("atomic Noise key publication requires a filesystem supporting hard links: {error}"))) }
+        })
+    } else {
+        fs::rename(&temporary, path).map_err(ThalovantError::from)
+    };
+    let _ = fs::remove_file(&temporary);
     result
 }
 
@@ -307,7 +413,7 @@ pub fn load_cached_psk(dir: Option<&Path>, node_id: &str) -> Result<Option<[u8; 
     if node_id.trim().is_empty() {
         return Ok(None);
     }
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let _guard = lock_state(dir)?;
     let (cache, _) = read_psk_cache(dir)?;
     let Some(encoded) = cache.get(node_id) else {
         return Ok(None);
@@ -323,7 +429,7 @@ pub fn save_cached_psk(dir: Option<&Path>, node_id: &str, psk: &[u8; 32]) -> Res
     if node_id.trim().is_empty() {
         return Ok(());
     }
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let _guard = lock_state(dir)?;
     let (mut cache, path) = read_psk_cache(dir)?;
     let encoded = hex::encode(psk);
     if cache
@@ -341,7 +447,7 @@ pub fn save_cached_psk(dir: Option<&Path>, node_id: &str, psk: &[u8; 32]) -> Res
 /// The handshake calls this when the hub rejects the key we offered, which is
 /// how a password rotated elsewhere is noticed: the next attempt derives again.
 pub fn forget_cached_psk(dir: Option<&Path>, node_id: &str) -> Result<()> {
-    let _guard = PIN_LOCK.lock().map_err(poisoned)?;
+    let _guard = lock_state(dir)?;
     let (mut cache, path) = read_psk_cache(dir)?;
     if cache.remove(node_id).is_none() {
         return Ok(());
@@ -351,6 +457,7 @@ pub fn forget_cached_psk(dir: Option<&Path>, node_id: &str) -> Result<()> {
 
 fn read_psk_cache(dir: Option<&Path>) -> Result<(BTreeMap<String, String>, PathBuf)> {
     let path = resolve_dir(dir)?.join(NOISE_PSK_FILENAME);
+    validate_state_file(&path, "Noise PSK cache")?;
     match fs::read_to_string(&path) {
         Ok(raw) => {
             assert_secure_secret_file(&path, "Noise PSK cache")?;
@@ -415,14 +522,8 @@ mod tests {
         );
     }
 
-    /// The create race is closed by `create_new` semantics: the second writer
-    /// must be told the file exists rather than replacing it, so
-    /// `load_or_create_noise_key` can reload the winner's key.
-    ///
-    /// This pins that primitive. The full race needs the file to be absent at
-    /// the read and present at the create, which one process cannot stage
-    /// without injecting a delay into the function under test -- so what is
-    /// asserted here is the property the fix rests on, not the interleaving.
+    /// Complete publication cannot replace an existing identity, including a
+    /// writer that does not cooperate with our lock-file convention.
     #[test]
     fn creating_a_static_key_never_replaces_an_existing_one() {
         let dir = tempdir();
@@ -471,6 +572,201 @@ mod tests {
         }
     }
 
+    #[test]
+    fn interrupted_staging_never_publishes_or_replaces_trust() {
+        for exclusive in [true, false] {
+            for complete in [true, false] {
+                let dir = tempdir();
+                let path = dir.join(if exclusive {
+                    NOISE_KEY_FILENAME
+                } else {
+                    NOISE_PINS_FILENAME
+                });
+                if !exclusive {
+                    write_private(&path, "original trust").unwrap();
+                }
+                let error =
+                    publish_private(&path, &"ab".repeat(32), exclusive, |temporary, contents| {
+                        assert_ne!(temporary, path);
+                        write_private_at(
+                            temporary,
+                            if complete { contents } else { &contents[..32] },
+                        )?;
+                        Err(std::io::Error::other("injected write/flush failure").into())
+                    })
+                    .unwrap_err();
+                assert!(error.to_string().contains("injected"));
+                if exclusive {
+                    assert!(!path.exists());
+                } else {
+                    assert_eq!(fs::read_to_string(&path).unwrap(), "original trust");
+                }
+                assert!(!fs::read_dir(&dir).unwrap().any(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "tmp")));
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    struct ChildWorker(std::process::Child);
+    impl Drop for ChildWorker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn worker(dir: &Path, operation: &str, id: usize) -> ChildWorker {
+        ChildWorker(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "noise_store::tests::store_process_worker",
+                    "--nocapture",
+                ])
+                .env("THALOVANT_STORE_TEST_DIR", dir)
+                .env("THALOVANT_STORE_TEST_OPERATION", operation)
+                .env("THALOVANT_STORE_TEST_ID", id.to_string())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn wait_for_file(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not reach {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn store_process_worker() {
+        let Some(directory) = std::env::var_os("THALOVANT_STORE_TEST_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(directory);
+        let operation = std::env::var("THALOVANT_STORE_TEST_OPERATION").unwrap();
+        let id: usize = std::env::var("THALOVANT_STORE_TEST_ID")
+            .unwrap()
+            .parse()
+            .unwrap();
+        if operation.starts_with("crash") {
+            let _guard = lock_state(Some(&dir)).unwrap();
+            let exclusive = operation == "crash-static";
+            let path = dir.join(if exclusive {
+                NOISE_KEY_FILENAME
+            } else {
+                NOISE_PINS_FILENAME
+            });
+            let _ = publish_private(&path, &"cd".repeat(32), exclusive, |temporary, contents| {
+                write_private_at(temporary, if id == 0 { &contents[..32] } else { contents })?;
+                fs::write(dir.join("staged"), b"ready")?;
+                loop {
+                    std::thread::park();
+                }
+            });
+        } else {
+            fs::write(dir.join(format!("ready-{id}")), b"ready").unwrap();
+            wait_for_file(&dir.join("go"));
+            let key = load_or_create_noise_key(Some(&dir)).unwrap();
+            fs::write(dir.join(format!("result-{id}")), hex::encode(key)).unwrap();
+            if operation == "distinct" {
+                for index in 0..12 {
+                    let node = format!("hub-{id}-{index}");
+                    pin_hub_key(Some(&dir), &node, &format!("{:02x}", id + 1).repeat(32)).unwrap();
+                }
+            } else {
+                let result = pin_hub_key(
+                    Some(&dir),
+                    "contested",
+                    &format!("{:02x}", id + 1).repeat(32),
+                );
+                fs::write(
+                    dir.join(format!("pin-{id}")),
+                    if result.is_ok() { "won" } else { "lost" },
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn killed_writer_leaves_only_untrusted_staging_and_releases_lock() {
+        for operation in ["crash-static", "crash-pin"] {
+            for complete in [0, 1] {
+                let dir = tempdir();
+                if operation == "crash-pin" {
+                    pin_hub_key(Some(&dir), "preserved", &"12".repeat(32)).unwrap();
+                }
+                let mut child = worker(&dir, operation, complete);
+                wait_for_file(&dir.join("staged"));
+                if operation == "crash-static" {
+                    assert!(!dir.join(NOISE_KEY_FILENAME).exists());
+                }
+                child.0.kill().unwrap();
+                child.0.wait().unwrap();
+                let key = load_or_create_noise_key(Some(&dir)).unwrap();
+                assert_eq!(load_or_create_noise_key(Some(&dir)).unwrap(), key);
+                if operation == "crash-pin" {
+                    assert_eq!(
+                        load_noise_pin(Some(&dir), "preserved").unwrap(),
+                        Some("12".repeat(32))
+                    );
+                }
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn independent_processes_preserve_one_key_and_transactional_pins() {
+        for operation in ["distinct", "conflicting"] {
+            let dir = tempdir();
+            let mut children: Vec<_> = (0..6).map(|id| worker(&dir, operation, id)).collect();
+            for id in 0..6 {
+                wait_for_file(&dir.join(format!("ready-{id}")));
+            }
+            fs::write(dir.join("go"), b"start").unwrap();
+            for child in &mut children {
+                assert!(child.0.wait().unwrap().success());
+            }
+            let expected = hex::encode(load_or_create_noise_key(Some(&dir)).unwrap());
+            for id in 0..6 {
+                assert_eq!(
+                    fs::read_to_string(dir.join(format!("result-{id}"))).unwrap(),
+                    expected
+                );
+            }
+            if operation == "distinct" {
+                for id in 0..6 {
+                    for index in 0..12 {
+                        assert_eq!(
+                            load_noise_pin(Some(&dir), &format!("hub-{id}-{index}")).unwrap(),
+                            Some(format!("{:02x}", id + 1).repeat(32))
+                        );
+                    }
+                }
+            } else {
+                let winners = (0..6)
+                    .filter(|id| {
+                        fs::read_to_string(dir.join(format!("pin-{id}"))).unwrap() == "won"
+                    })
+                    .count();
+                assert_eq!(winners, 1);
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     /// A unique directory under the system temp dir; removed on the next run of
     /// the same name rather than tracked, which keeps this dependency-free.
     fn tempdir() -> PathBuf {
@@ -483,5 +779,77 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+    #[test]
+    fn corrupt_trust_files_are_preserved_and_never_reset() {
+        let dir = tempdir();
+        let key = dir.join(NOISE_KEY_FILENAME);
+        write_private_at(&key, "incomplete").unwrap();
+        assert!(load_or_create_noise_key(Some(&dir)).is_err());
+        assert_eq!(fs::read_to_string(&key).unwrap(), "incomplete");
+        let pins = dir.join(NOISE_PINS_FILENAME);
+        write_private_at(&pins, "{partial").unwrap();
+        assert!(pin_hub_key(Some(&dir), "hub", &"aa".repeat(32)).is_err());
+        assert_eq!(fs::read_to_string(&pins).unwrap(), "{partial");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_and_exposed_pins_are_refused() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for filename in [NOISE_KEY_FILENAME, NOISE_PINS_FILENAME, NOISE_PSK_FILENAME] {
+            let dir = tempdir();
+            let outside = dir.join("outside");
+            write_private_at(&outside, "{}").unwrap();
+            symlink(&outside, dir.join(filename)).unwrap();
+            let rejected = match filename {
+                NOISE_KEY_FILENAME => load_or_create_noise_key(Some(&dir)).is_err(),
+                NOISE_PINS_FILENAME => load_noise_pin(Some(&dir), "hub").is_err(),
+                _ => load_cached_psk(Some(&dir), "hub").is_err(),
+            };
+            assert!(rejected);
+            assert_eq!(fs::read_to_string(outside).unwrap(), "{}");
+        }
+        let dir = tempdir();
+        pin_hub_key(Some(&dir), "hub", &"aa".repeat(32)).unwrap();
+        fs::set_permissions(
+            dir.join(NOISE_PINS_FILENAME),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(load_noise_pin(Some(&dir), "hub").is_err());
+    }
+    #[test]
+    fn an_external_process_lock_has_a_finite_acquisition_budget() {
+        let dir = tempdir();
+        let mut holder = worker(&dir, "crash-static", 0);
+        wait_for_file(&dir.join("staged"));
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            lock_state_with_timeout(Some(&dir), std::time::Duration::from_millis(30)),
+            Err(ThalovantError::Timeout(_))
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        holder.0.kill().unwrap();
+        holder.0.wait().unwrap();
+        load_or_create_noise_key(Some(&dir)).unwrap();
+    }
+    #[test]
+    fn staging_collisions_do_not_claim_an_existing_published_key_or_remove_the_staging_file() {
+        let dir = tempdir();
+        let path = dir.join(NOISE_KEY_FILENAME);
+        let mut staged = None;
+        let error = publish_private(&path, "new-key", true, |temporary, _| {
+            write_private_at(temporary, "other-writer").unwrap();
+            staged = Some(temporary.to_path_buf());
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into())
+        })
+        .unwrap_err();
+        assert!(
+            !matches!(error, ThalovantError::Io(ref error) if error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert!(!path.exists());
+        assert_eq!(fs::read_to_string(staged.unwrap()).unwrap(), "other-writer");
+        load_or_create_noise_key(Some(&dir)).unwrap();
     }
 }

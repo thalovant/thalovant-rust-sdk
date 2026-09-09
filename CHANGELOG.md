@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0
+
+- Share one absolute timeout across every intent-description window, retain earlier answers, and stop publishing after the budget expires.
+
+- Add `listen`, `wait_for_event`, `ListenOptions`, and `EventStream::recv` with scoped correlation, total deadlines, predicate filters, limits, cancellation-safe subscription ownership, and explicit overflow or disconnect errors.
+- Refuse control-plane redirects, including 307/308 login-body replay, require HTTPS for authenticated requests and request bodies outside explicit loopback development endpoints, and remove request URLs from transport errors.
+- Validate device verification URLs before prompting or launching a browser; allow only HTTP(S) without embedded credentials and use direct platform commands without a shell.
+- Flush complete MQTT broker-fixture packets before waiting for more input, with a buffered-writer regression and native TLS coverage on Windows.
+
+- Raise the minimum Rust version from 1.85 to 1.88 and upgrade `time` to 0.3.55 to fix RUSTSEC-2026-0009 (RFC2822 parser stack exhaustion). HTTP cookie affinity requires this dependency; upgrade the compiler before upgrading the crate.
+
+- Preserve complete Noise identities with atomic publication and OS locks across processes. Interrupted writers cannot publish partial keys, pin transactions cannot lose another process's changes, and malformed or exposed trust files remain errors without automatic reset. Bound OS lock waits and move handshake/store work off Tokio workers so caller deadlines remain responsive.
+- Join concurrent connections only after authenticated Noise readiness. A joining caller owns its own deadline; cancellation of the initiating caller retires only that connection generation. Bound transport writes and the caller's cleanup wait, retain cleanup workers after cancellation, abort taken MQTT tasks safely, and retain unacknowledged HTTP admission for a later cleanup attempt.
+- Report the first nonempty hub-assigned session from accepted Query events, falling back to the requested session when none is supplied, consistent with Ask.
+- Collect Ask/Query replies concurrently with sending; hard failures immediately freeze partial replies. Ask returns received speech at its total deadline even if the write stalls, uses fixed first-event speech windows, reports buffer overflow, and cancels the owned write when collection ends.
+- Include connection, send, and response collection in Ask/Query deadlines. Add `AskOptions` and `ask_with_options` for delayed speech and fragment collection, recover soft intent misses when speech arrives, and report empty completion as a timeout. Existing options struct literals remain compatible.
+- Fall back to engine manifests when intent listing is denied or silent. Add `intents_with_capabilities`, `HubIntentCapabilities`, `HubFallback`, and `list_fallbacks`; distinguish unknown fallback support from a confirmed empty list and expose conservative `may_answer(language)`. The legacy `denied` field names an unavailable query and is not proof of an ACL denial.
+- Exercise stable Rust on Linux, macOS, and Windows, test the declared Rust 1.88 minimum, and audit freshly resolved dependencies in CI. Add failure, cancellation, concurrency, interrupted-write, and fallback-discovery regressions.
+
 ## 0.4.8
 
 - Drive WSS, HTTP, and MQTT through one Noise handshake, authenticated framing, and hub trust implementation. Preserve WSS writer ordering and cancellation poisoning, and keep HTTP/MQTT lifecycle ownership unchanged.

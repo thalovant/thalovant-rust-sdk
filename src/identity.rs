@@ -412,6 +412,8 @@ fn assert_secure_identity_file(path: &Path) -> Result<()> {
 
 pub(crate) fn assert_secure_secret_file(path: &Path, description: &str) -> Result<()> {
     let metadata = fs::metadata(path)?;
+    #[cfg(not(unix))]
+    let _ = (&metadata, description);
     #[cfg(unix)]
     {
         if metadata.permissions().mode() & 0o077 != 0 {
@@ -426,6 +428,7 @@ pub(crate) fn assert_secure_secret_file(path: &Path, description: &str) -> Resul
     Ok(())
 }
 
+#[cfg(unix)]
 fn capitalize(value: &str) -> String {
     let mut chars = value.chars();
     match chars.next() {
