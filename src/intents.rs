@@ -82,7 +82,9 @@ pub(crate) const DEFAULT_LANG: &str = "en-us";
 /// falls back to the engines' manifests when `ovos.intent.list` is denied or silent.
 #[derive(Clone, Debug)]
 pub struct IntentInventoryOptions {
-    /// Deadline for each listing, and for the whole batch of describes. Default 5s.
+    /// Deadline for each listing and one shared deadline across all describe
+    /// windows, including their sends and replies. Default 5s. Initial connection
+    /// and other inventory phases have separate budgets.
     pub timeout: Option<Duration>,
     /// Ask for the sentences behind every template intent. Off, the inventory
     /// carries the intents and their engines but no phrases.
@@ -842,17 +844,20 @@ type Wanted = (String, String, String);
 /// One subscription per batch, one request id per registration, replies
 /// matched by that id, repeats dropped. A hub that does not echo the id is
 /// matched by the definition's own `skill_id`/`intent_name`/`lang`. The
-/// deadline covers each batch, so a hub that answers nothing fails after one
-/// batch rather than holding every request open. A partial answer is still an
-/// answer, within a window and across them: the intents the hub did not
-/// describe in time are simply absent from the result, and only a call where
-/// no window answered at all is a timeout. `batch` 0 sends them all at once.
+/// deadline covers all windows, including sends and reply collection. Once it
+/// expires, no later window is sent. Partial answers from completed windows
+/// survive; intents not described in time are absent from the result. Only a
+/// call where no window answered at all is a timeout. `batch` 0 sends them all
+/// at once.
 pub(crate) async fn describe_many<L: HubLink>(
     link: &L,
     wanted: &[Wanted],
     deadline: Duration,
     batch: usize,
 ) -> Result<HashMap<Wanted, Vec<IntentDefinition>>> {
+    let end = Instant::now()
+        .checked_add(deadline)
+        .ok_or_else(|| ThalovantError::Runtime("intent describe timeout is too large".into()))?;
     let mut unique: Vec<Wanted> = Vec::new();
     for key in wanted {
         if !unique.contains(key) {
@@ -862,7 +867,7 @@ pub(crate) async fn describe_many<L: HubLink>(
     if batch > 0 && unique.len() > batch {
         let mut found: HashMap<Wanted, Vec<IntentDefinition>> = HashMap::new();
         for window in unique.chunks(batch) {
-            match describe_one_batch(link, window, deadline).await {
+            match describe_one_batch(link, window, end).await {
                 Ok(described) => found.extend(described),
                 // A partial answer is an answer across windows as within one.
                 // Windows are contiguous slices of the work, so a skill that
@@ -878,17 +883,20 @@ pub(crate) async fn describe_many<L: HubLink>(
                 }
                 Err(error) => return Err(error),
             }
+            if Instant::now() >= end {
+                break;
+            }
         }
         return Ok(found);
     }
-    describe_one_batch(link, &unique, deadline).await
+    describe_one_batch(link, &unique, end).await
 }
 
 /// One describe window: every request out, then the replies, then done.
 async fn describe_one_batch<L: HubLink>(
     link: &L,
     unique: &[Wanted],
-    deadline: Duration,
+    end: Instant,
 ) -> Result<HashMap<Wanted, Vec<IntentDefinition>>> {
     let mut found: HashMap<Wanted, Vec<IntentDefinition>> = HashMap::new();
     if unique.is_empty() {
@@ -897,8 +905,12 @@ async fn describe_one_batch<L: HubLink>(
 
     let mut receiver = link.subscribe();
     let mut by_request: HashMap<String, Wanted> = HashMap::new();
-    let end = Instant::now() + deadline;
     for key in unique {
+        if Instant::now() >= end {
+            return Err(ThalovantError::Timeout(
+                "intent describe send timed out".into(),
+            ));
+        }
         let (skill_id, intent_name, lang) = key;
         let request_id = new_request_id();
         by_request.insert(request_id.clone(), key.clone());
@@ -2173,7 +2185,7 @@ mod tests {
         };
         let inventory = inventory(&hub, ["en-us"], &options(Some(Duration::from_millis(200))))
             .await
-            .expect("two silent windows must not fail the inventory");
+            .expect("a silent later window must not fail the inventory");
 
         assert_eq!(inventory.intents().count(), 69, "every intent is listed");
         assert!(inventory.has_phrases());
@@ -2194,6 +2206,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_expired_describe_budget_never_publishes() {
+        let hub = FakeHub::default();
+        let wanted = vec![(WEATHER.into(), "current.weather".into(), "en-us".into())];
+        assert!(matches!(
+            describe_many(&hub, &wanted, Duration::ZERO, 1).await,
+            Err(ThalovantError::Timeout(_))
+        ));
+        assert!(hub.emitted(EVENT_INTENT_DESCRIBE).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn describe_windows_share_one_deadline_and_keep_earlier_answers() {
+        struct SlowFirstDescribe(FakeHub);
+        impl HubLink for SlowFirstDescribe {
+            fn subscribe(&self) -> broadcast::Receiver<Event> {
+                self.0.subscribe()
+            }
+            fn site_id(&self) -> Option<String> {
+                self.0.site_id()
+            }
+            async fn emit_bus(&self, event_type: &str, data: Data, context: Context) -> Result<()> {
+                if event_type == EVENT_INTENT_DESCRIBE
+                    && self.0.emitted(EVENT_INTENT_DESCRIBE).is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                }
+                self.0.emit_bus(event_type, data, context).await
+            }
+        }
+        let hub = SlowFirstDescribe(FakeHub {
+            registrations: many_registrations("en-us", 3),
+            describe_answer_limit: Some(1),
+            ..Default::default()
+        });
+        let wanted: Vec<Wanted> = (0..3)
+            .map(|index| (WEATHER.into(), format!("intent.{index:03}"), "en-us".into()))
+            .collect();
+        let budget = Duration::from_millis(100);
+        let started = Instant::now();
+        let found = describe_many(&hub, &wanted, budget, 1).await.unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "the answered first window remains available"
+        );
+        assert_eq!(found[&wanted[0]][0].samples, vec!["sentence number 0"]);
+        assert!(
+            started.elapsed() <= budget + Duration::from_millis(1),
+            "the slow first window consumed the shared budget: elapsed {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            hub.0.emitted(EVENT_INTENT_DESCRIBE).len(),
+            2,
+            "no third window may publish after the shared deadline"
+        );
     }
 
     #[tokio::test]

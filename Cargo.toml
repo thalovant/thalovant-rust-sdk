@@ -43,5 +43,6 @@ time = { version = "=0.3.55", default-features = false }
 idna_adapter = "=1.2.0"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 rcgen = "=0.14.5"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

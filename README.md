@@ -441,7 +441,11 @@ language and `describe_intent(skill_id, intent_name, lang, IntentDescribeOptions
 the registrations behind one intent, sentences included, for callers that want
 the two underlying queries. A large inventory is described in batches of
 `DESCRIBE_BATCH` (32) requests, so a hub with hundreds of intents neither
-outruns the bus channel nor receives the whole burst at once.
+outruns the bus channel nor receives the whole burst at once. All describe
+windows share one `IntentInventoryOptions::timeout` budget, including sends and
+reply collection. When that budget expires, earlier definitions remain and no
+later window is sent. Listing queries, initial connection, and the optional
+fallback probe have separate budgets.
 
 ## Use An Existing Identity
 

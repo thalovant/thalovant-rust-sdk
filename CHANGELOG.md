@@ -2,6 +2,8 @@
 
 ## 0.5.0
 
+- Share one absolute timeout across every intent-description window, retain earlier answers, and stop publishing after the budget expires.
+
 - Add `listen`, `wait_for_event`, `ListenOptions`, and `EventStream::recv` with scoped correlation, total deadlines, predicate filters, limits, cancellation-safe subscription ownership, and explicit overflow or disconnect errors.
 - Refuse control-plane redirects, including 307/308 login-body replay, require HTTPS for authenticated requests and request bodies outside explicit loopback development endpoints, and remove request URLs from transport errors.
 - Validate device verification URLs before prompting or launching a browser; allow only HTTP(S) without embedded credentials and use direct platform commands without a shell.
