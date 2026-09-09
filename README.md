@@ -790,7 +790,13 @@ for item in items {
   recovered soft misses can succeed, while a policy denial remains a failure.
   Empty completion is `ThalovantError::Timeout`. `ask_with_options(AskOptions)`
   exposes `empty_reply_wait` (default five seconds) and `reply_settle` (default
-  250 milliseconds); both stay within the request deadline.
+  250 milliseconds). Each window starts once, at the first qualifying event,
+  and stays within the request deadline. Ask collects while the write is pending
+  and returns available speech when that deadline expires. Hard policy denials or
+  query timeouts immediately freeze Ask/Query replies; later speech cannot change
+  the failed result. Ask reports a receive-buffer overflow as an error. Dropping
+  either request cancels its owned write and subscription; an uncertain Noise
+  write poisons only the captured session and is never replayed automatically.
 - `ThalovantError::PolicyDenied`: the hub's policy does not let this connection
   publish that message type (`ovos.intent.list`, say). Allow the type in the
   connection's settings in the dashboard; `allowed` lists what it may publish

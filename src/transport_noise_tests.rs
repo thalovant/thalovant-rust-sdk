@@ -1193,10 +1193,11 @@ fn shared_noise_rejects_duplicate_hello_and_a_changed_pinned_peer() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers() {
-    // A small receive window makes backpressure independent of the host's
-    // loopback socket buffers. The peer signals an actual application chunk.
+    // One encrypted chunk fits in the receive window on every platform, while
+    // the 16 MiB message still exceeds loopback buffers after the peer stops.
+    // The peer signals an actual application chunk before cancellation.
     let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.set_recv_buffer_size(4096).unwrap();
+    socket.set_recv_buffer_size(128 * 1024).unwrap();
     socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
     let listener = socket.listen(128).unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -1261,7 +1262,7 @@ async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers
             )
             .await
     });
-    timeout(Duration::from_secs(5), paused.notified())
+    timeout(Duration::from_secs(15), paused.notified())
         .await
         .expect("peer must receive the first encrypted application chunk");
     assert!(!send.is_finished());

@@ -301,32 +301,42 @@ impl Client {
                 "ask requires non-empty text".into(),
             ));
         }
-        let deadline = Instant::now() + options.request.timeout.unwrap_or(Duration::from_secs(12));
-        timeout_at(deadline, async {
-            self.connect_with_timeout(deadline.saturating_duration_since(Instant::now()))
-                .await?;
-            let opts = &options.request;
-            let lang = opts.lang.as_deref().unwrap_or("en-us");
-            let request_id = opts.request_id.clone().unwrap_or_else(new_request_id);
-            let context = context_with_correlation(
-                opts.context.as_ref(),
-                opts.session_id.as_deref(),
-                Some(&self.identity.site_id),
-                Some(lang),
-                Some(&request_id),
-            );
-            let mut receiver = self.transport.subscribe();
-            self.transport
-                .emit_bus(
-                    EVENT_RECOGNIZER_LOOP_UTTERANCE,
-                    utterance_payload(prompt, lang),
-                    context.clone(),
-                )
-                .await?;
-            collect_ask_reply(&mut receiver, &context, &request_id, deadline, &options).await
-        })
+        let deadline = Instant::now()
+            .checked_add(options.request.timeout.unwrap_or(Duration::from_secs(12)))
+            .ok_or_else(|| ThalovantError::Runtime("ask timeout is too large".into()))?;
+        timeout_at(
+            deadline,
+            self.connect_with_timeout(deadline.saturating_duration_since(Instant::now())),
+        )
         .await
-        .map_err(|_| ThalovantError::Timeout("utterance handling timed out".into()))?
+        .map_err(|_| ThalovantError::Timeout("utterance handling timed out".into()))??;
+        if Instant::now() >= deadline {
+            return Err(ThalovantError::Timeout(
+                "utterance handling timed out".into(),
+            ));
+        }
+        let opts = &options.request;
+        let lang = opts.lang.as_deref().unwrap_or("en-us");
+        let request_id = opts.request_id.clone().unwrap_or_else(new_request_id);
+        let context = context_with_correlation(
+            opts.context.as_ref(),
+            opts.session_id.as_deref(),
+            Some(&self.identity.site_id),
+            Some(lang),
+            Some(&request_id),
+        );
+        let mut receiver = self.transport.subscribe();
+        // The collector owns the remaining deadline so already received speech
+        // is returned even when the transport write has not completed.
+        send_and_collect(
+            self.transport.emit_bus(
+                EVENT_RECOGNIZER_LOOP_UTTERANCE,
+                utterance_payload(prompt, lang),
+                context.clone(),
+            ),
+            collect_ask_reply(&mut receiver, &context, &request_id, deadline, &options),
+        )
+        .await
     }
 
     pub async fn query(&self, text: &str, opts: QueryOptions) -> Result<Reply> {
@@ -379,8 +389,8 @@ impl Client {
             target_pubkey: None,
             source_peer: None,
         };
-        self.transport
-            .send_hive_message(
+        send_and_collect(
+            self.transport.send_hive_message(
                 HiveMessage {
                     msg_type: "query".to_string(),
                     payload: hive_message_payload(&inner)?,
@@ -395,72 +405,16 @@ impl Client {
                     source_peer: None,
                 },
                 true,
-            )
-            .await?;
-        let mut events = Vec::new();
-        let mut fragments = Vec::new();
-        let mut failure_event = None;
-        let mut soft_failure = None;
-        timeout(timeout_duration, async {
-            loop {
-                let message = receiver
-                    .recv()
-                    .await
-                    .map_err(|err| ThalovantError::Runtime(err.to_string()))?;
-                if query_id_from_hive_message(&message).as_deref() != Some(&query_id) {
-                    continue;
-                }
-                let Some(event) = event_from_query_hive_message(&message) else {
-                    continue;
-                };
-                if event.name == "hive.query.complete" {
-                    events.push(event);
-                    break;
-                }
-                match event.name.as_str() {
-                    EVENT_SPEAK | EVENT_OVOS_UTTERANCE_SPEAK => {
-                        push_fragment(&mut fragments, &event.text());
-                    }
-                    EVENT_INTENT_FAILURE | EVENT_INTENT_UNMATCHED => {
-                        soft_failure = Some(event.clone())
-                    }
-                    EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => {
-                        failure_event = Some(event.clone());
-                    }
-                    _ => {}
-                }
-                events.push(event);
-            }
-            Ok::<(), ThalovantError>(())
-        })
+            ),
+            collect_query_reply(
+                &mut receiver,
+                &query_id,
+                session_id,
+                request_id,
+                timeout_duration,
+            ),
+        )
         .await
-        .map_err(|_| ThalovantError::Timeout("query timed out".to_string()))??;
-        if fragments.is_empty() {
-            failure_event = failure_event.or(soft_failure);
-        }
-        if failure_event.is_some() && fragments.is_empty() {
-            return Err(ThalovantError::Runtime(
-                failure_event
-                    .as_ref()
-                    .map(|event| event.name.clone())
-                    .unwrap_or_default(),
-            ));
-        }
-        if fragments.is_empty() {
-            return Err(ThalovantError::Timeout(
-                "hub finished the query without a speak reply".to_string(),
-            ));
-        }
-        Ok(Reply {
-            text: fragments.join(" "),
-            utterances: fragments,
-            handled: failure_event.is_none(),
-            ok: failure_event.is_none(),
-            session_id: Some(session_id),
-            request_id: Some(request_id),
-            events,
-            failure_event,
-        })
     }
 
     pub fn conversation(&self, opts: ConversationOptions) -> Conversation {
@@ -578,6 +532,98 @@ impl Client {
     }
 }
 
+async fn collect_query_reply(
+    receiver: &mut broadcast::Receiver<HiveMessage>,
+    query_id: &str,
+    session_id: String,
+    request_id: String,
+    timeout_duration: Duration,
+) -> Result<Reply> {
+    let mut events = Vec::new();
+    let mut fragments = Vec::new();
+    let mut failure_event = None;
+    let mut soft_failure = None;
+    timeout(timeout_duration, async {
+        loop {
+            let message = receiver
+                .recv()
+                .await
+                .map_err(|err| ThalovantError::Runtime(err.to_string()))?;
+            if query_id_from_hive_message(&message).as_deref() != Some(query_id) {
+                continue;
+            }
+            let Some(event) = event_from_query_hive_message(&message) else {
+                continue;
+            };
+            if event.name == "hive.query.complete" {
+                events.push(event);
+                break;
+            }
+            match event.name.as_str() {
+                EVENT_SPEAK | EVENT_OVOS_UTTERANCE_SPEAK => {
+                    push_fragment(&mut fragments, &event.text());
+                }
+                EVENT_INTENT_FAILURE | EVENT_INTENT_UNMATCHED => soft_failure = Some(event.clone()),
+                EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => {
+                    failure_event = Some(event.clone());
+                }
+                _ => {}
+            }
+            events.push(event);
+            if failure_event.is_some() {
+                break;
+            }
+        }
+        Ok::<(), ThalovantError>(())
+    })
+    .await
+    .map_err(|_| ThalovantError::Timeout("query timed out".to_string()))??;
+    if fragments.is_empty() {
+        failure_event = failure_event.or(soft_failure);
+    }
+    if failure_event.is_some() && fragments.is_empty() {
+        return Err(ThalovantError::Runtime(
+            failure_event
+                .as_ref()
+                .map(|event| event.name.clone())
+                .unwrap_or_default(),
+        ));
+    }
+    if fragments.is_empty() {
+        return Err(ThalovantError::Timeout(
+            "hub finished the query without a speak reply".to_string(),
+        ));
+    }
+    Ok(Reply {
+        text: fragments.join(" "),
+        utterances: fragments,
+        handled: failure_event.is_none(),
+        ok: failure_event.is_none(),
+        session_id: Some(session_id),
+        request_id: Some(request_id),
+        events,
+        failure_event,
+    })
+}
+
+async fn send_and_collect(
+    sending: impl std::future::Future<Output = Result<()>>,
+    collecting: impl std::future::Future<Output = Result<Reply>>,
+) -> Result<Reply> {
+    tokio::pin!(sending, collecting);
+    tokio::select! {
+        // A ready terminal response wins over a subsequent write error.
+        biased;
+        result = &mut collecting => result,
+        result = &mut sending => {
+            result?;
+            collecting.await
+        }
+    }
+    // Dropping an unfinished write preserves the transport's cancellation guard:
+    // uncertain encrypted delivery poisons only its captured Noise generation.
+}
+
 async fn collect_ask_reply(
     receiver: &mut broadcast::Receiver<Event>,
     context: &Context,
@@ -596,10 +642,17 @@ async fn collect_ask_reply(
             .or(empty_deadline)
             .unwrap_or(deadline)
             .min(deadline);
+        if Instant::now() >= wake {
+            break;
+        }
         let event = match timeout_at(wake, receiver.recv()).await {
             Err(_) => break,
             Ok(Ok(event)) => event,
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                return Err(ThalovantError::Runtime(format!(
+                    "reply event buffer overflow: skipped {skipped} events"
+                )))
+            }
             Ok(Err(broadcast::error::RecvError::Closed)) => {
                 return Err(ThalovantError::Connection(
                     "hub session closed while collecting a reply".into(),
@@ -615,16 +668,31 @@ async fn collect_ask_reply(
             EVENT_SPEAK | EVENT_OVOS_UTTERANCE_SPEAK => {
                 push_fragment(&mut fragments, &event.text());
                 if !fragments.is_empty() && settle_deadline.is_none() {
-                    settle_deadline = Some(Instant::now() + options.reply_settle);
+                    settle_deadline = Some(
+                        Instant::now()
+                            .checked_add(options.reply_settle)
+                            .unwrap_or(deadline)
+                            .min(deadline),
+                    );
                 }
             }
             EVENT_INTENT_FAILURE | EVENT_INTENT_UNMATCHED => {
                 soft_failure = Some(event.clone());
-                empty_deadline.get_or_insert(Instant::now() + options.empty_reply_wait);
+                empty_deadline.get_or_insert_with(|| {
+                    Instant::now()
+                        .checked_add(options.empty_reply_wait)
+                        .unwrap_or(deadline)
+                        .min(deadline)
+                });
             }
             EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => hard_failure = Some(event.clone()),
             EVENT_UTTERANCE_HANDLED => {
-                empty_deadline.get_or_insert(Instant::now() + options.empty_reply_wait);
+                empty_deadline.get_or_insert_with(|| {
+                    Instant::now()
+                        .checked_add(options.empty_reply_wait)
+                        .unwrap_or(deadline)
+                        .min(deadline)
+                });
             }
             _ => {}
         }
@@ -972,6 +1040,306 @@ mod tests {
             }
         }
     }
+    fn fixture_query_event(name: &str, text: &str) -> HiveMessage {
+        HiveMessage {
+            msg_type: "cascade".into(),
+            metadata: json!({"query_id":"fixture"}).as_object().unwrap().clone(),
+            payload: json!({"type":name,"data":{"utterance":text},"context":{}})
+                .as_object()
+                .unwrap()
+                .clone(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn query_hard_failure_freezes_partial_without_waiting_for_complete() {
+        for hard in [EVENT_POLICY_DENIED, EVENT_QUERY_TIMEOUT] {
+            for partial in [false, true] {
+                let (tx, mut rx) = broadcast::channel(8);
+                if partial {
+                    tx.send(fixture_query_event(EVENT_SPEAK, "partial"))
+                        .unwrap();
+                }
+                tx.send(fixture_query_event(hard, "denied")).unwrap();
+                tx.send(fixture_query_event(EVENT_SPEAK, "too late"))
+                    .unwrap();
+                let result = timeout(
+                    Duration::from_millis(100),
+                    collect_query_reply(
+                        &mut rx,
+                        "fixture",
+                        "session".into(),
+                        "request".into(),
+                        Duration::from_secs(10),
+                    ),
+                )
+                .await
+                .expect("hard failures must not wait for complete or timeout");
+                if partial {
+                    let reply = result.unwrap();
+                    assert_eq!(reply.text, "partial");
+                    assert!(!reply.ok);
+                    assert_eq!(
+                        reply
+                            .events
+                            .iter()
+                            .map(|e| e.name.as_str())
+                            .collect::<Vec<_>>(),
+                        [EVENT_SPEAK, hard]
+                    );
+                } else {
+                    assert!(matches!(result, Err(ThalovantError::Runtime(_))));
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ask_collects_partial_at_its_deadline_while_the_send_is_stalled() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct SendGuard(Arc<AtomicBool>);
+        impl Drop for SendGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = broadcast::channel(4);
+        let context = context_with_correlation(None, None, None, None, Some("request"));
+        let sending = async {
+            let _guard = SendGuard(dropped.clone());
+            tx.send(Event::new(
+                EVENT_SPEAK,
+                json!({"utterance":"partial"}).as_object().unwrap().clone(),
+                context.clone(),
+                None,
+            ))
+            .unwrap();
+            std::future::pending::<Result<()>>().await
+        };
+        let started = Instant::now();
+        let options = AskOptions {
+            reply_settle: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let reply = timeout(
+            Duration::from_millis(200),
+            send_and_collect(
+                sending,
+                collect_ask_reply(
+                    &mut rx,
+                    &context,
+                    "request",
+                    started + Duration::from_millis(100),
+                    &options,
+                ),
+            ),
+        )
+        .await
+        .expect("partial reply must complete independently of its pending write")
+        .unwrap();
+        assert_eq!(reply.text, "partial");
+        assert!(started.elapsed() <= Duration::from_millis(101));
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "returning drops the owned send future and its cancellation guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_reports_broadcast_overflow_instead_of_silently_losing_events() {
+        let (tx, mut rx) = broadcast::channel(2);
+        let context = context_with_correlation(None, None, None, None, Some("request"));
+        for text in ["lost", "second", "third"] {
+            tx.send(Event::new(
+                EVENT_SPEAK,
+                json!({"utterance":text}).as_object().unwrap().clone(),
+                context.clone(),
+                None,
+            ))
+            .unwrap();
+        }
+        let result = collect_ask_reply(
+            &mut rx,
+            &context,
+            "request",
+            Instant::now() + Duration::from_millis(10),
+            &AskOptions::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ThalovantError::Runtime(ref message)) if message.contains("overflow")),
+            "overflow must be explicit, got {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_reply_finishes_while_the_write_is_stalled_and_ignores_late_speech() {
+        for hard in [EVENT_POLICY_DENIED, EVENT_QUERY_TIMEOUT] {
+            let (tx, mut rx) = broadcast::channel(8);
+            let context = reply_context("request");
+            let sending = async {
+                for (name, text) in [(EVENT_SPEAK, "partial"), (hard, ""), (EVENT_SPEAK, "late")] {
+                    tx.send(Event::new(
+                        name,
+                        json!({"utterance":text}).as_object().unwrap().clone(),
+                        context.clone(),
+                        None,
+                    ))
+                    .unwrap();
+                }
+                std::future::pending::<Result<()>>().await
+            };
+            let reply = timeout(
+                Duration::from_millis(1),
+                send_and_collect(
+                    sending,
+                    collect_ask_reply(
+                        &mut rx,
+                        &context,
+                        "request",
+                        Instant::now() + Duration::from_secs(12),
+                        &AskOptions::default(),
+                    ),
+                ),
+            )
+            .await
+            .expect("hard response cannot wait for the write")
+            .unwrap();
+            assert_eq!(reply.text, "partial");
+            assert_eq!(reply.events.len(), 2);
+            assert!(!reply.ok);
+            assert_eq!(reply.failure_event.unwrap().name, hard);
+
+            let (tx, mut rx) = broadcast::channel(8);
+            let sending = async {
+                tx.send(fixture_query_event(EVENT_SPEAK, "partial"))
+                    .unwrap();
+                tx.send(fixture_query_event(hard, "")).unwrap();
+                tx.send(fixture_query_event(EVENT_SPEAK, "late")).unwrap();
+                std::future::pending::<Result<()>>().await
+            };
+            let reply = timeout(
+                Duration::from_millis(1),
+                send_and_collect(
+                    sending,
+                    collect_query_reply(
+                        &mut rx,
+                        "fixture",
+                        "session".into(),
+                        "request".into(),
+                        Duration::from_secs(12),
+                    ),
+                ),
+            )
+            .await
+            .expect("hard query response cannot wait for the write")
+            .unwrap();
+            assert_eq!(reply.text, "partial");
+            assert_eq!(reply.events.len(), 2);
+            assert!(!reply.ok);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_collection_drops_its_write_and_subscription() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = dropped.clone();
+        let (tx, mut rx) = broadcast::channel(4);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let signal = started.clone();
+        let task = tokio::spawn(send_and_collect(
+            async move {
+                let _guard = Guard(guard);
+                signal.notify_one();
+                std::future::pending::<Result<()>>().await
+            },
+            async move {
+                collect_ask_reply(
+                    &mut rx,
+                    &reply_context("request"),
+                    "request",
+                    Instant::now() + Duration::from_secs(12),
+                    &AskOptions::default(),
+                )
+                .await
+            },
+        ));
+        started.notified().await;
+        assert_eq!(tx.receiver_count(), 1);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(tx.receiver_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ask_first_empty_and_first_speech_windows_never_restart() {
+        for speak in [false, true] {
+            let (tx, mut rx) = broadcast::channel(8);
+            let producer = tokio::spawn(async move {
+                let name = if speak {
+                    EVENT_SPEAK
+                } else {
+                    EVENT_UTTERANCE_HANDLED
+                };
+                tx.send(Event::new(
+                    name,
+                    json!({"utterance":"first"}).as_object().unwrap().clone(),
+                    reply_context("request"),
+                    None,
+                ))
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                tx.send(Event::new(
+                    name,
+                    json!({"utterance":"second"}).as_object().unwrap().clone(),
+                    reply_context("request"),
+                    None,
+                ))
+                .unwrap();
+                std::future::pending::<()>().await;
+            });
+            let start = Instant::now();
+            let result = collect_ask_reply(
+                &mut rx,
+                &reply_context("request"),
+                "request",
+                start + Duration::from_secs(12),
+                &AskOptions {
+                    reply_settle: Duration::from_millis(100),
+                    empty_reply_wait: Duration::from_millis(100),
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert!(
+                start.elapsed() <= Duration::from_millis(101),
+                "later events must not restart the first-event window"
+            );
+            if speak {
+                assert_eq!(result.unwrap().text, "first second");
+            } else {
+                assert!(matches!(result, Err(ThalovantError::Timeout(_))));
+            }
+            producer.abort();
+        }
+    }
+
     #[tokio::test]
     async fn ask_reports_the_hub_session_from_correlated_events() {
         for requested in [None, Some("caller-session")] {
