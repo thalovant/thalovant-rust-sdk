@@ -565,6 +565,7 @@ impl HttpTransport {
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
+        let _lifecycle = self.state.lifecycle.lock().await;
         let result = self.send_encrypted(message).await;
         if let Err(error) = &result {
             self.mark_connection_error(error).await;
@@ -1274,6 +1275,7 @@ impl WssTransport {
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
+        let mut writer = self.state.writer.lock().await;
         let session = self.state.session.lock().await.clone().ok_or_else(|| {
             ThalovantError::Connection(
                 "refusing to send before the v3 Noise session is established".to_string(),
@@ -1286,7 +1288,6 @@ impl WssTransport {
         // order -- so encrypting outside this lock lets two concurrent senders
         // consume their nonces in one order and reach the wire in the other,
         // which the hub treats as tampering and drops the session for.
-        let mut writer = self.state.writer.lock().await;
         if !self.state.session_valid.load(Ordering::Acquire) {
             return Err(ThalovantError::Connection(
                 "Noise session interrupted; reconnect required".into(),
@@ -1715,6 +1716,7 @@ impl MqttTransport {
     }
 
     pub async fn send_hive_message(&self, message: HiveMessage, _encrypt: bool) -> Result<()> {
+        let _lifecycle = self.state.lifecycle.lock().await;
         let result = self.send_encrypted(message).await;
         if let Err(error) = &result {
             self.mark_error(error).await;
