@@ -126,7 +126,7 @@ pub enum IntentInventorySource {
     /// `intent-manifest`: the runtime's intent manifest, sentences per language.
     IntentManifest,
     /// `engine-manifests`: the engines' own manifests, names only; the
-    /// inventory's `denied` names the query the hub refused.
+    /// inventory's legacy `denied` names a query unavailable through denial or silence.
     EngineManifests,
 }
 
@@ -368,7 +368,8 @@ impl Serialize for HubSkillIntents {
 ///
 /// `source` says how it was read: [`IntentInventorySource::IntentManifest`]
 /// carries sentences per language; [`IntentInventorySource::EngineManifests`]
-/// is the names-only fallback, and `denied` then names the query the hub refused.
+/// is the names-only fallback. The legacy `denied` field names queries unavailable
+/// through denial or silence; it does not prove an ACL refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HubIntentInventory {
     /// The languages asked for, one per language in the order given, spelt
