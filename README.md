@@ -585,9 +585,11 @@ MQTT allows its worker three seconds for offline publication and event-loop
 retirement. An unacknowledged HTTP cleanup retains this object's admission marker,
 so the next connection retries cleanup before admitting a fresh session.
 If the hub cleaned up but its response was lost, the retry also accepts its
-exact `Already Disconnected` or `Client is not connected` acknowledgment.
-These acknowledgments apply only to successful HTTP disconnect responses
-without `ok: false`; arbitrary refusals still fail and retain admission ownership.
+exact one-field JSON object: `{"error":"Already Disconnected"}` or
+`{"error":"Client is not connected"}`. These acknowledgments apply only to
+successful HTTP disconnect responses; any additional field, including `ok` or
+`status`, invalidates them. Other refusals and `ok: false` still fail and retain
+admission ownership.
 
 All three transports use the same Noise negotiation, authenticated framing, and
 peer pinning implementation; transport-specific connection and send ownership
