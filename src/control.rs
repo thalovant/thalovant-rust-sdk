@@ -1416,7 +1416,7 @@ impl ControlPlane {
 fn validate_control_request_url(raw: &str, sensitive: bool) -> Result<url::Url> {
     let url = url::Url::parse(raw)
         .map_err(|_| ThalovantError::Api("invalid control-plane API URL".into()))?;
-    if !url.username().is_empty() || url.password().is_some() {
+    if url_has_userinfo(raw) || !url.username().is_empty() || url.password().is_some() {
         return Err(ThalovantError::Api(
             "control-plane API URLs cannot contain credentials".into(),
         ));
@@ -1565,12 +1565,28 @@ fn open_url_in_browser(url: &str) {
     let Some((command, arguments)) = browser_command(url, std::env::consts::OS) else {
         return;
     };
-    let _ = std::process::Command::new(command)
+    if let Ok(mut child) = std::process::Command::new(command)
         .args(arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+    {
+        // Reap a short-lived opener without delaying device authorization.
+        let _ = std::thread::Builder::new()
+            .name("thalovant-browser".into())
+            .spawn(move || {
+                let _ = child.wait();
+            });
+    }
+}
+
+fn url_has_userinfo(raw: &str) -> bool {
+    raw.split_once("://").is_some_and(|(_, tail)| {
+        tail.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|authority| authority.contains('@'))
+    })
 }
 
 fn browser_command(raw: &str, os: &str) -> Option<(&'static str, Vec<String>)> {
@@ -1578,6 +1594,9 @@ fn browser_command(raw: &str, os: &str) -> Option<(&'static str, Vec<String>)> {
         .chars()
         .any(|character| character.is_control() || character.is_whitespace())
     {
+        return None;
+    }
+    if url_has_userinfo(raw) {
         return None;
     }
     let url = url::Url::parse(raw).ok()?;
@@ -1726,6 +1745,7 @@ mod tests {
                 "file:///tmp/program",
                 "javascript:alert(1)",
                 "https://user:password@example.invalid",
+                "https://@example.invalid",
                 "https://",
                 "https://example.invalid/\ncommand",
                 "https://example.invalid/ bad",
