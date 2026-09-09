@@ -5,6 +5,8 @@
 - Implement the deployed HiveMind v3 Noise handshake for HTTP and MQTT. Offers
   alone no longer mark a transport ready, and all post-handshake HELLO/bus
   traffic is encrypted, including chunked messages and `encrypt=false` calls.
+- Reset a previously admitted HTTP peer before reconnecting after failure;
+  first connections never evict an unknown peer.
 - Preserve HTTP replica cookies, use binary form/poll endpoints, reject redirects
   and JSON error responses, and expose a builder for custom HTTP trust roots.
 - Add persistent Noise state directory and remote static key methods to HTTP

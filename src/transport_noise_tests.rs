@@ -217,6 +217,7 @@ struct HttpFixtureState {
     binary: VecDeque<String>,
     reject: Option<String>,
     unsupported: bool,
+    connected: bool,
     tamper: bool,
     plaintext: bool,
 }
@@ -241,6 +242,10 @@ impl HttpFixtureState {
         }
         match path {
             "/connect" => {
+                if self.connected {
+                    return json!({"status":"Connected"});
+                }
+                self.connected = true;
                 self.plain.clear();
                 self.binary.clear();
                 let writes = self.responder.reset();
@@ -251,7 +256,10 @@ impl HttpFixtureState {
                 }
                 json!({"status":"Connected"})
             }
-            "/disconnect" => json!({"status":"Disconnected"}),
+            "/disconnect" => {
+                self.connected = false;
+                json!({"status":"Disconnected"})
+            }
             "/get_messages" => {
                 let mut messages = self.plain.drain(..).collect::<Vec<_>>();
                 if self.plaintext {
@@ -313,6 +321,7 @@ impl HttpFixture {
             binary: VecDeque::new(),
             reject: None,
             unsupported: false,
+            connected: false,
             tamper: false,
             plaintext: false,
         }));
@@ -861,4 +870,30 @@ async fn wss_failed_kk_keeps_the_authenticated_hub_pin() {
         .await
         .is_err());
     assert_eq!(load_noise_pin(Some(&dir.0), "test-hub").unwrap(), Some(pin));
+}
+
+#[tokio::test]
+async fn http_noise_reconnect_resets_previously_admitted_server_session() {
+    let fixture = HttpFixture::new().await;
+    let transport = fixture.transport();
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    transport.connect().await.unwrap();
+    fixture.state.lock().await.tamper = true;
+    transport
+        .emit_bus("echo", Map::new(), Map::new())
+        .await
+        .unwrap();
+    assert!(transport.poll_once().await.is_err());
+    fixture.state.lock().await.tamper = false;
+    timeout(Duration::from_secs(10), transport.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(transport.healthcheck().await.handshake_complete);
+    assert_eq!(
+        fixture.state.lock().await.responder.patterns,
+        vec!["XXpsk2", "KKpsk0"]
+    );
+    transport.disconnect().await.unwrap();
 }

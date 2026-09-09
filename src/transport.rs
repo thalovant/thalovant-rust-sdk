@@ -219,6 +219,7 @@ struct HttpTransportState {
     hive_tx: broadcast::Sender<HiveMessage>,
     health: Mutex<TransportHealth>,
     poll_task: Mutex<Option<JoinHandle<()>>>,
+    admitted: AtomicBool,
     noise: Mutex<Option<NoiseChannel>>,
     noise_state_dir: Mutex<Option<PathBuf>>,
     lifecycle: Mutex<()>,
@@ -271,6 +272,7 @@ impl HttpTransport {
                 hive_tx,
                 health: Mutex::new(TransportHealth::default()),
                 poll_task: Mutex::new(None),
+                admitted: AtomicBool::new(false),
                 noise: Mutex::new(None),
                 noise_state_dir: Mutex::new(None),
                 lifecycle: Mutex::new(()),
@@ -320,6 +322,15 @@ impl HttpTransport {
     pub async fn connect(&self) -> Result<()> {
         let _lifecycle = self.state.lifecycle.lock().await;
         self.stop_polling().await;
+        if self.state.admitted.swap(false, Ordering::AcqRel) {
+            // /connect does not issue a new offer for a peer still registered
+            // locally. Reset only this object's previously admitted session.
+            let _ = timeout(
+                Duration::from_secs(2),
+                self.request(reqwest::Method::POST, "/disconnect", None),
+            )
+            .await;
+        }
         *self.state.noise.lock().await = None;
         *self.state.health.lock().await = TransportHealth {
             connection: connecting_connection(),
@@ -355,6 +366,7 @@ impl HttpTransport {
         *self.state.noise.lock().await = Some(NoiseChannel::new(self.state.identity.clone(), dir));
         self.request(reqwest::Method::POST, "/connect", None)
             .await?;
+        self.state.admitted.store(true, Ordering::Release);
         let opened = Instant::now();
         {
             let mut health = self.state.health.lock().await;
@@ -393,6 +405,7 @@ impl HttpTransport {
             health.transport_alive = false;
             health.connection.phase = TransportConnectionPhase::Closed;
         }
+        self.state.admitted.store(false, Ordering::Release);
         self.request(reqwest::Method::POST, "/disconnect", None)
             .await
             .map(|_| ())
