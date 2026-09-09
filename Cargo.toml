@@ -1,6 +1,6 @@
 [package]
 name = "thalovant"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2021"
 description = "Rust SDK for direct Thalovant hub data-plane clients and agents"
 readme = "README.md"
@@ -10,7 +10,7 @@ homepage = "https://docs.thalovant.com/developers/sdks/rust/"
 documentation = "https://docs.rs/thalovant"
 keywords = ["thalovant", "sdk", "agent", "voice", "assistant"]
 categories = ["api-bindings", "network-programming"]
-rust-version = "1.75"
+rust-version = "1.85"
 
 [dependencies]
 base64 = "0.23"
@@ -34,6 +34,13 @@ uuid = { version = "1", features = ["v4", "fast-rng"] }
 snow = "0.10.0"
 argon2 = "0.6.0"
 
+# These compatible-version constraints keep HTTP cookie affinity and URL/IDNA
+# support buildable on our declared Rust 1.85 floor in downstream fresh resolves.
+# Later patch/minor releases of these dependencies require Rust 1.86/1.88.
+cookie_store = { version = "=0.22.0", default-features = false }
+time = { version = "=0.3.45", default-features = false }
+idna_adapter = "=1.2.0"
+
 [dev-dependencies]
-rcgen = "0.14"
+rcgen = "=0.14.5"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.7
+
+- Correct the declared minimum Rust version to 1.85, already required by the
+  Noise cryptography dependencies. Rust 1.75 was an inaccurate compatibility
+  claim in earlier package metadata.
+- Keep HTTP cookie and URL dependencies on releases compatible with Rust 1.85,
+  so a fresh dependency resolution does not unexpectedly require Rust 1.88.
+- Test all targets and features on Rust 1.85.0 in CI as well as current stable.
+
 ## 0.4.6
 
 - Implement the deployed HiveMind v3 Noise handshake for HTTP and MQTT. Offers
