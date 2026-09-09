@@ -503,13 +503,15 @@ Nothing extra has to be provisioned. The Noise pre-shared key is derived from
 the identity `password` with argon2id, salted with the hub's node id, so an
 identity that can authenticate can already handshake.
 
-Two files persist beside the SDK config file (`~/.config/thalovant` unless
-`XDG_CONFIG_HOME` or `%APPDATA%` says otherwise), both `0600`:
+Three files persist beside the SDK config file (`~/.config/thalovant` unless
+`XDG_CONFIG_HOME` or `%APPDATA%` says otherwise), all `0600`:
 
 - `noise_key` — this client's static X25519 key. It has to persist: a hub pins
   it on first contact, so regenerating it makes the client look like a
   different peer and the hub refuses it.
 - `noise_pins.json` — the hub static keys this client has pinned.
+- `noise_psks.json` — cached derived Noise credentials, indexed by hub node ID.
+  Protect it like a password file; `forget_cached_psk` removes one entry.
 
 Use `set_noise_state_dir` on `WssTransport`, `HttpTransport`, or `MqttTransport`
 to select another persistent directory. Keep the same directory when switching

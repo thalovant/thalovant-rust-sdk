@@ -1,8 +1,8 @@
 //! On-disk state for the v3 Noise handshake: this client's static key and the
-//! hub keys it has pinned.
+//! hub keys it has pinned, and the derived PSK credential cache.
 //!
-//! Both live beside the SDK config file, so `XDG_CONFIG_HOME` and the Windows
-//! `APPDATA` location are honored the same way, and both are written `0600`.
+//! All three live beside the SDK config file, so `XDG_CONFIG_HOME` and the Windows
+//! `APPDATA` location are honored the same way, and all are written `0600`.
 
 use std::collections::BTreeMap;
 use std::fs;

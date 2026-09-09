@@ -63,9 +63,11 @@
   `select_noise_options`, `NoiseHandshake`, `NoiseSession`, and the on-disk
   state helpers `load_or_create_noise_key`, `load_noise_pin`, `save_noise_pin`
   and `forget_noise_pin`.
-- Two files persist beside the SDK config file, both `0600`: `noise_key` (this
-  client's static X25519 key) and `noise_pins.json` (the hub keys it has
-  pinned). `WssTransport::set_noise_state_dir` overrides the location.
+- Three files persist beside the SDK config file, all `0600`: `noise_key` (this
+  client's static X25519 key), `noise_pins.json` (the hub keys it has pinned),
+  and `noise_psks.json` (cached derived credentials indexed by hub node ID).
+  `WssTransport::set_noise_state_dir` overrides the location; `forget_cached_psk`
+  removes one derived credential without removing keys or pins.
 - Trust on first use: the first hub key seen for a node id is pinned, and a
   later connection presenting a different key is refused with an error naming
   `forget_noise_pin`, rather than silently re-pinned. A failed `KKpsk0`
