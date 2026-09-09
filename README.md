@@ -491,11 +491,12 @@ Hubs may expose one or more public data-plane protocols:
 
 ### Transport Security
 
-`wss` connections perform the HiveMind **v3 Noise handshake**
+`wss`, `https`, and `mqtt` connections perform the HiveMind **v3 Noise handshake**
 (`Noise_XXpsk2_25519_ChaChaPoly_SHA256`, or `KKpsk0` once the hub's static key
 is pinned). It is the only key exchange a HiveMind-core 5.x hub accepts: there
 is no pre-shared `crypto_key` any more, no cleartext path, and a connection
-that cannot complete the handshake is closed with WebSocket `1008`.
+that cannot complete the handshake never becomes ready. A WebSocket refusal
+may close with code `1008`.
 
 Nothing extra has to be provisioned. The Noise pre-shared key is derived from
 the identity `password` with argon2id, salted with the hub's node id, so an
@@ -509,7 +510,9 @@ Two files persist beside the SDK config file (`~/.config/thalovant` unless
   different peer and the hub refuses it.
 - `noise_pins.json` — the hub static keys this client has pinned.
 
-Point both somewhere else with `WssTransport::set_noise_state_dir`.
+Use `set_noise_state_dir` on `WssTransport`, `HttpTransport`, or `MqttTransport`
+to select another persistent directory. Keep the same directory when switching
+transports with one identity; regenerating the key breaks the hub's client pin.
 
 The first connection to a hub trusts the key it presents and records it. A
 later connection presenting a different key is **refused**, because the SDK
@@ -522,11 +525,46 @@ use thalovant::forget_noise_pin;
 forget_noise_pin(None, &node_id)?;
 ```
 
-The derivation costs 64 MiB and a few hundred milliseconds. A transport caches
-the result per hub, so reconnects pay it once.
+The derivation costs 64 MiB and a few hundred milliseconds. WSS caches the
+result per hub; HTTP and MQTT derive from the current password for each fresh
+connection. Failed authentication never removes the trusted hub pin.
 
-`https` and `mqtt` do not run a Noise handshake. They authenticate with the
-identity credentials and take their confidentiality from TLS.
+HTTP reconnect resets this object's prior admission before asking for a new
+Noise offer, so it can recover when a failed poll leaves the old peer registered.
+An initial connection does not evict a peer admitted by another process.
+
+HTTP retains the listener's replica affinity cookie, sends encrypted frames as
+Base64 form data with `binary=1`, and decrypts `/get_binary_messages` replies.
+HTTP errors and JSON `error` responses both fail the session. Redirects are
+refused so identity credentials cannot move to another endpoint. For custom
+trust roots, use `HttpTransport::with_options_and_http_client_builder`; it
+always enables cookies and disables redirects.
+
+MQTT carries raw Noise ciphertext after the initial HELLO and handshake. Its
+broker connection ID is random; identity credentials still belong in the
+protocol's topic paths. Use one identity per simultaneous client. A broker
+failure invalidates readiness; call `connect()` to resubscribe and negotiate a
+fresh session. `set_tls_configuration` configures private CA roots or a TLS
+client certificate. TLS remains mandatory to protect the access key and broker
+credentials in addition to Noise's end-to-end message encryption.
+
+All transports serialize encryption and complete chunk delivery. An interrupted
+or failed send requires a new session, and `encrypt=false` cannot bypass Noise.
+Each transport exposes `remote_static_key()` only for a working session.
+
+```rust
+let transport = thalovant::HttpTransport::new(identity);
+transport.set_noise_state_dir(Some("/var/lib/my-agent/thalovant".into())).await;
+transport.connect().await?;
+// Readiness follows the Noise exchange and encrypted HELLO.
+transport.emit_bus(
+    "ovos.intent.list",
+    serde_json::Map::new(),
+    serde_json::json!({"request_id": thalovant::new_request_id()})
+        .as_object().unwrap().clone(),
+).await?;
+transport.disconnect().await?;
+```
 
 Inspect what an identity supports:
 

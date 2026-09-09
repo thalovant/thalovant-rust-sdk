@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.6
+
+- Implement the deployed HiveMind v3 Noise handshake for HTTP and MQTT. Offers
+  alone no longer mark a transport ready, and all post-handshake HELLO/bus
+  traffic is encrypted, including chunked messages and `encrypt=false` calls.
+- Reset a previously admitted HTTP peer before reconnecting after failure;
+  first connections never evict an unknown peer.
+- Preserve HTTP replica cookies, use binary form/poll endpoints, reject redirects
+  and JSON error responses, and expose a builder for custom HTTP trust roots.
+- Add persistent Noise state directory and remote static key methods to HTTP
+  and MQTT; preserve hub pins after authentication failures on every transport.
+- Reset WSS cipher, handshake, HELLO and node state before same-object reconnects,
+  join old readers, reject unauthenticated bus events, and decode authenticated
+  binary bus frames. Interrupted cipher sends invalidate session readiness.
+- Serialize MQTT ciphertext delivery, handle full-size Noise frames, and keep
+  polling the broker while the ordered protocol worker exchanges messages.
+  Broker failures require an explicit reconnect with a new session. Add TLS
+  trust configuration and random broker connection IDs.
+- Exercise real local TLS HTTP/MQTT and WebSocket responders, XX-to-KK reconnects,
+  correlated encrypted replies, concurrent chunked messages, wrong credentials,
+  unsupported offers, tampering, plaintext rejection, and changed-key refusal.
+
 ## 0.4.0
 
 - **Breaking.** `wss` connections now perform the HiveMind v3 Noise handshake,
