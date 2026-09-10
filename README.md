@@ -537,6 +537,13 @@ Three files persist beside the SDK config file (`~/.config/thalovant` unless
 - `noise_psks.json` — cached derived Noise credentials, indexed by hub node ID.
   Protect it like a password file; `forget_cached_psk` removes one entry.
 
+Saved pins and pin-writing helpers require a nonempty node ID and exactly 64
+hexadecimal characters (32 bytes). Malformed trust is rejected before any
+rewrite. `save_noise_pin` now enforces its first-contact contract: an identical
+key is idempotent; a conflicting key requires verified rotation through
+`forget_noise_pin`. It cannot silently replace a saved decision. Hexadecimal case does not change
+key identity; idempotent checks preserve the existing saved bytes.
+
 Use `set_noise_state_dir` on `WssTransport`, `HttpTransport`, or `MqttTransport`
 to select another persistent directory. Keep the same directory when switching
 transports with one identity; regenerating the key breaks the hub's client pin.

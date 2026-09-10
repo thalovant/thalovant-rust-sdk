@@ -2,6 +2,8 @@
 
 ## 0.5.2
 
+- Validate saved Noise pin values and pin inputs before loading or changing trust. Preserve malformed files; enforce the documented first-contact rule atomically in `save_noise_pin`, with explicit `forget_noise_pin` for verified rotation.
+
 - Reject duplicate active Ask request IDs and Query query IDs on a shared
   transport, including Client clones, without changing public Client literals.
 - Omit unstructured API error bodies that can echo credentials. Preserve

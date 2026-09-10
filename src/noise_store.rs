@@ -220,20 +220,10 @@ pub fn load_noise_pin(dir: Option<&Path>, node_id: &str) -> Result<Option<String
 }
 
 /// Record the hub static key for a node id on first contact.
+/// Repeating the same key succeeds; a different key requires verified rotation
+/// through [`forget_noise_pin`]. Malformed saved trust is never overwritten.
 pub fn save_noise_pin(dir: Option<&Path>, node_id: &str, public_key: &str) -> Result<()> {
-    if node_id.trim().is_empty() || public_key.trim().is_empty() {
-        return Ok(());
-    }
-    let _guard = lock_state(dir)?;
-    let (mut pins, path) = read_pins(dir)?;
-    if pins
-        .get(node_id)
-        .is_some_and(|current| current == public_key)
-    {
-        return Ok(());
-    }
-    pins.insert(node_id.to_string(), public_key.to_string());
-    write_pins(&path, &pins)
+    pin_hub_key(dir, node_id, public_key)
 }
 
 /// Enforce trust on first use: record the first key seen for a node id, and
@@ -247,9 +237,7 @@ pub fn save_noise_pin(dir: Option<&Path>, node_id: &str, public_key: &str) -> Re
 /// answering at this address. The SDK cannot tell those apart, so it refuses and
 /// leaves clearing the pin ([`forget_noise_pin`]) as a deliberate act.
 pub fn pin_hub_key(dir: Option<&Path>, node_id: &str, remote_static_key: &str) -> Result<()> {
-    if remote_static_key.is_empty() {
-        return Ok(());
-    }
+    validate_pin(node_id, remote_static_key)?;
     let _guard = lock_state(dir)?;
     let (mut pins, path) = read_pins(dir)?;
     match pins.get(node_id) {
@@ -257,7 +245,7 @@ pub fn pin_hub_key(dir: Option<&Path>, node_id: &str, remote_static_key: &str) -
             pins.insert(node_id.to_string(), remote_static_key.to_string());
             write_pins(&path, &pins)
         }
-        Some(pinned) if pinned == remote_static_key => Ok(()),
+        Some(pinned) if pinned.eq_ignore_ascii_case(remote_static_key) => Ok(()),
         Some(_) => Err(ThalovantError::Connection(
             "the hub's Noise static key changed. If the hub was not reinstalled or replaced, another machine may be answering at this address. If it was, drop the stale pin with forget_noise_pin and reconnect to trust the new key"
                 .to_string(),
@@ -283,17 +271,32 @@ fn read_pins(dir: Option<&Path>) -> Result<(BTreeMap<String, String>, PathBuf)> 
     validate_state_file(&path, "Noise pin file")?;
     match fs::read_to_string(&path) {
         Ok(raw) => {
-            let pins = serde_json::from_str(&raw).map_err(|err| {
+            let pins: BTreeMap<String, String> = serde_json::from_str(&raw).map_err(|err| {
                 ThalovantError::InvalidIdentity(format!(
                     "Noise pin file {} is not a JSON object of node id to key: {err}",
                     path.display()
                 ))
             })?;
+            for (node_id, key) in &pins {
+                validate_pin(node_id, key)?;
+            }
             Ok((pins, path))
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok((BTreeMap::new(), path)),
         Err(err) => Err(err.into()),
     }
+}
+
+fn validate_pin(node_id: &str, key: &str) -> Result<()> {
+    if node_id.trim().is_empty()
+        || key.len() != 64
+        || !key.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ThalovantError::InvalidIdentity(
+            "Noise pin requires a nonempty node id and a 32-byte hexadecimal static key".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_pins(path: &Path, pins: &BTreeMap<String, String>) -> Result<()> {
@@ -482,6 +485,92 @@ fn write_psk_cache(path: &Path, cache: &BTreeMap<String, String>) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_save_preserves_first_contact_until_explicit_forget() {
+        let dir = tempdir();
+        let first = "ab".repeat(32);
+        let second = "cd".repeat(32);
+        save_noise_pin(Some(&dir), "hub", &first).unwrap();
+        let path = dir.join(NOISE_PINS_FILENAME);
+        let original = fs::read(&path).unwrap();
+        save_noise_pin(Some(&dir), "hub", &first).unwrap();
+        assert!(matches!(
+            save_noise_pin(Some(&dir), "hub", &second),
+            Err(ThalovantError::Connection(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        forget_noise_pin(Some(&dir), "hub").unwrap();
+        save_noise_pin(Some(&dir), "hub", &second).unwrap();
+        assert_eq!(load_noise_pin(Some(&dir), "hub").unwrap(), Some(second));
+    }
+
+    #[test]
+    fn malformed_saved_pins_are_rejected_without_rewriting() {
+        for raw in [
+            "null".to_string(),
+            "[]".to_string(),
+            r#"{"hub":null}"#.to_string(),
+            r#"{"hub":""}"#.to_string(),
+            r#"{"hub":" "}"#.to_string(),
+            r#"{"hub":"aa"}"#.to_string(),
+            format!(r#"{{"hub":"{}"}}"#, "gg".repeat(32)),
+        ] {
+            let dir = tempdir();
+            let path = dir.join(NOISE_PINS_FILENAME);
+            write_private(&path, &raw).unwrap();
+            assert!(
+                matches!(
+                    load_noise_pin(Some(&dir), "hub"),
+                    Err(ThalovantError::InvalidIdentity(_))
+                ),
+                "invalid stored pin accepted: {raw}"
+            );
+            for result in [
+                save_noise_pin(Some(&dir), "hub", &"ab".repeat(32)),
+                pin_hub_key(Some(&dir), "hub", &"ab".repeat(32)),
+                forget_noise_pin(Some(&dir), "hub"),
+            ] {
+                assert!(matches!(result, Err(ThalovantError::InvalidIdentity(_))));
+                assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_pin_inputs_cannot_create_trust() {
+        for (node_id, key) in [
+            ("hub", "".to_string()),
+            ("hub", " ".to_string()),
+            ("hub", "aa".to_string()),
+            ("hub", "gg".repeat(32)),
+            (" ", "ab".repeat(32)),
+        ] {
+            let dir = tempdir();
+            assert!(matches!(
+                save_noise_pin(Some(&dir), node_id, &key),
+                Err(ThalovantError::InvalidIdentity(_))
+            ));
+            assert!(!dir.join(NOISE_PINS_FILENAME).exists());
+        }
+    }
+
+    #[test]
+    fn equivalent_hex_pins_preserve_saved_bytes() {
+        for saved in ["AB".repeat(32), "aB".repeat(32)] {
+            let dir = tempdir();
+            save_noise_pin(Some(&dir), "hub", &saved).unwrap();
+            let path = dir.join(NOISE_PINS_FILENAME);
+            let before = fs::read(&path).unwrap();
+            save_noise_pin(Some(&dir), "hub", &saved.to_ascii_lowercase()).unwrap();
+            pin_hub_key(Some(&dir), "hub", &saved.to_ascii_lowercase()).unwrap();
+            assert!(matches!(
+                save_noise_pin(Some(&dir), "hub", &"cd".repeat(32)),
+                Err(ThalovantError::Connection(_))
+            ));
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
 
     #[test]
     fn pin_hub_key_records_then_refuses_a_changed_key() {
