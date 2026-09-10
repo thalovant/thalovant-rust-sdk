@@ -13,12 +13,14 @@
 //! hivemind-core allow-msg recognizer_loop:utterance <id>
 //! hivemind-core listen
 //!
-//! THALOVANT_INTEROP_WSS=ws://127.0.0.1:5678 \
+//! THALOVANT_INTEROP_WSS=wss://hub.example.com \
 //! THALOVANT_INTEROP_ACCESS_KEY=<key> \
 //! THALOVANT_INTEROP_PASSWORD=<password> \
+//! THALOVANT_INTEROP_STATE_DIR=/persistent/thalovant-interop \
 //! cargo test --test noise_interop -- --nocapture
 //! ```
 //!
+//! Expose the listener through a WSS endpoint with a trusted TLS certificate.
 //! A hub pins the client static key on first contact, so a run whose state
 //! directory has been discarded needs `hivemind-core reset-noise-pin <key>`.
 

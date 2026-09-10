@@ -304,6 +304,12 @@ impl Client {
         let deadline = Instant::now()
             .checked_add(options.request.timeout.unwrap_or(Duration::from_secs(12)))
             .ok_or_else(|| ThalovantError::Runtime("ask timeout is too large".into()))?;
+        let request_id = options
+            .request
+            .request_id
+            .clone()
+            .unwrap_or_else(new_request_id);
+        let _reservation = self.transport.reserve_reply(false, &request_id)?;
         timeout_at(
             deadline,
             self.connect_with_timeout(deadline.saturating_duration_since(Instant::now())),
@@ -317,7 +323,6 @@ impl Client {
         }
         let opts = &options.request;
         let lang = opts.lang.as_deref().unwrap_or("en-us");
-        let request_id = opts.request_id.clone().unwrap_or_else(new_request_id);
         let context = context_with_correlation(
             opts.context.as_ref(),
             opts.session_id.as_deref(),
@@ -355,11 +360,12 @@ impl Client {
                 "query requires non-empty text".to_string(),
             ));
         }
-        self.connect().await?;
         let lang = opts.lang.as_deref().unwrap_or("en-us");
         let timeout_duration = opts.timeout.unwrap_or(Duration::from_secs(12));
         let request_id = opts.request_id.unwrap_or_else(new_request_id);
         let query_id = opts.query_id.unwrap_or_else(|| request_id.clone());
+        let _reservation = self.transport.reserve_reply(true, &query_id)?;
+        self.connect().await?;
         let session_id = opts.session_id.unwrap_or_else(new_session_id);
         let context = context_with_correlation(
             opts.context.as_ref(),

@@ -847,7 +847,8 @@ type Wanted = (String, String, String);
 /// deadline covers all windows, including sends and reply collection. Once it
 /// expires, no later window is sent. Partial answers from completed windows
 /// survive; intents not described in time are absent from the result. Only a
-/// call where no window answered at all is a timeout. `batch` 0 sends them all
+/// call with unanswered registrations and no usable definition is a timeout.
+/// Explicit empty answers to every request remain a successful empty result. `batch` 0 sends them all
 /// at once.
 pub(crate) async fn describe_many<L: HubLink>(
     link: &L,
@@ -877,7 +878,7 @@ pub(crate) async fn describe_many<L: HubLink>(
                 // only loses its sentences. A hub silent from the start still
                 // fails at the first window, having found nothing.
                 Err(ThalovantError::Timeout(message)) => {
-                    if found.is_empty() {
+                    if !found.values().any(|definitions| !definitions.is_empty()) {
                         return Err(ThalovantError::Timeout(message));
                     }
                 }
@@ -968,7 +969,7 @@ async fn describe_one_batch<L: HubLink>(
     match waited {
         Ok(()) => Ok(found),
         Err(ThalovantError::Timeout(message)) => {
-            if found.is_empty() {
+            if !found.values().any(|definitions| !definitions.is_empty()) {
                 Err(ThalovantError::Timeout(message))
             } else {
                 Ok(found)
@@ -2203,6 +2204,66 @@ mod tests {
                     sentences.is_empty(),
                     "{} was never described, so it has no sentences",
                     intent.id()
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_describe_answers_do_not_hide_unanswered_registrations() {
+        struct EmptyAnswers {
+            hub: FakeHub,
+            refused: bool,
+            silence: bool,
+        }
+        impl HubLink for EmptyAnswers {
+            fn subscribe(&self) -> broadcast::Receiver<Event> {
+                self.hub.subscribe()
+            }
+            fn site_id(&self) -> Option<String> {
+                self.hub.site_id()
+            }
+            async fn emit_bus(&self, name: &str, data: Data, context: Context) -> Result<()> {
+                if self.silence && data["intent_name"] == "second" {
+                    return Ok(());
+                }
+                let response = if self.refused {
+                    json!({"ok": false, "error": "unknown intent"})
+                } else {
+                    json!({"ok": true, "definitions": []})
+                };
+                self.hub
+                    .deliver(EVENT_INTENT_DESCRIBE_RESPONSE, response, &context);
+                assert_eq!(name, EVENT_INTENT_DESCRIBE);
+                Ok(())
+            }
+        }
+        let wanted = vec![
+            ("skill".into(), "first".into(), "en-us".into()),
+            ("skill".into(), "second".into(), "en-us".into()),
+        ];
+        for refused in [false, true] {
+            for batch in [1, 2] {
+                let mut hub = EmptyAnswers {
+                    hub: FakeHub::default(),
+                    refused,
+                    silence: true,
+                };
+                assert!(
+                    matches!(
+                        describe_many(&hub, &wanted, Duration::from_millis(20), batch).await,
+                        Err(ThalovantError::Timeout(_))
+                    ),
+                    "refused={refused}, batch={batch}: no usable partial definition"
+                );
+                hub.silence = false;
+                let found = describe_many(&hub, &wanted, Duration::from_secs(1), batch)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    found.len(),
+                    2,
+                    "explicit answers for every registration remain valid"
                 );
             }
         }

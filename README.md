@@ -253,26 +253,27 @@ control.release_runtime_group(&group_id, channel()).await?;
 control.release_hub(&hub_id, channel()).await?;
 ```
 
-Creating a hub is idempotent. `create_hub` sends a generated `Idempotency-Key`
-header when you pass `None`, so a create retried after a timeout returns the
-hub that was already created instead of making a second one. Pass
-`Some(key)` to control the key yourself. No other provisioning route reads that
-header.
+For safe `create_hub` retries, choose one idempotency key before the first
+attempt and pass the same `Some(key)` and payload for retries of that operation.
+`None` generates a fresh
+`Idempotency-Key` per call; repeating it after a timeout can create a second
+hub. No other hub provisioning route reads that header.
 
 Updating and deleting a hub use optimistic locking, so `etag` is a required
 argument rather than an option. Pass the `etag` from the hub resource you read
 — it lives in the JSON body, not in an `ETag` response header — and the SDK
-sends it as `If-Match`. The API rejects a stale *or missing* value with HTTP
-412 without changing anything:
+sends it as `If-Match`. The API rejects a stale value with HTTP 412 without
+changing anything. Empty or whitespace-only values fail locally with
+`ThalovantError::Api` before any request is sent:
 
 ```rust
 let hub = control.get_hub(&hub_id).await?;
-let etag = hub["etag"].as_str().unwrap_or_default();
+let etag = hub["etag"].as_str().ok_or("hub response has no etag")?;
 let hub = control
     .update_hub(&hub_id, json!({"active": false}), etag)
     .await?;
 control
-    .delete_hub(&hub_id, hub["etag"].as_str().unwrap_or_default())
+    .delete_hub(&hub_id, hub["etag"].as_str().ok_or("hub response has no etag")?)
     .await?;
 ```
 
@@ -677,6 +678,13 @@ API for low-latency app integrations.
 let reply = client.query("What time is it in Toronto?", QueryOptions::default()).await?;
 ```
 
+When migrating from the old MQTT topic API, replace `MqttTopicSet.c2s` and
+`.s2c` with `.inbound` and `.outbound`. `MqttBrokerCredentials.hub_id`,
+`c2s_topic`, `s2c_topic`, `status_topic`, and `hash_topics` were removed: use
+the API-provided full `topic_prefix`, from which `/in`, `/out`, and `/status`
+are derived. These historical breaking changes are included in the 0.3 and
+later release lines; no additional field is removed by this patch.
+
 MQTT identities include a broker endpoint, username, password, TLS flag, and
 topic prefix. The broker credentials are scoped to that client and should be
 treated like a password. Public identities should use `mqtts://`; the SDK also
@@ -814,12 +822,15 @@ for item in items {
   `retry_after_seconds`; wait that long and resend.
 - `HTTP 429` with `"code": "token_quota_exceeded"`: the API token exhausted
   its plan's daily or monthly call quota. The body names which in `quota`
-  (`daily` or `monthly`) alongside `limit` and `used`, and `Retry-After`
+  (`daily` or `monthly`) alongside `limit`, `used`, and `retry_after_seconds`;
+  `Retry-After`
   points at the next UTC day or month boundary.
 
 Both 429s apply to token-authenticated control-plane calls and surface as
-`ThalovantError::Api`, carrying the status and response body. The SDK does not
-retry automatically: `Retry-After` is authoritative, so honor it before
+`ThalovantError::Api`, carrying the status and a bounded, redacted JSON error
+object. Unstructured response bodies are omitted. The SDK does not expose
+HTTP headers or structured retry metadata and does not retry automatically.
+When inspecting a direct API response, `Retry-After` is authoritative; honor it before
 resending. Per-plan limits are listed in the dashboard and at
 <https://docs.thalovant.com/developers/sdks/rust/>.
 
@@ -914,3 +925,11 @@ Each stream owns a bounded transport subscription. Overflow and connection loss
 are explicit errors. Drop or `close()` the stream to unsubscribe without closing
 the shared client. Cancelling an individual `recv` future leaves the stream
 usable; dropping a `wait_for_event` future releases its subscription.
+
+Concurrent `ask` calls sharing a transport (including cloned clients) must use
+distinct request IDs; concurrent `query` calls must use distinct query IDs.
+An active duplicate returns `ThalovantError::Runtime` before publication. Ask
+and Query have separate namespaces. Dropping or completing a collector frees
+its reservation; existing transport ownership still controls retiring writes.
+Use fresh IDs for every later logical operation, including after cancellation;
+delayed remote replies can outlive the collector that originally requested them.

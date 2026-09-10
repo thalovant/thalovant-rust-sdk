@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.2
+
+- Reject duplicate active Ask request IDs and Query query IDs on a shared
+  transport, including Client clones, without changing public Client literals.
+- Omit unstructured API error bodies that can echo credentials. Preserve
+  redacted JSON diagnostics and report peer WSS close status as a connection
+  failure instead of a misleading handshake timeout.
+- Document historical MQTT field migration and the complete live interop setup.
+- Reject blank hub ETags before sending update or delete requests.
+- Keep describe timeouts when earlier replies contain no definitions, while
+  retaining explicit empty answers and useful partial descriptions.
+- Correct idempotency retry and quota documentation; make the recording HTTP
+  fixture read complete bodies and compare install JSON independently of key order.
+
 ## 0.5.1
 
 - Recover HTTP cleanup after a lost disconnect response by accepting successful JSON responses containing exactly one `error` field with `Already Disconnected` or `Client is not connected`. Additional fields such as `ok` or `status` invalidate these idempotent acknowledgments. Preserve replica affinity and Noise trust across explicit cleanup retry or reconnect; other errors, unsuccessful HTTP responses and `ok: false` remain failures.

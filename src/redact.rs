@@ -32,6 +32,12 @@ pub(crate) fn is_secret_key(key: &str) -> bool {
     matches!(
         normalize_key(key).as_str(),
         "password"
+            | "authorization"
+            | "clientsecret"
+            | "privatekey"
+            | "apisecret"
+            | "secretkey"
+            | "credentials"
             | "apikey"
             | "cryptokey"
             | "accesskey"

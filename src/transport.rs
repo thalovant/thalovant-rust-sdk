@@ -117,11 +117,29 @@ pub enum RuntimeTransport {
 
 #[derive(Default)]
 struct ConnectionControl {
+    active_replies: std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
     gate: Mutex<()>,
     generation: std::sync::atomic::AtomicU64,
     cancelled: AtomicBool,
     active_attempt: AtomicBool,
     retired: Notify,
+}
+
+/// Retains the shared transport identity without changing public Client literals.
+pub(crate) struct ReplyReservation {
+    transport: RuntimeTransport,
+    key: (bool, String),
+}
+
+impl Drop for ReplyReservation {
+    fn drop(&mut self) {
+        self.transport
+            .control()
+            .active_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key);
+    }
 }
 
 impl ConnectionControl {
@@ -169,6 +187,24 @@ impl Drop for ConnectionAttempt {
 }
 
 impl RuntimeTransport {
+    pub(crate) fn reserve_reply(&self, query: bool, id: &str) -> Result<ReplyReservation> {
+        let key = (query, id.to_string());
+        let mut active = self
+            .control()
+            .active_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !active.insert(key.clone()) {
+            return Err(ThalovantError::Runtime(
+                "reply correlation ID is already active on this transport".into(),
+            ));
+        }
+        Ok(ReplyReservation {
+            transport: self.clone(),
+            key,
+        })
+    }
+
     pub fn for_protocol(identity: Identity, protocol: HubProtocol) -> Result<Self> {
         match protocol {
             HubProtocol::Https => Ok(Self::Http(HttpTransport::new(identity))),
@@ -1061,8 +1097,20 @@ impl WssTransport {
                             break;
                         }
                     }
-                    Ok(WebSocketMessage::Close(_)) => {
+                    Ok(WebSocketMessage::Close(frame)) => {
                         transport.mark_disconnected().await;
+                        // The close status explains a peer refusal without echoing
+                        // arbitrary remote reason text into diagnostics.
+                        let detail = match frame {
+                            Some(frame) => format!(
+                                "WSS peer closed the connection (code {})",
+                                u16::from(frame.code)
+                            ),
+                            None => "WSS peer closed the connection without a status".into(),
+                        };
+                        let mut health = transport.state.health.lock().await;
+                        health.last_error = Some(detail.clone());
+                        health.connection.last_error = Some(detail);
                         break;
                     }
                     Ok(_) => {}
