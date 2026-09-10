@@ -45,13 +45,13 @@ impl Drop for StateDir {
 const NODE_ID: &str =
     "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEF\n-----END PUBLIC KEY-----";
 
-/// Sourced at run time, so no literal anywhere reaches a password parameter.
-/// A literal there is indistinguishable, to a scanner, from a real credential
-/// committed to the repository -- and it is right to say so, so the tests
-/// avoid one rather than suppressing the rule. Each test uses its own state
-/// directory, so one value serves them all.
+/// A synthetic credential with a runtime seed. Its non-hex prefix prevents a
+/// short process ID from accidentally matching a legitimate derived-key hex
+/// substring in the cache's no-plaintext assertion.
 fn test_password() -> String {
-    std::env::var("THALOVANT_TEST_PASSWORD").unwrap_or_else(|_| std::process::id().to_string())
+    let seed =
+        std::env::var("THALOVANT_TEST_PASSWORD").unwrap_or_else(|_| std::process::id().to_string());
+    format!("synthetic-psk-cache-fixture:{seed}")
 }
 
 #[test]
@@ -95,6 +95,14 @@ fn cache_file_holds_only_the_key() {
     save_cached_psk(Some(dir.path()), NODE_ID, &psk).expect("save");
 
     let raw = fs::read_to_string(dir.path().join(NOISE_PSK_FILENAME)).expect("read");
+    let cache: serde_json::Value = serde_json::from_str(&raw).expect("cache JSON");
+    let entries = cache.as_object().expect("cache object");
+    assert_eq!(
+        entries.len(),
+        1,
+        "the cache must contain only one key entry"
+    );
+    assert_eq!(entries.values().next().unwrap(), &hex::encode(psk));
     assert!(
         !raw.contains(&password),
         "the cache must not hold the password"
