@@ -734,9 +734,9 @@ impl ControlPlane {
     /// required, and `slug`, `namespace`, `runtime_group_id`, `domain`,
     /// `active`, `visibility`, `capacity_profile`, and `owner_id` are optional.
     ///
-    /// The request is idempotent: a generated `Idempotency-Key` is sent unless
-    /// you pass your own, so a create retried after a timeout returns the first
-    /// hub instead of making a second one.
+    /// For safe retries, pass the same explicit `Some(key)` and payload on every attempt.
+    /// `None` generates a fresh `Idempotency-Key` for this call only; repeating
+    /// such a call after a timeout can create another hub.
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope. A
     /// free-plan token fails with HTTP 402 and a token without the scope with
@@ -761,12 +761,18 @@ impl ControlPlane {
     ///
     /// The API enforces optimistic locking on this route, so `etag` is
     /// required, not optional: pass the `etag` from the hub resource you read
-    /// and the SDK sends it as `If-Match`. A stale or missing value fails the
+    /// and the SDK sends it as `If-Match`. A stale value fails the
     /// request with HTTP 412 and changes nothing; re-read the hub with
-    /// [`ControlPlane::get_hub`] and retry with the new `etag`.
+    /// [`ControlPlane::get_hub`] and retry with the new `etag`. Blank values
+    /// fail locally with [`ThalovantError::Api`] before any request is sent.
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope.
     pub async fn update_hub(&self, hub_id: &str, payload: Value, etag: &str) -> Result<Value> {
+        if etag.trim().is_empty() {
+            return Err(ThalovantError::Api(
+                "etag is required for hub updates and deletions".into(),
+            ));
+        }
         self.request(
             "PATCH",
             &format!("/v1/hubs/{}", urlencoding::encode(hub_id)),
@@ -780,11 +786,16 @@ impl ControlPlane {
     /// Delete a hub along with its dependent clients and ACLs.
     ///
     /// Like [`ControlPlane::update_hub`] this route requires the hub's current
-    /// `etag`, sent as `If-Match`; a stale or missing value fails with HTTP
-    /// 412.
+    /// `etag`, sent as `If-Match`; a stale value fails with HTTP 412. Blank
+    /// values fail locally with [`ThalovantError::Api`] before any request.
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope.
     pub async fn delete_hub(&self, hub_id: &str, etag: &str) -> Result<()> {
+        if etag.trim().is_empty() {
+            return Err(ThalovantError::Api(
+                "etag is required for hub updates and deletions".into(),
+            ));
+        }
         let _ = self
             .request(
                 "DELETE",
@@ -1699,15 +1710,16 @@ fn json_string(value: &Value) -> Option<String> {
 }
 
 /// Reduce a raw HTTP response body to a short detail that is safe to embed in an
-/// error message. When the body is JSON its secret-keyed fields are redacted
+/// error message. Unstructured bodies are omitted; JSON objects have their
+/// secret-keyed fields redacted
 /// (the `POST /v1/clients`, `/v1/auth/token`, and `/v1/auth/device/token` routes
 /// are *sent* credentials that an error response may echo); whitespace is then
 /// collapsed and the result is length-bounded so a large or multi-line body
 /// never lands verbatim in `last_error`, logs, or a bug report.
 fn server_error_detail(body: &str) -> String {
     let rendered = match serde_json::from_str::<Value>(body) {
-        Ok(value) => crate::redact::redact_value(&value).to_string(),
-        Err(_) => body.to_string(),
+        Ok(value) if value.is_object() => crate::redact::redact_value(&value).to_string(),
+        _ => "(server error response omitted)".to_string(),
     };
     let collapsed = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
     const MAX_DETAIL: usize = 200;
@@ -2584,6 +2596,43 @@ mod tests {
     const RUNTIME_GROUP_CONFIG_BODY: &str = r#"{"runtime_group_id":"rg-1","config":{"lang":"en-us"},"personas":{"default":"assistant"}}"#;
     const DESIRED_SKILL_BODY: &str = r#"{"id":"desired-1","runtime_group_id":"rg-1","skill_id":"skill-weather","source_type":"catalog","active":true}"#;
 
+    fn read_full_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let size = stream.read(&mut chunk).expect("read complete request");
+            assert!(size > 0, "request closed before its body completed");
+            raw.extend_from_slice(&chunk[..size]);
+            assert!(
+                raw.len() <= 1024 * 1024,
+                "test request exceeds fixture limit"
+            );
+            if let Some(header_end) = raw.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&raw[..header_end]).unwrap();
+                let body_len = head
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, length)| length.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                assert!(
+                    body_len <= 1024 * 1024 - header_end - 4,
+                    "body exceeds fixture limit"
+                );
+                if raw.len() >= header_end + 4 + body_len {
+                    return String::from_utf8(raw).expect("UTF-8 test request");
+                }
+            }
+        }
+    }
+
+    fn request_body(request: &str) -> Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
     /// Serve `count` requests, answering each from `route` and recording the
     /// raw request text so assertions can run after the server has stopped.
     fn spawn_recording_server(
@@ -2599,9 +2648,7 @@ mod tests {
         let handle = thread::spawn(move || {
             for _ in 0..count {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut buffer = [0_u8; 16384];
-                let size = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                let request = read_full_request(&mut stream);
                 let (status, body) = route(&request);
                 write_json_response(&mut stream, status, body);
                 recorded.lock().expect("record request").push(request);
@@ -2612,6 +2659,64 @@ mod tests {
 
     fn recorded(requests: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, index: usize) -> String {
         requests.lock().expect("read requests")[index].clone()
+    }
+
+    #[test]
+    fn recording_server_waits_for_the_complete_fragmented_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (routed, observed) = std::sync::mpsc::channel();
+        let (server, requests) = spawn_recording_server(listener, 1, move |_| {
+            routed.send(()).unwrap();
+            ("200 OK", "{}")
+        });
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        let body = r#"{"name":"café","active":true}"#;
+        let headers = format!(
+            "POST /v1/hubs HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        client.write_all(headers.as_bytes()).unwrap();
+        let early_route = observed.recv_timeout(Duration::from_millis(100));
+        if early_route.is_ok() {
+            server.join().unwrap();
+            panic!("routing happened before the promised body arrived");
+        }
+        client.write_all(body.as_bytes()).unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        server.join().unwrap();
+        assert!(recorded(&requests, 0).ends_with(body));
+    }
+
+    #[tokio::test]
+    async fn empty_hub_etags_fail_before_any_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".into()));
+        for etag in ["", " \t "] {
+            let updated = tokio::time::timeout(
+                Duration::from_millis(100),
+                control.update_hub("hub", json!({}), etag),
+            )
+            .await;
+            assert!(
+                matches!(updated, Ok(Err(ThalovantError::Api(_)))),
+                "update should fail locally: {updated:?}"
+            );
+            let deleted =
+                tokio::time::timeout(Duration::from_millis(100), control.delete_hub("hub", etag))
+                    .await;
+            assert!(
+                matches!(deleted, Ok(Err(ThalovantError::Api(_)))),
+                "delete should fail locally: {deleted:?}"
+            );
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "must not open a connection"
+        );
     }
 
     #[tokio::test]
@@ -2962,10 +3067,11 @@ mod tests {
 
         // The default install is an active catalog install with no extra keys.
         let default_install = recorded(&requests, 0);
-        assert!(
-            default_install
-                .ends_with(r#"{"active":true,"skill_id":"skill-weather","source_type":"catalog"}"#),
-            "unexpected default install body: {default_install}"
+        assert_eq!(
+            request_body(&default_install),
+            json!({
+                "active": true, "skill_id": "skill-weather", "source_type": "catalog"
+            })
         );
 
         let git_install = recorded(&requests, 1);
@@ -3304,6 +3410,65 @@ mod tests {
         // The user code is meant to be shown to the end user.
         assert!(debug.contains("WDJB-MJHT"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[tokio::test]
+    async fn unstructured_error_bodies_do_not_echo_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (server, _) = spawn_recording_server(listener, 4, |request| {
+            let body = if request.starts_with("GET /v1/hubs/plain ") {
+                "password=RAW-SECRET"
+            } else if request.starts_with("GET /v1/hubs/scalar ") {
+                r#""RAW-SECRET""#
+            } else if request.starts_with("GET /v1/hubs/array ") {
+                r#"["RAW-SECRET"]"#
+            } else {
+                r#"{"detail":"safe diagnostic","password":"RAW-SECRET"}"#
+            };
+            ("500 Internal Server Error", body)
+        });
+        let control = ControlPlane::new(format!("http://{address}"), Some("token".into()));
+        let mut failures = Vec::new();
+        for id in ["plain", "scalar", "array", "object"] {
+            failures.push(control.get_hub(id).await.unwrap_err().to_string());
+        }
+        server.join().unwrap();
+        for error in &failures {
+            assert!(error.contains("500"));
+            assert!(
+                !error.contains("RAW-SECRET"),
+                "raw credentials reached the returned error"
+            );
+        }
+        assert!(failures[3].contains("safe diagnostic"));
+    }
+
+    #[test]
+    fn credential_aliases_are_redacted_in_errors_and_debug_without_changing_serialization() {
+        let mut result = bootstrap_result_with_secrets();
+        let fields = json!({
+            "detail": "safe diagnostic",
+            "Authorization": "ALIAS-SECRET",
+            "client_secret": "ALIAS-SECRET",
+            "PRIVATE-KEY": "ALIAS-SECRET",
+            "nested": [{"apiSecret": "ALIAS-SECRET", "secret_key": "ALIAS-SECRET"}],
+            "credentials": {"custom": "ALIAS-SECRET"}
+        });
+        result.client = fields.clone();
+        result.identity.metadata = fields.as_object().unwrap().clone();
+        let detail = server_error_detail(&fields.to_string());
+        let debug = format!("{result:?}");
+        let public = result.as_value(false).to_string();
+        for text in [detail, debug, public] {
+            assert!(!text.contains("ALIAS-SECRET"), "credential alias leaked");
+            assert!(text.contains("safe diagnostic"));
+        }
+        assert_eq!(result.as_value(true)["client"], fields);
+        assert_eq!(
+            serde_json::to_value(&result.identity).unwrap()["metadata"],
+            fields
+        );
     }
 
     #[test]

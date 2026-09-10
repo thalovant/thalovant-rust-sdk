@@ -117,6 +117,10 @@ impl Responder {
                 self.hellos += 1;
                 return Ok(vec![]);
             }
+            if message.msg_type == "query" {
+                // Admission tests keep cascade collectors pending without a reply.
+                return Ok(vec![]);
+            }
             if message.msg_type != "bus" {
                 return Err(ThalovantError::Connection("unexpected message".into()));
             }
@@ -359,7 +363,9 @@ impl HttpFixture {
                 let acceptor = acceptor.clone();
                 let state = server_state.clone();
                 tokio::spawn(async move {
-                    let mut stream = acceptor.accept(stream).await.unwrap();
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return; // A cancelled client can close during the TLS handshake.
+                    };
                     let mut bytes = vec![];
                     let mut chunk = [0; 4096];
                     let header_end;
@@ -1806,4 +1812,141 @@ async fn failed_http_admission_reset_refreshes_both_health_errors() {
     );
     assert_eq!(health.connection.last_error, health.last_error);
     assert!(transport.state.admitted.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn active_reply_ids_reject_duplicates_on_a_shared_authenticated_transport() {
+    async fn invoke(
+        client: crate::Client,
+        query: bool,
+        request_id: &str,
+        budget: Duration,
+    ) -> Result<crate::Reply> {
+        if query {
+            client
+                .query(
+                    "question",
+                    crate::QueryOptions {
+                        request_id: Some(request_id.into()),
+                        query_id: Some("shared".into()),
+                        timeout: Some(budget),
+                        ..Default::default()
+                    },
+                )
+                .await
+        } else {
+            client
+                .ask(
+                    "question",
+                    crate::RequestOptions {
+                        request_id: Some("shared".into()),
+                        timeout: Some(budget),
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+    }
+    for query in [false, true] {
+        let fixture = HttpFixture::new().await;
+        let transport = fixture.transport();
+        let dir = FixtureDir::new();
+        transport.set_noise_state_dir(Some(dir.0.clone())).await;
+        let client = crate::Client {
+            identity: transport.identity().clone(),
+            transport: RuntimeTransport::Http(transport.clone()),
+        };
+        client.connect().await.unwrap();
+        let first = tokio::spawn(invoke(
+            client.clone(),
+            query,
+            "first",
+            Duration::from_secs(10),
+        ));
+        timeout(Duration::from_secs(2), async {
+            while if query {
+                transport.state.hive_tx.receiver_count()
+            } else {
+                transport.state.bus_tx.receiver_count()
+            } == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let duplicate = invoke(
+            client.clone(),
+            query,
+            "different-request-same-query",
+            Duration::from_millis(50),
+        )
+        .await;
+        // Equal strings in different matching namespaces must remain independent.
+        let independent = invoke(
+            client.clone(),
+            !query,
+            "other-namespace",
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(
+            !matches!(independent, Err(ThalovantError::Runtime(_))),
+            "Ask and Query namespaces collided: {independent:?}"
+        );
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert!(
+            matches!(duplicate, Err(ThalovantError::Runtime(_))),
+            "query={query}: duplicate must fail before publication: {duplicate:?}"
+        );
+        // The dropped collector released its reservation, even through a Client clone.
+        let repeated = invoke(client.clone(), query, "again", Duration::from_millis(30)).await;
+        assert!(
+            !matches!(repeated, Err(ThalovantError::Runtime(_))),
+            "cancelled collector leaked its reservation: {repeated:?}"
+        );
+        let _ = client.close().await;
+    }
+}
+
+#[tokio::test]
+async fn a_peer_close_during_handshake_is_not_reported_as_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let identity = Identity::from_value(json!({"site_id":"test","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"wss":endpoint}})).unwrap();
+    let transport = WssTransport::new(identity);
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        socket
+            .send(WebSocketMessage::Close(Some(
+                tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    reason: "untrusted-password=RAW-SECRET".into(),
+                },
+            )))
+            .await
+            .unwrap();
+    });
+    let error = timeout(Duration::from_secs(2), transport.connect())
+        .await
+        .unwrap()
+        .unwrap_err();
+    server.await.unwrap();
+    assert!(
+        matches!(error, ThalovantError::Connection(_)),
+        "peer refusal was mislabeled: {error:?}"
+    );
+    assert!(error.to_string().contains("1008"));
+    assert!(!error.to_string().contains("RAW-SECRET"));
+    assert!(!transport
+        .healthcheck()
+        .await
+        .last_error
+        .unwrap()
+        .contains("RAW-SECRET"));
 }
