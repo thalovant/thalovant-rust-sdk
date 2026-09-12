@@ -285,64 +285,70 @@ impl HubIntent {
         self.phrases.keys().map(String::as_str).collect()
     }
 
-    /// The sentences for one language, matched case-insensitively with `_`/`-` folded.
+    /// Sentences for the closest OVOS-compatible registered locale.
     pub fn phrases_for(&self, lang: &str) -> &[String] {
-        self.phrases
-            .iter()
-            .find(|(candidate, _)| same_language(candidate, lang))
-            .map(|(_, sentences)| sentences.as_slice())
+        crate::closest_language(lang, self.phrases.keys().map(String::as_str))
+            .and_then(|tag| self.phrases.get(tag))
+            .map(Vec::as_slice)
             .unwrap_or(&[])
     }
-
-    /// A few sentences worth showing: whole ones before ones with a slot,
-    /// shorter ones first. `lang` `None` takes the first language; `limit` 0
-    /// returns every sentence as the skill wrote them.
+    /// Complete phrases before prefixes/slots, fuller wording up to eight words.
     pub fn examples(&self, lang: Option<&str>, limit: usize) -> Vec<String> {
-        self.examples_with_options(lang, limit, false, &std::collections::BTreeMap::new())
+        self.examples_with_listing(lang, limit, &crate::IntentExampleOptions::default())
     }
-
+    /// Existing rendering API; locale defaults are now applied to slot examples.
     pub fn examples_with_options(
         &self,
         lang: Option<&str>,
         limit: usize,
         render: bool,
-        slots: &std::collections::BTreeMap<String, String>,
+        slots: &BTreeMap<String, String>,
     ) -> Vec<String> {
-        let mut pool: Vec<String> = match lang {
-            Some(lang) => self.phrases_for(lang).to_vec(),
-            None => self.phrases.values().next().cloned().unwrap_or_default(),
-        };
-        let mut ranks = std::collections::BTreeMap::<String, bool>::new();
-        if render {
-            let mut rendered = Vec::new();
-            for pattern in &pool {
-                let sentence = crate::speakable(pattern, slots);
-                if sentence.is_empty() {
-                    continue;
-                }
-                if !ranks.contains_key(&sentence) {
-                    rendered.push(sentence.clone());
-                }
-                let rank = ranks.get(&sentence).copied().unwrap_or(true) && pattern.contains('{');
-                ranks.insert(sentence, rank);
+        self.examples_with_listing(
+            lang,
+            limit,
+            &crate::IntentExampleOptions {
+                speakable: render,
+                slots: slots.clone(),
+                ..Default::default()
+            },
+        )
+    }
+    pub fn examples_with_listing(
+        &self,
+        lang: Option<&str>,
+        limit: usize,
+        options: &crate::IntentExampleOptions<'_>,
+    ) -> Vec<String> {
+        let lang = lang
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.phrases.keys().next().map(String::as_str));
+        let pool = lang.map(|lang| self.phrases_for(lang)).unwrap_or(&[]);
+        let listing = options.listing.unwrap_or(&crate::DEFAULT_LISTING);
+        if !options.speakable && !options.sentence {
+            if limit == 0 {
+                return pool.to_vec();
             }
-            pool = rendered;
+            let mut rows = listing.rank(pool, lang);
+            rows.truncate(limit);
+            return rows;
         }
-        if limit == 0 {
-            return pool;
+        let mut result = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for pattern in listing.rank(pool, lang) {
+            let mut text = listing.speakable(&pattern, &options.slots, lang);
+            if options.sentence {
+                text = listing.as_sentence(&text, lang);
+            }
+            if text.is_empty() || !seen.insert(text.clone()) {
+                continue;
+            }
+            result.push(text);
+            if limit > 0 && result.len() >= limit {
+                break;
+            }
         }
-        let mut chosen = pool;
-        chosen.sort_by_key(|text| {
-            (
-                ranks
-                    .get(text)
-                    .copied()
-                    .unwrap_or_else(|| text.contains('{')),
-                text.chars().count(),
-            )
-        });
-        chosen.truncate(limit);
-        chosen
+        result
     }
 
     /// The JSON the other SDKs and the CLI print for an intent.

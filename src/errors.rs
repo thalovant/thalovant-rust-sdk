@@ -17,6 +17,8 @@ pub enum ThalovantError {
     Connection(String),
     #[error("timeout: {0}")]
     Timeout(String),
+    #[error("listing error: {0}")]
+    Listing(String),
     #[error("runtime error: {0}")]
     Runtime(String),
     /// The hub refused a message type this connection may not publish.

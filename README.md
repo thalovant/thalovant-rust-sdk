@@ -1018,3 +1018,38 @@ Guarded merges in 0.7.1 preserve native signed/unsigned 64-bit integers but
 reject floating-point configuration/persona values outside the exact integer
 range (±9,007,199,254,740,991), including stored integers that overflow native
 JSON integer storage. Use string identifiers for larger integers.
+
+## Locale-aware intent listings
+
+`as_sentence("quelle heure est-il", Some("fr-CA"))` returns
+`"Quelle heure est-il?"`. `speakable_with_language(pattern, &slots, Some(lang))`
+uses the bundled thalovant-languages 0.1.1 slot examples before explicit caller
+overrides. The original `speakable` function remains available without locale defaults.
+
+Use `intent.examples_with_listing(lang, limit, &IntentExampleOptions {
+sentence: true, ..Default::default() })` for capitalized sentences. Sentence mode
+also renders patterns. The existing `examples_with_options` remains available.
+Complete phrases rank before prefixes and slot patterns, then fuller wording
+up to eight words. Empty and duplicate rendered phrases do not consume limits.
+Raw unlimited examples keep their registered order. With no language, the
+first sorted phrase-map key supplies the locale.
+
+Regional matching follows the OVOS distance policy using langcodes 3.5.1 CLDR
+data, including Portuguese norm-region behavior. Distances above ten do not
+match; ties preserve candidate order.
+
+`ListingRules::new(Some(data))` owns a complete custom data tree. Pass a reference
+in `IntentExampleOptions.listing` or call its methods. `ListingRules::new(None)`
+selects bare rendering with slot names. Unknown languages also stay bare. Invalid
+patterns return `ThalovantError::Listing`. Regex backtracking is limited to
+100,000 steps; `asks` reports matching failures, while sentence rendering leaves
+failed rules unpunctuated. The rules are safe to share between threads and
+perform no runtime file or network access.
+
+Generated source licenses are included in `LICENSE-languages` and
+`LICENSE-langcodes`. Regenerate data and reference cases with
+`python scripts/sync-listing-data.py --test-dir tests/data` using the public
+Python environment pinned in that script.
+
+The SDK code, CLDR matching tables and bundled `thalovant-languages` data
+retain their upstream MIT license notices. Both data notices ship with the SDK.
