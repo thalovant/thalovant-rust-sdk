@@ -1050,3 +1050,6 @@ Generated source licenses are included in `LICENSE-languages` and
 `LICENSE-langcodes`. Regenerate data and reference cases with
 `python scripts/sync-listing-data.py --test-dir tests/data` using the public
 Python environment pinned in that script.
+
+The SDK code and CLDR matching tables are MIT-licensed; bundled
+`thalovant-languages` data is Apache-2.0-licensed. Both notices ship with the SDK.
