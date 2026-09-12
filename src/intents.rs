@@ -298,15 +298,49 @@ impl HubIntent {
     /// shorter ones first. `lang` `None` takes the first language; `limit` 0
     /// returns every sentence as the skill wrote them.
     pub fn examples(&self, lang: Option<&str>, limit: usize) -> Vec<String> {
-        let pool: Vec<String> = match lang {
+        self.examples_with_options(lang, limit, false, &std::collections::BTreeMap::new())
+    }
+
+    pub fn examples_with_options(
+        &self,
+        lang: Option<&str>,
+        limit: usize,
+        render: bool,
+        slots: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
+        let mut pool: Vec<String> = match lang {
             Some(lang) => self.phrases_for(lang).to_vec(),
             None => self.phrases.values().next().cloned().unwrap_or_default(),
         };
+        let mut ranks = std::collections::BTreeMap::<String, bool>::new();
+        if render {
+            let mut rendered = Vec::new();
+            for pattern in &pool {
+                let sentence = crate::speakable(pattern, slots);
+                if sentence.is_empty() {
+                    continue;
+                }
+                if !ranks.contains_key(&sentence) {
+                    rendered.push(sentence.clone());
+                }
+                let rank = ranks.get(&sentence).copied().unwrap_or(true) && pattern.contains('{');
+                ranks.insert(sentence, rank);
+            }
+            pool = rendered;
+        }
         if limit == 0 {
             return pool;
         }
         let mut chosen = pool;
-        chosen.sort_by_key(|text| (text.contains('{'), text.len()));
+        chosen.sort_by_key(|text| {
+            (
+                ranks
+                    .get(text)
+                    .copied()
+                    .unwrap_or_else(|| text.contains('{')),
+                text.chars().count(),
+            )
+        });
         chosen.truncate(limit);
         chosen
     }

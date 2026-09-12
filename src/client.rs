@@ -295,6 +295,18 @@ impl Client {
 
     /// Configure bounded delayed-speech and fragment collection explicitly.
     pub async fn ask_with_options(&self, text: &str, options: AskOptions) -> Result<Reply> {
+        self.ask_with_hints(text, options, crate::RequestContextOptions::default())
+            .await
+    }
+
+    /// Apply request-level language, pipeline and location hints without mutating caller context.
+    pub async fn ask_with_hints(
+        &self,
+        text: &str,
+        mut options: AskOptions,
+        hints: crate::RequestContextOptions,
+    ) -> Result<Reply> {
+        options.request.context = crate::request_context(options.request.context.as_ref(), &hints);
         let prompt = text.trim();
         if prompt.is_empty() {
             return Err(ThalovantError::Runtime(
@@ -546,6 +558,7 @@ async fn collect_query_reply(
     timeout_duration: Duration,
 ) -> Result<Reply> {
     let mut events = Vec::new();
+    let mut media_budget = crate::events::ReplyMediaBudget::default();
     let mut fragments = Vec::new();
     let mut failure_event = None;
     let mut soft_failure = None;
@@ -561,6 +574,9 @@ async fn collect_query_reply(
             let Some(event) = event_from_query_hive_message(&message) else {
                 continue;
             };
+            if !media_budget.accept(&event) {
+                continue;
+            }
             if event.name == "hive.query.complete" {
                 events.push(event);
                 break;
@@ -601,6 +617,7 @@ async fn collect_query_reply(
         ));
     }
     Ok(Reply {
+        dropped_media: media_budget.dropped,
         text: fragments.join(" "),
         utterances: fragments,
         handled: failure_event.is_none(),
@@ -642,6 +659,7 @@ async fn collect_ask_reply(
     options: &AskOptions,
 ) -> Result<Reply> {
     let mut events = Vec::new();
+    let mut media_budget = crate::events::ReplyMediaBudget::default();
     let mut fragments = Vec::new();
     let mut hard_failure = None;
     let mut soft_failure = None;
@@ -672,6 +690,9 @@ async fn collect_ask_reply(
         // A runtime may replace the session ID. The request ID is required:
         // ambient or uncorrelated events must never satisfy a concurrent Ask.
         if event.request_id().as_deref() != Some(request_id) {
+            continue;
+        }
+        if !media_budget.accept(&event) {
             continue;
         }
         match event.name.as_str() {
@@ -720,6 +741,7 @@ async fn collect_ask_reply(
         });
     }
     Ok(Reply {
+        dropped_media: media_budget.dropped,
         text: fragments.join(" "),
         utterances: fragments,
         handled: failure_event.is_none(),

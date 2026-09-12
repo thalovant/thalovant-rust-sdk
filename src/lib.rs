@@ -3,6 +3,10 @@
 pub mod client;
 pub mod constants;
 pub mod context;
+mod request_helpers;
+pub use request_helpers::{
+    build_location, request_context, speakable, LocationOptions, RequestContextOptions,
+};
 pub mod control;
 pub mod errors;
 pub mod events;

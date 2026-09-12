@@ -2,6 +2,9 @@ pub const DEFAULT_USER_AGENT: &str = concat!("thalovant-rust-sdk/", env!("CARGO_
 
 pub const EVENT_RECOGNIZER_LOOP_UTTERANCE: &str = "recognizer_loop:utterance";
 pub const EVENT_UTTERANCE_HANDLED: &str = "ovos.utterance.handled";
+pub const EVENT_AUDIO_QUEUE: &str = "mycroft.audio.queue";
+pub const MAX_AUDIO_CLIP_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_REPLY_MEDIA_BYTES: usize = 16 * 1024 * 1024;
 pub const EVENT_SPEAK: &str = "speak";
 pub const EVENT_OVOS_UTTERANCE_SPEAK: &str = "ovos.utterance.speak";
 /// Legacy Mycroft name for the "no intent matched" bus event.
