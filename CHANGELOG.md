@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0 — 2026-09-12
+
+- Add locale-aware sentence listings, canonical slot examples, fuller phrase ranking and OVOS-compatible regional language selection.
+- Own custom rule data, retain the selected locale and count unique rendered examples toward limits.
+- Bound regex backtracking; expose matching failures and keep sentence output bare when a rule cannot be evaluated safely.
+
 ## 0.7.1 — 2026-09-12
 
 - Reject lossy floating-point values in guarded config/personas merges, including stored JSON integer overflow. Preserve native signed and unsigned 64-bit integer values exactly.
