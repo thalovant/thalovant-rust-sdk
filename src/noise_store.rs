@@ -737,6 +737,22 @@ mod tests {
         }
     }
 
+    // This stress fixture checks durable state under competing processes. The
+    // production API deliberately bounds each lock wait to five seconds; a slow
+    // Windows runner may reach that bound while the other workers publish pins.
+    // Retry only that pre-mutation refusal, with an overall fixture deadline.
+    fn under_store_contention<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match operation() {
+                Err(ThalovantError::Timeout(message))
+                    if message == "Noise state lock acquisition timed out"
+                        && std::time::Instant::now() < deadline => {}
+                result => return result,
+            }
+        }
+    }
+
     #[test]
     fn store_process_worker() {
         let Some(directory) = std::env::var_os("THALOVANT_STORE_TEST_DIR") else {
@@ -766,24 +782,34 @@ mod tests {
         } else {
             fs::write(dir.join(format!("ready-{id}")), b"ready").unwrap();
             wait_for_file(&dir.join("go"));
-            let key = load_or_create_noise_key(Some(&dir)).unwrap();
+            let key = under_store_contention(|| load_or_create_noise_key(Some(&dir))).unwrap();
             fs::write(dir.join(format!("result-{id}")), hex::encode(key)).unwrap();
             if operation == "distinct" {
                 for index in 0..12 {
                     let node = format!("hub-{id}-{index}");
-                    pin_hub_key(Some(&dir), &node, &format!("{:02x}", id + 1).repeat(32)).unwrap();
+                    under_store_contention(|| {
+                        pin_hub_key(Some(&dir), &node, &format!("{:02x}", id + 1).repeat(32))
+                    })
+                    .unwrap();
                 }
             } else {
-                let result = pin_hub_key(
-                    Some(&dir),
-                    "contested",
-                    &format!("{:02x}", id + 1).repeat(32),
-                );
-                fs::write(
-                    dir.join(format!("pin-{id}")),
-                    if result.is_ok() { "won" } else { "lost" },
-                )
-                .unwrap();
+                let result = under_store_contention(|| {
+                    pin_hub_key(
+                        Some(&dir),
+                        "contested",
+                        &format!("{:02x}", id + 1).repeat(32),
+                    )
+                });
+                let outcome = match result {
+                    Ok(()) => "won",
+                    Err(ThalovantError::Connection(message))
+                        if message.starts_with("the hub's Noise static key changed.") =>
+                    {
+                        "lost"
+                    }
+                    Err(error) => panic!("Unexpected contested pin error: {error}"),
+                };
+                fs::write(dir.join(format!("pin-{id}")), outcome).unwrap();
             }
         }
     }
