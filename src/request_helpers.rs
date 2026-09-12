@@ -195,6 +195,20 @@ mod tests {
         );
         assert_eq!(e.audio_bytes().unwrap(), vec![0, 255, 16]);
         assert_eq!(e.lang().as_deref(), Some("fr"));
+        let padded = Event::new(
+            crate::EVENT_AUDIO_QUEUE,
+            Data::from_iter([("binary_data".into(), json!("00 "))]),
+            Context::new(),
+            None,
+        );
+        assert!(padded.audio_bytes_with_limit(1).is_err());
+        let whitespace = Event::new(
+            crate::EVENT_AUDIO_QUEUE,
+            Data::from_iter([("binary_data".into(), json!(" \t"))]),
+            Context::new(),
+            None,
+        );
+        assert!(whitespace.audio_bytes().unwrap().is_empty());
         for encoded in ["", "0", "0 0", "gg", "https://example.com", "00\u{a0}ff"] {
             assert!(Event::new(
                 crate::EVENT_AUDIO_QUEUE,

@@ -201,7 +201,7 @@ routes need a **paid plan** and a token with the **`hubs:write`** scope
 ("Create and update your hubs" on the dashboard's API Tokens page). A free-plan
 token fails with HTTP 402 `API access requires a paid plan.`, and a token
 without the scope fails with HTTP 403 `Insufficient scopes`; both surface as
-`ThalovantError::Api` carrying the status and body.
+`ThalovantError::ApiResponse` carrying the status and redacted detail.
 
 ```rust
 use serde_json::json;
@@ -834,7 +834,7 @@ for item in items {
   points at the next UTC day or month boundary.
 
 Both 429s apply to token-authenticated control-plane calls and surface as
-`ThalovantError::Api`, carrying the status and a bounded, redacted JSON error
+`ThalovantError::ApiResponse`, carrying the status and a bounded, redacted JSON error
 object. Unstructured response bodies are omitted. The SDK does not expose
 HTTP headers or structured retry metadata and does not retry automatically.
 When inspecting a direct API response, `Retry-After` is authoritative; honor it before
@@ -990,6 +990,7 @@ api.update_runtime_group_config(group_id, delta, None).await?;
 api.replace_runtime_group_config(group_id, full_config, None).await?;
 ```
 
+Guarded merging requires the `hubs:read` and `hubs:write` scopes and a paid plan.
 Safe merging requires an API whose configuration GET returns a valid `revision`
 and whose configuration PUT checks `expected_revision`. The SDK rereads and
 reapplies the original delta only after HTTP 412, with at most three attempts.
@@ -1003,3 +1004,12 @@ is intended, including when working with an older API. Existing code relying on
 replacement must opt into it when upgrading. Raw intent patterns remain the
 default; speakable examples remove optional parts, choose alternatives, and
 substitute caller-supplied slots while retaining complete-phrase priority.
+
+The audio limits use encoded-length upper bounds before decoding, so formatting
+whitespace consumes budget too. Like Python's `bytes.fromhex`, ASCII whitespace
+alone decodes to zero bytes. Bounded malformed clips remain available as event
+metadata and fail when decoded; they are never fetched or played automatically.
+Distinct audio events may intentionally repeat identical sound content. Only
+repeated delivery of the same event object is suppressed where object identity
+is available, without counting it as a dropped clip. Rendered example ranking
+uses the original pattern's slot presence even when sample values are supplied.

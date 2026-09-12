@@ -743,7 +743,7 @@ impl ControlPlane {
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope. A
     /// free-plan token fails with HTTP 402 and a token without the scope with
-    /// HTTP 403, both surfaced as [`ThalovantError::Api`].
+    /// HTTP 403, both surfaced as [`ThalovantError::ApiResponse`].
     pub async fn create_hub(
         &self,
         payload: Value,
