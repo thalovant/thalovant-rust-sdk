@@ -201,7 +201,7 @@ routes need a **paid plan** and a token with the **`hubs:write`** scope
 ("Create and update your hubs" on the dashboard's API Tokens page). A free-plan
 token fails with HTTP 402 `API access requires a paid plan.`, and a token
 without the scope fails with HTTP 403 `Insufficient scopes`; both surface as
-`ThalovantError::Api` carrying the status and body.
+`ThalovantError::ApiResponse` carrying the status and redacted detail.
 
 ```rust
 use serde_json::json;
@@ -282,7 +282,7 @@ Deleting a hub also deletes its clients and ACLs. Runtime groups have no
 delete the workspace default group or a group that still has hubs attached
 (HTTP 409).
 
-Runtime configuration is merged, not replaced, and `personas` is sent only when
+Runtime configuration is deep-merged using a revision precondition, and `personas` is sent only when
 you pass `Some(..)`:
 
 ```rust
@@ -834,7 +834,7 @@ for item in items {
   points at the next UTC day or month boundary.
 
 Both 429s apply to token-authenticated control-plane calls and surface as
-`ThalovantError::Api`, carrying the status and a bounded, redacted JSON error
+`ThalovantError::ApiResponse`, carrying the status and a bounded, redacted JSON error
 object. Unstructured response bodies are omitted. The SDK does not expose
 HTTP headers or structured retry metadata and does not retry automatically.
 When inspecting a direct API response, `Retry-After` is authoritative; honor it before
@@ -961,3 +961,55 @@ Methods: `list_hub_skills / list_hub_skill_history / install_hub_skill / update_
 without waiting, retain the complete accepted response (including `operation_id`
 and `state`), then pass that response to the wait helper separately. Cancelling waiting does not undo the server operation. After a polling
 failure, inspect/resume that operation instead of submitting the write again.
+
+## Request helpers and safe configuration updates (0.7.0)
+
+Request hints carry a recognized language, ordered intent pipeline, and caller
+location without changing the caller's context. Empty hints are omitted. The
+location helper requires a city and omits invalid or zero/zero coordinates.
+The hub validates language hints against its configured languages.
+
+Replies expose their reported language, ordered speech/audio events, and a
+count of dropped media. Embedded skill clips are limited to 4 MiB each and
+16 MiB per reply, checked before retention and decoding. Audio does not extend
+the reply settlement window. Decoding accepts hexadecimal bytes with ASCII
+whitespace between bytes; it never fetches a skill-supplied URL or file path.
+The application owns playback (the `play`/`Play` function in this example).
+
+```rust
+let location = thalovant::build_location(&thalovant::LocationOptions {
+    city: "Montréal".into(), country: "CA".into(), ..Default::default()
+});
+let reply = client.ask_with_hints("Quel temps fait-il ?", Default::default(), thalovant::RequestContextOptions {
+    stt_lang: Some("fr-ca".into()), location, ..Default::default()
+}).await?;
+for event in reply.media_events() { if event.is_audio() { let bytes = event.audio_bytes()?; /* play bytes */ } }
+let examples = intent.examples_with_options(Some("en-us"), 2, true, &Default::default());
+api.update_runtime_group_config(group_id, delta, None).await?;
+// Explicit full replacement:
+api.replace_runtime_group_config(group_id, full_config, None).await?;
+```
+
+Guarded merging requires the `hubs:read` and `hubs:write` scopes and a paid plan.
+Safe merging requires an API whose configuration GET returns a valid `revision`
+and whose configuration PUT checks `expected_revision`. The SDK rereads and
+reapplies the original delta only after HTTP 412, with at most three attempts.
+Arrays and scalar values replace; objects merge recursively. Personas replace
+only when explicitly supplied. Connection failures, redirects, other statuses,
+and ambiguous write results are never retried. No unsafe PATCH fallback is used.
+Unconditional replacements must still be coordinated with other writers.
+
+Use the explicit replacement operation shown above when a complete replacement
+is intended, including when working with an older API. Existing code relying on
+replacement must opt into it when upgrading. Raw intent patterns remain the
+default; speakable examples remove optional parts, choose alternatives, and
+substitute caller-supplied slots while retaining complete-phrase priority.
+
+The audio limits use encoded-length upper bounds before decoding, so formatting
+whitespace consumes budget too. Like Python's `bytes.fromhex`, ASCII whitespace
+alone decodes to zero bytes. Bounded malformed clips remain available as event
+metadata and fail when decoded; they are never fetched or played automatically.
+Distinct audio events may intentionally repeat identical sound content. Only
+repeated delivery of the same event object is suppressed where object identity
+is available, without counting it as a dropped clip. Rendered example ranking
+uses the original pattern's slot presence even when sample values are supplied.

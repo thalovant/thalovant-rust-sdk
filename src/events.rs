@@ -26,6 +26,7 @@ pub struct Event {
 // the end-user bearer token, so `{:?}` must route through `Event`'s redaction.
 #[derive(Clone, PartialEq)]
 pub struct Reply {
+    pub dropped_media: usize,
     pub text: String,
     pub utterances: Vec<String>,
     pub handled: bool,
@@ -321,6 +322,7 @@ mod tests {
 
         // `{:?}` on a Reply is a central use case; it must redact too.
         let reply = Reply {
+            dropped_media: 0,
             text: "hello".to_string(),
             utterances: vec!["hello".to_string()],
             handled: true,
@@ -398,5 +400,108 @@ mod session_nat_tests {
             &event(Some("s2"), None),
             Some(&ctx(Some("s1"), None))
         ));
+    }
+}
+
+impl Event {
+    pub fn lang(&self) -> Option<String> {
+        [
+            self.data.get("lang"),
+            self.context.get("lang"),
+            self.context.get("session").and_then(|s| s.get("lang")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_null() && v.as_str() != Some(""))
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| v.to_string())
+        })
+    }
+    pub fn is_audio(&self) -> bool {
+        self.name == crate::EVENT_AUDIO_QUEUE
+    }
+    pub fn has_audio(&self) -> bool {
+        self.is_audio()
+            && self
+                .data
+                .get("binary_data")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+    }
+    pub fn audio_bytes(&self) -> crate::Result<Vec<u8>> {
+        self.audio_bytes_with_limit(crate::MAX_AUDIO_CLIP_BYTES)
+    }
+    /// Decode embedded hex only. Never fetch a path or URL returned by a skill.
+    pub fn audio_bytes_with_limit(&self, max_bytes: usize) -> crate::Result<Vec<u8>> {
+        let fail = || {
+            crate::ThalovantError::Runtime("missing, invalid or oversized embedded audio".into())
+        };
+        if !self.is_audio() {
+            return Err(fail());
+        }
+        let encoded = self
+            .data
+            .get("binary_data")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(fail)?;
+        if encoded.len().div_ceil(2) > max_bytes {
+            return Err(fail());
+        }
+        let mut compact = Vec::with_capacity(encoded.len());
+        for byte in encoded.bytes() {
+            if matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 11 | 12) {
+                if compact.len() % 2 != 0 {
+                    return Err(fail());
+                }
+            } else {
+                compact.push(byte);
+            }
+        }
+        hex::decode(compact).map_err(|_| fail())
+    }
+}
+impl Reply {
+    pub fn lang(&self) -> Option<String> {
+        self.events.iter().find_map(Event::lang)
+    }
+    pub fn has_audio(&self) -> bool {
+        self.events.iter().any(Event::is_audio)
+    }
+    pub fn media_events(&self) -> Vec<&Event> {
+        self.events
+            .iter()
+            .filter(|e| {
+                e.is_audio()
+                    || e.name == crate::EVENT_SPEAK
+                    || e.name == crate::EVENT_OVOS_UTTERANCE_SPEAK
+            })
+            .collect()
+    }
+}
+#[derive(Default)]
+pub(crate) struct ReplyMediaBudget {
+    chars: usize,
+    pub dropped: usize,
+}
+impl ReplyMediaBudget {
+    pub fn accept(&mut self, event: &Event) -> bool {
+        if !event.is_audio() {
+            return true;
+        }
+        let Some(encoded) = event.data.get("binary_data").and_then(Value::as_str) else {
+            self.dropped += 1;
+            return false;
+        };
+        if encoded.len() > crate::MAX_AUDIO_CLIP_BYTES * 2
+            || self.chars + encoded.len() > crate::MAX_REPLY_MEDIA_BYTES * 2
+        {
+            self.dropped += 1;
+            return false;
+        }
+        self.chars += encoded.len();
+        true
     }
 }

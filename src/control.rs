@@ -743,7 +743,7 @@ impl ControlPlane {
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope. A
     /// free-plan token fails with HTTP 402 and a token without the scope with
-    /// HTTP 403, both surfaced as [`ThalovantError::Api`].
+    /// HTTP 403, both surfaced as [`ThalovantError::ApiResponse`].
     pub async fn create_hub(
         &self,
         payload: Value,
@@ -966,15 +966,52 @@ impl ControlPlane {
         .await
     }
 
-    /// Merge runtime configuration into a runtime group.
-    ///
-    /// The API merges `config` into the stored configuration rather than
-    /// replacing it, and marks the group pending so the runtime operator
-    /// reconciles the change. `personas` is sent, and therefore replaced, only
-    /// when you pass `Some(..)`.
-    ///
-    /// Requires a paid plan and a token with the `hubs:write` scope.
+    /// Deep merge with a revision precondition. Only 412 conflicts retry, at most
+    /// three attempts. Older servers fail before a write; no unconditional fallback.
     pub async fn update_runtime_group_config(
+        &self,
+        runtime_group_id: &str,
+        config: Value,
+        personas: Option<Value>,
+    ) -> Result<Value> {
+        if !config.is_object() {
+            return Err(ThalovantError::Api("config must be a JSON object".into()));
+        }
+        let path = format!(
+            "/v1/runtime-groups/{}/config",
+            urlencoding::encode(runtime_group_id)
+        );
+        for attempt in 0..3 {
+            let snapshot = self.get_runtime_group_config(runtime_group_id).await?;
+            let revision = snapshot
+                .get("revision")
+                .and_then(Value::as_str)
+                .filter(|s| {
+                    s.len() == 64
+                        && s.bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                });
+            let base = snapshot.get("config").filter(|v| v.is_object());
+            let (Some(revision), Some(base)) = (revision, base) else {
+                return Err(ThalovantError::Api(
+                    "safe configuration merge requires a valid config and revision from the API"
+                        .into(),
+                ));
+            };
+            let mut body = serde_json::json!({"config": merge_runtime_config(base, &config), "expected_revision": revision});
+            if let Some(personas) = &personas {
+                body["personas"] = personas.clone();
+            }
+            let result = self.request("PUT", &path, Some(body), None, true).await;
+            if !matches!(&result, Err(e) if e.status_code() == Some(412) && attempt < 2) {
+                return result;
+            }
+        }
+        unreachable!("the last attempt always returns")
+    }
+
+    /// Explicit unconditional config replacement via PATCH. Personas replace only when supplied.
+    pub async fn replace_runtime_group_config(
         &self,
         runtime_group_id: &str,
         config: Value,
@@ -1350,15 +1387,18 @@ impl ControlPlane {
     ) -> Result<Value> {
         let (status, body) = self.send_request(method, path, body, headers, auth).await?;
         if !status.is_success() {
-            return Err(ThalovantError::Api(format!(
-                "HTTP {status}: {}",
-                server_error_detail(&body)
-            )));
+            return Err(ThalovantError::ApiResponse {
+                status_code: status.as_u16(),
+                detail: server_error_detail(&body),
+            });
         }
         if body.trim().is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str::<Value>(&body).map_err(ThalovantError::from)
+        serde_json::from_str::<Value>(&body).map_err(|_| ThalovantError::ApiResponse {
+            status_code: status.as_u16(),
+            detail: "invalid JSON response".into(),
+        })
     }
 
     async fn send_request(
@@ -1411,9 +1451,10 @@ impl ControlPlane {
             .map_err(|err| ThalovantError::Api(err.without_url().to_string()))?;
         let status = response.status();
         if status.is_redirection() {
-            return Err(ThalovantError::Api(format!(
-                "HTTP {status}: control-plane redirects are refused; configure the final API URL"
-            )));
+            return Err(ThalovantError::ApiResponse {
+                status_code: status.as_u16(),
+                detail: "control-plane redirects are refused; configure the final API URL".into(),
+            });
         }
         let body = if status.is_success() {
             response
@@ -1745,6 +1786,24 @@ fn sanitize_caller_spec(spec: &Map<String, Value>) -> Map<String, Value> {
     sanitized.remove("cryptoKey");
     sanitized.remove("crypto_key");
     sanitized
+}
+
+fn merge_runtime_config(base: &Value, delta: &Value) -> Value {
+    match (base.as_object(), delta.as_object()) {
+        (Some(base), Some(delta)) => {
+            let mut result = base.clone();
+            for (key, value) in delta {
+                result.insert(
+                    key.clone(),
+                    base.get(key)
+                        .map(|old| merge_runtime_config(old, value))
+                        .unwrap_or_else(|| value.clone()),
+                );
+            }
+            Value::Object(result)
+        }
+        _ => delta.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -2660,6 +2719,101 @@ mod tests {
         (handle, requests)
     }
 
+    #[tokio::test]
+    async fn config_merge_rereads_after_conflict_and_preserves_concurrent_keys() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let count = AtomicUsize::new(0);
+        let (server, requests) = spawn_recording_server(listener, 4, move |request| {
+            let index = count.fetch_add(1, Ordering::SeqCst);
+            match index {
+                0 => (
+                    "200 OK",
+                    r#"{"config":{"nested":{"original":true}},"revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                ),
+                1 => {
+                    assert!(request.starts_with("PUT "));
+                    ("412 Precondition Failed", "{}")
+                }
+                2 => (
+                    "200 OK",
+                    r#"{"config":{"nested":{"original":true,"concurrent":true}},"revision":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}"#,
+                ),
+                _ => ("200 OK", r#"{"ok":true}"#),
+            }
+        });
+        let result = ControlPlane::new(format!("http://{address}"), Some("test".into()))
+            .update_runtime_group_config(
+                "x",
+                json!({"nested":{"caller":true},"array":[1]}),
+                Some(json!({})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        server.join().unwrap();
+        let body = request_body(&recorded(&requests, 3));
+        assert_eq!(
+            body["config"],
+            json!({"nested":{"original":true,"concurrent":true,"caller":true},"array":[1]})
+        );
+        assert_eq!(body["personas"], json!({}));
+        assert_eq!(body["expected_revision"], "b".repeat(64));
+    }
+
+    #[tokio::test]
+    async fn config_merge_fails_closed_and_retries_only_preconditions() {
+        for (status, count) in [
+            ("400 Bad Request", 2),
+            ("401 Unauthorized", 2),
+            ("405 Method Not Allowed", 2),
+            ("409 Conflict", 2),
+            ("412 Precondition Failed", 6),
+            ("429 Too Many Requests", 2),
+            ("500 Internal Server Error", 2),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (server, _) = spawn_recording_server(listener, count, move |request| {
+                if request.starts_with("GET ") {
+                    (
+                        "200 OK",
+                        r#"{"config":{},"revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                    )
+                } else {
+                    assert!(request.starts_with("PUT "));
+                    (status, "{}")
+                }
+            });
+            let error = ControlPlane::new(format!("http://{address}"), Some("test".into()))
+                .update_runtime_group_config("x", json!({}), None)
+                .await
+                .unwrap_err();
+            assert_eq!(error.status_code().unwrap().to_string(), &status[..3]);
+            server.join().unwrap();
+        }
+        for body in [
+            r#"{"config":{}}"#,
+            r#"{"config":{},"revision":"bad"}"#,
+            r#"{"config":[],"revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let (server, _) = spawn_recording_server(listener, 1, move |request| {
+                assert!(request.starts_with("GET "));
+                ("200 OK", body)
+            });
+            assert!(
+                ControlPlane::new(format!("http://{address}"), Some("test".into()))
+                    .update_runtime_group_config("x", json!({}), None)
+                    .await
+                    .is_err()
+            );
+            server.join().unwrap();
+        }
+    }
+
     fn recorded(requests: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, index: usize) -> String {
         requests.lock().expect("read requests")[index].clone()
     }
@@ -2942,7 +3096,7 @@ mod tests {
             .await
             .expect("get config");
         control
-            .update_runtime_group_config(
+            .replace_runtime_group_config(
                 "rg-1",
                 json!({"lang": "en-us"}),
                 Some(json!({"default": "assistant"})),
@@ -2950,7 +3104,7 @@ mod tests {
             .await
             .expect("update config with personas");
         control
-            .update_runtime_group_config("rg-1", json!({"lang": "fr-fr"}), None)
+            .replace_runtime_group_config("rg-1", json!({"lang": "fr-fr"}), None)
             .await
             .expect("update config without personas");
         control
@@ -3262,9 +3416,8 @@ mod tests {
             (stale_etag, "412", "ETag mismatch"),
             (not_connected, "409", "Live skills and intents"),
         ] {
-            let ThalovantError::Api(message) = &error else {
-                panic!("unexpected error variant: {error:?}");
-            };
+            assert_eq!(error.status_code().unwrap().to_string(), status);
+            let message = error.to_string();
             assert!(
                 message.contains(status) && message.contains(detail),
                 "expected HTTP {status} and {detail:?}: {message}"

@@ -40,6 +40,8 @@ pub enum ThalovantError {
     },
     #[error("api error: {0}")]
     Api(String),
+    #[error("api error: HTTP {status_code}: {detail}")]
+    ApiResponse { status_code: u16, detail: String },
     #[error("device authorization denied: the sign-in request was denied in the browser")]
     DeviceAuthorizationDenied,
     #[error("device authorization expired: the code expired before it was approved; call login_with_browser again to request a new code")]
@@ -70,6 +72,16 @@ impl From<reqwest::Error> for ThalovantError {
     /// is rendered (notably `TransportHealth::last_error`).
     fn from(error: reqwest::Error) -> Self {
         ThalovantError::Http(error.without_url())
+    }
+}
+
+impl ThalovantError {
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::ApiResponse { status_code, .. } => Some(*status_code),
+            Self::Http(e) => e.status().map(|s| s.as_u16()),
+            _ => None,
+        }
     }
 }
 

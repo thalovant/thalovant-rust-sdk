@@ -1,6 +1,6 @@
 [package]
 name = "thalovant"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Rust SDK for direct Thalovant hub data-plane clients and agents"
 readme = "README.md"
@@ -19,6 +19,7 @@ flate2 = "1"
 fs2 = "0.4.3"
 hex = "0.4"
 rand = "0.8"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }
 rumqttc = { version = "0.25.1", default-features = false, features = ["use-native-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
