@@ -26,9 +26,10 @@ pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
 pub use control::{
     AnalyticsOverviewOptions, BootstrapIdentityOptions, BootstrapIdentityResult, ControlPlane,
-    DeviceAuthorization, DeviceLoginOptions, DevicePrompt, LoginOptions, MarketplaceSkillsOptions,
-    MemoryListOptions, OperationResource, OperationStatus, ReleaseOptions, SkillInstallOptions,
-    DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_SKILL_SOURCE_TYPE,
+    DeviceAuthorization, DeviceLoginOptions, DevicePrompt, HubSkillWaitOptions, LoginOptions,
+    MarketplaceSkillsOptions, MemoryListOptions, OperationResource, OperationStatus,
+    ReleaseOptions, SkillInstallOptions, DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL,
+    DEFAULT_SKILL_SOURCE_TYPE,
 };
 pub use errors::{Result, ThalovantError};
 pub use events::{

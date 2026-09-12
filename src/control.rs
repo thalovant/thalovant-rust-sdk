@@ -1,3 +1,6 @@
+mod hub_skills;
+pub use hub_skills::HubSkillWaitOptions;
+
 use crate::{
     errors::{Result, ThalovantError},
     identity::Identity,
@@ -10,7 +13,7 @@ use crate::{
 use base64::{engine::general_purpose, Engine as _};
 use rand::{rngs::OsRng, RngCore};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -28,7 +31,7 @@ pub const DEFAULT_SKILL_SOURCE_TYPE: &str = "catalog";
 const DEFAULT_CONTROL_USER_AGENT: &str = concat!("thalovant-rust-sdk/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(900);
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationStatus {
     Requested,
@@ -39,7 +42,7 @@ pub enum OperationStatus {
     TimedOut,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OperationResource {
     pub id: String,
     pub kind: String,
