@@ -1023,7 +1023,7 @@ JSON integer storage. Use string identifiers for larger integers.
 
 `as_sentence("quelle heure est-il", Some("fr-CA"))` returns
 `"Quelle heure est-il?"`. `speakable_with_language(pattern, &slots, Some(lang))`
-uses the bundled thalovant-languages 0.1.1 slot examples before explicit caller
+uses the bundled thalovant-languages 0.2.1 slot examples before explicit caller
 overrides. The original `speakable` function remains available without locale defaults.
 
 Use `intent.examples_with_listing(lang, limit, &IntentExampleOptions {
@@ -1053,3 +1053,13 @@ Python environment pinned in that script.
 
 The SDK code, CLDR matching tables and bundled `thalovant-languages` data
 retain their upstream MIT license notices. Both data notices ship with the SDK.
+
+### Language data refresh
+
+The bundled listing data follows `thalovant-languages` 0.2.1: 270 languages
+(290 base and regional entries), with regional rules resolved through the
+public package loader. Sentence marks and trailing words now match Python 0.6.8;
+for example Spanish `qué hora es` becomes `Qué hora es?`, while French
+`coupe le son` remains a complete sentence. Undescribed languages such as
+`tlh` still render bare. The reference fixtures cover 4,652 listing cases and
+990 OVOS language-selection cases.
