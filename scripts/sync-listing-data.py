@@ -15,7 +15,7 @@ from thalovant import as_sentence, listing, speakable
 from ovos_spec_tools.language import closest_lang
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--test-dir', default='testdata')
+parser.add_argument('--test-dir', default='tests/data')
 parser.add_argument('--data-dir', default='data')
 parser.add_argument('--fixtures-only', action='store_true')
 args = parser.parse_args()
