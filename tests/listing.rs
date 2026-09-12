@@ -186,3 +186,13 @@ fn no_data_invalid_patterns_and_bounded_backtracking() {
         "A".to_owned() + &text[1..]
     );
 }
+
+#[test]
+fn custom_non_boundaries_use_unicode_letters() {
+    let data: thalovant::ListingData =
+        serde_json::from_str(r#"{"languages":{"xq":{"question_patterns":["\\Bété\\B"]}}}"#)
+            .unwrap();
+    let rules = thalovant::ListingRules::new(Some(data)).unwrap();
+    assert!(!rules.asks("été", Some("xq")).unwrap());
+    assert!(rules.asks("pétéx", Some("xq")).unwrap());
+}

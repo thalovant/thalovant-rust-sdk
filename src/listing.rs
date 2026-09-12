@@ -36,6 +36,7 @@ fn failure(error: impl std::fmt::Display) -> ThalovantError {
 }
 fn compile(expression: &str, ignore_case: bool) -> Result<Regex> {
     let boundary = r"(?:(?<![\p{L}\p{N}_])(?=[\p{L}\p{N}_])|(?<=[\p{L}\p{N}_])(?![\p{L}\p{N}_]))";
+    let non_boundary = r"(?:(?=[\s\S])|(?<=[\s\S]))(?:(?<=[\p{L}\p{N}_])(?=[\p{L}\p{N}_])|(?<![\p{L}\p{N}_])(?![\p{L}\p{N}_]))";
     let mut converted = String::new();
     let mut chars = expression.chars();
     let mut in_class = false;
@@ -44,6 +45,8 @@ fn compile(expression: &str, ignore_case: bool) -> Result<Regex> {
             if let Some(next) = chars.next() {
                 if next == 'b' && !in_class {
                     converted.push_str(boundary);
+                } else if next == 'B' && !in_class {
+                    converted.push_str(non_boundary);
                 } else {
                     converted.push(ch);
                     converted.push(next);

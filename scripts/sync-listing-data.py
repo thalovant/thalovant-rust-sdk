@@ -21,9 +21,12 @@ parser.add_argument('--fixtures-only', action='store_true')
 args = parser.parse_args()
 versions = {'thalovant':'0.6.5','thalovant-languages':'0.1.1','ovos-spec-tools':'1.12.0a1','langcodes':'3.5.1'}
 for package, expected in versions.items():
-    assert metadata.version(package) == expected, f'Install {package}=={expected}'
-assert unicodedata.unidata_version == '15.1.0', 'Use Python3.13 for reproducible Unicode data'
-assert languages.root() == languages.DATA_ROOT, 'Remove THALOVANT_LANGUAGES_DIR overrides'
+    if metadata.version(package) != expected:
+        raise RuntimeError(f'Install {package}=={expected}')
+if unicodedata.unidata_version != '15.1.0':
+    raise RuntimeError('Use Python3.13 for reproducible Unicode data')
+if languages.root() != languages.DATA_ROOT:
+    raise RuntimeError('Remove THALOVANT_LANGUAGES_DIR overrides')
 keys = {'trailing_words','question_openers','question_words_anywhere','question_patterns','written_forms','slot_examples'}
 data = {'sentence_ends':listing.sentence_ends(), 'languages':{
     tag:{key:value for key,value in languages.language(tag).items() if key in keys} for tag in languages.described()}}
