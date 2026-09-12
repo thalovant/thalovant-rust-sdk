@@ -962,7 +962,7 @@ without waiting, retain the complete accepted response (including `operation_id`
 and `state`), then pass that response to the wait helper separately. Cancelling waiting does not undo the server operation. After a polling
 failure, inspect/resume that operation instead of submitting the write again.
 
-## Request helpers and safe configuration updates (0.7.0)
+## Request helpers and safe configuration updates
 
 Request hints carry a recognized language, ordered intent pipeline, and caller
 location without changing the caller's context. Empty hints are omitted. The
@@ -1013,3 +1013,8 @@ Distinct audio events may intentionally repeat identical sound content. Only
 repeated delivery of the same event object is suppressed where object identity
 is available, without counting it as a dropped clip. Rendered example ranking
 uses the original pattern's slot presence even when sample values are supplied.
+
+Guarded merges in 0.7.1 preserve native signed/unsigned 64-bit integers but
+reject floating-point configuration/persona values outside the exact integer
+range (±9,007,199,254,740,991), including stored integers that overflow native
+JSON integer storage. Use string identifiers for larger integers.
