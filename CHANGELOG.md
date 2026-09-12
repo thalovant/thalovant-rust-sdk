@@ -2,6 +2,8 @@
 
 ## 0.6.0 — 2026-09-12
 
+- Bound in-flight skill status requests by the wait deadline, preserving the accepted operation ID on timeout.
+
 - Add hub-addressed skill listing, history, install, update and removal.
 - Add optional bounded polling and explicit operation resumption without repeating accepted writes.
 - Document shared-runtime scope, authorization and cancellation behavior.

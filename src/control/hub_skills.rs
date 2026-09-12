@@ -118,7 +118,7 @@ impl ControlPlane {
     }
     /// Resume an accepted operation without repeating the mutation.
     /// For cancellation-sensitive callers, submit without waiting, retain the
-    /// accepted ID, then await this separately. Dropping the future stops polling.
+    /// complete accepted response, then await this separately. Dropping the future stops polling.
     pub async fn wait_for_hub_skill_operation(
         &self,
         accepted: &Value,
@@ -141,9 +141,12 @@ impl ControlPlane {
             if tokio::time::Instant::now() >= deadline {
                 return Err(ThalovantError::Timeout(format!("accepted operation {id}")));
             }
-            let operation = self.get_operation(id).await.map_err(|_| {
+            let operation = tokio::time::timeout_at(deadline, self.get_operation(id))
+                .await
+                .map_err(|_| ThalovantError::Timeout(format!("accepted operation {id}")))?
+                .map_err(|_| {
                 ThalovantError::Api(format!(
-                    "could not read accepted operation {id}; resume using its ID"
+                    "could not read accepted operation {id}; inspect by ID or resume with the complete accepted response"
                 ))
             })?;
             match operation.status {
@@ -293,6 +296,38 @@ mod tests {
             worker.join().unwrap();
             assert_eq!(requests.lock().unwrap().len(), 2);
         }
+    }
+    #[tokio::test]
+    async fn stalled_poll_is_bounded_and_keeps_the_operation_id() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api = ControlPlane::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            Some("token".into()),
+        );
+        let accepted = json!({"operation_id":"op-stalled","state":"removing"});
+        let (connected, confirmed) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            connected.send(()).unwrap();
+            // Keep the connection open without responding until the test cancels it.
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let error = api
+            .wait_for_hub_skill_operation(
+                &accepted,
+                HubSkillWaitOptions {
+                    timeout: Duration::from_millis(200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        confirmed.await.unwrap();
+        assert!(matches!(error, ThalovantError::Timeout(_)));
+        assert!(error.to_string().contains("op-stalled"));
+        assert_eq!(accepted["state"], "removing");
+        worker.abort();
     }
     #[tokio::test]
     async fn invalid_arguments_do_not_send() {
