@@ -1,4 +1,4 @@
-{"source":{"packages": {"thalovant": "0.6.5", "thalovant-languages": "0.1.1", "ovos-spec-tools": "1.12.0a1", "langcodes": "3.5.1"}, "unicode_version": "15.1.0"},"cases":[
+{"source":{"packages": {"thalovant": "0.6.8", "thalovant-languages": "0.2.1", "ovos-spec-tools": "1.12.0a1", "langcodes": "3.5.1"}, "unicode_version": "15.1.0"},"cases":[
 {"target":"en","available":["en-US","en-GB"],"expected":"en-US"},
 {"target":"en","available":["fr-FR","fr-CA"],"expected":null},
 {"target":"en","available":["pt-BR","pt-PT"],"expected":null},

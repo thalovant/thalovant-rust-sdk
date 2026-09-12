@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.1 — 2026-09-12
+
+- Refresh bundled listing rules to thalovant-languages 0.2.1, matching Python 0.6.8 across 270 languages. Preserve regional inheritance and the corrected French/Spanish trailing-word behavior.
+- Regenerate public-reference cases for every shipped locale, including Spanish questions and French complete phrases.
+
 ## 0.8.0 — 2026-09-12
 
 - Add locale-aware sentence listings, canonical slot examples, fuller phrase ranking and OVOS-compatible regional language selection.

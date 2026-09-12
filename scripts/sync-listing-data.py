@@ -1,5 +1,5 @@
 """Generate immutable listing data and cross-SDK golden cases from public packages.
-Use Python3.13 with thalovant[listing]==0.6.5, thalovant-languages==0.1.1,
+Use Python3.13 with thalovant[listing]==0.6.8, thalovant-languages==0.2.1,
 ovos-spec-tools==1.12.0a1 and langcodes==3.5.1. No local SDK overrides.
 """
 import argparse
@@ -19,7 +19,7 @@ parser.add_argument('--test-dir', default='tests/data')
 parser.add_argument('--data-dir', default='data')
 parser.add_argument('--fixtures-only', action='store_true')
 args = parser.parse_args()
-versions = {'thalovant':'0.6.5','thalovant-languages':'0.1.1','ovos-spec-tools':'1.12.0a1','langcodes':'3.5.1'}
+versions = {'thalovant':'0.6.8','thalovant-languages':'0.2.1','ovos-spec-tools':'1.12.0a1','langcodes':'3.5.1'}
 for package, expected in versions.items():
     if metadata.version(package) != expected:
         raise RuntimeError(f'Install {package}=={expected}')
@@ -59,7 +59,7 @@ if not args.fixtures_only:
 
 cases = []
 for lang,rules in data['languages'].items():
-    for text in ['go home','weather in','what time is it','quelle heure est-il','prends rendez-vous avec le docteur','do i need a jacket','como esta el tiempo','',' déjà fini!','𐐨 test','ß test']:
+    for text in ['go home','weather in','what time is it','quelle heure est-il','prends rendez-vous avec le docteur','do i need a jacket','como esta el tiempo','qué hora es','enciende la luz','coupe le son','今日は晴れ','',' déjà fini!','𐐨 test','ß test']:
         cases.append({'kind':'sentence','text':text,'lang':lang,'expected':as_sentence(text,lang)})
     for key in rules.get('slot_examples',{}):
         text='open {'+key+'}'
