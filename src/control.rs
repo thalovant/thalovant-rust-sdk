@@ -977,6 +977,10 @@ impl ControlPlane {
         if !config.is_object() {
             return Err(ThalovantError::Api("config must be a JSON object".into()));
         }
+        validate_config_numbers(&config)?;
+        if let Some(personas) = &personas {
+            validate_config_numbers(personas)?;
+        }
         let path = format!(
             "/v1/runtime-groups/{}/config",
             urlencoding::encode(runtime_group_id)
@@ -998,6 +1002,7 @@ impl ControlPlane {
                         .into(),
                 ));
             };
+            validate_config_numbers(base)?;
             let mut body = serde_json::json!({"config": merge_runtime_config(base, &config), "expected_revision": revision});
             if let Some(personas) = &personas {
                 body["personas"] = personas.clone();
@@ -1786,6 +1791,33 @@ fn sanitize_caller_spec(spec: &Map<String, Value>) -> Map<String, Value> {
     sanitized.remove("cryptoKey");
     sanitized.remove("crypto_key");
     sanitized
+}
+
+fn validate_config_numbers(value: &Value) -> Result<()> {
+    match value {
+        Value::Number(number) if number.is_f64() => {
+            if number
+                .as_f64()
+                .is_some_and(|v| !v.is_finite() || v.abs() > 9_007_199_254_740_991.0)
+            {
+                return Err(ThalovantError::Api(
+                    "safe configuration merge refuses floating-point values outside the exact integer range; use native integers or string identifiers".into(),
+                ));
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                validate_config_numbers(value)?;
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values() {
+                validate_config_numbers(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn merge_runtime_config(base: &Value, delta: &Value) -> Value {
@@ -2720,6 +2752,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_numbers_reject_floating_overflow_before_io() {
+        let api = ControlPlane::new("http://127.0.0.1:1", Some("test".into()));
+        for (config, personas) in [
+            (json!({"nested": [1e25]}), None),
+            (json!({}), Some(json!({"nested": [1e25]}))),
+        ] {
+            let error = api
+                .update_runtime_group_config("x", config, personas)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ThalovantError::Api(ref message) if message.contains("floating-point"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn config_numbers_reject_stored_integer_overflow_before_writing() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (server, requests) = spawn_recording_server(listener, 1, |request| {
+            assert!(request.starts_with("GET "));
+            (
+                "200 OK",
+                r#"{"config":{"id":18446744073709551617},"revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+            )
+        });
+        let error = ControlPlane::new(format!("http://{address}"), Some("test".into()))
+            .update_runtime_group_config("x", json!({"lang":"fr"}), None)
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            matches!(error, ThalovantError::Api(ref message) if message.contains("floating-point"))
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn config_merge_rereads_after_conflict_and_preserves_concurrent_keys() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2746,7 +2817,7 @@ mod tests {
         let result = ControlPlane::new(format!("http://{address}"), Some("test".into()))
             .update_runtime_group_config(
                 "x",
-                json!({"nested":{"caller":true},"array":[1]}),
+                json!({"nested":{"caller":true},"array":[1],"native_id":u64::MAX}),
                 Some(json!({})),
             )
             .await
@@ -2756,7 +2827,7 @@ mod tests {
         let body = request_body(&recorded(&requests, 3));
         assert_eq!(
             body["config"],
-            json!({"nested":{"original":true,"concurrent":true,"caller":true},"array":[1]})
+            json!({"nested":{"original":true,"concurrent":true,"caller":true},"array":[1],"native_id":u64::MAX})
         );
         assert_eq!(body["personas"], json!({}));
         assert_eq!(body["expected_revision"], "b".repeat(64));
