@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.0 — 2026-09-13
+
+- Add managed hub sessions with persistent subscriptions, bounded background retry backoff, terminal close, and no automatic replay of admitted requests. Preferred-origin selection delegates address binding and failed-attempt cleanup to the transport builder.
+- Add presentable skill/intent inventories, regional example selection, tri-state catalogue locale support, and private best-effort inventory caches. Explicit language order survives JSON serialization across SDKs; invalid cache records become misses.
+- Match Python question detection, including unnamed-locale patterns and Unicode question marks, with shared executable conformance vectors.
+- Require reviewed Python reference and consumer evidence in PR and publishing parity checks, with scheduled fresh-dependency conformance checks.
+
 ## 0.8.1 — 2026-09-12
 
 - Refresh bundled listing rules to thalovant-languages 0.2.1, matching Python 0.6.8 across 270 languages. Preserve regional inheritance and the corrected French/Spanish trailing-word behavior.
