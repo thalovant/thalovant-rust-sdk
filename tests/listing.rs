@@ -210,3 +210,11 @@ fn question_reference() {
         );
     }
 }
+
+#[test]
+fn arabic_question_terminator_is_preserved() {
+    assert_eq!(
+        thalovant::listing::as_sentence("hello؟", Some("en")),
+        "Hello؟"
+    );
+}

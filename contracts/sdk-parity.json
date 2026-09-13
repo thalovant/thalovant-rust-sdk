@@ -2,7 +2,7 @@
   "schema_version": 1,
   "reference_digests": [
     "1133ac83dca463a5b7c69c980d1b5db46a1314d08151b31508982ad1cf41b6c6",
-    "216fafa88e0606baf35976f53392bda9152217d3797cebce5432bc2707c49847"
+    "91ddccd7d6a9b01b5722a9d22cd23a8f42a6edabee3e91462f2b4433efe37723"
   ],
   "capabilities": {
     "runtime": {
@@ -48,7 +48,7 @@
         "src/intents.rs": "6c1087eb20a0a2846607ac7790913cb7f302f8502c36c4f34fade314c72b56fa"
       },
       "tests": {
-        "tests/listing.rs": "3e3e96385d3d6547265291888f8a8aaa4b1105451edba336ad28a2b16cbe3d17",
+        "tests/listing.rs": "ed2be3c6a5f761117a158fba2d99e87911aca2eed09698fb7a908f09756cb299",
         "tests/data/question-vectors.json": "046a163f1340976ae5898da153f080dbdd9326a733c97c4acbe7c2302474286e"
       }
     },
@@ -56,11 +56,11 @@
       "status": "required",
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "implementation": {
-        "src/inventory.rs": "66ce7258214478562b19cbec4f3728350c078a64124fc9ecbed93196b5c0d8db"
+        "src/inventory.rs": "fe1a8e75ad20f99752a224c95962f25fee6f77fcaf05b49927f0c4d56400c9c3"
       },
       "tests": {
-        "tests/inventory.rs": "e11d6c331e2a7f050988dab71e7cce493302c4b2b5395313762875dfb7b1ce6c",
-        "tests/data/inventory-vectors.json": "78c7bf51a748dc9b9f66277dc63d83f9cd75a54a341ca630fb8bc55d0b30bcf5"
+        "tests/inventory.rs": "e3dfc2ab4a18fbdf19051785bb8d004e80beb30b3711ea59dc2351c7f38ec3ac",
+        "tests/data/inventory-vectors.json": "4deb456540b8b08aa4b59f8366d4295318b743245e7936febbdb199eb2dcfae0"
       }
     },
     "session": {

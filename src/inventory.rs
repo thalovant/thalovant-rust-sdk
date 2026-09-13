@@ -307,10 +307,8 @@ pub fn compare_names(left: &str, right: &str) -> Ordering {
 }
 pub fn identity_host(path: &Path) -> Option<String> {
     let raw: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
-    url::Url::parse(raw.get("default_master")?.as_str()?)
-        .ok()?
-        .host_str()
-        .map(str::to_owned)
+    let host = crate::session::hub_hostname(raw.get("default_master")?.as_str()?);
+    (!host.is_empty()).then_some(host)
 }
 pub struct InventoryCache {
     pub directory: PathBuf,
@@ -365,7 +363,7 @@ impl InventoryCache {
             })
             .take(40)
             .collect::<String>();
-        let digest = hex::encode(Sha256::digest(format!("{mode}|{text}")));
+        let digest = hex::encode(Sha256::digest(format!("{mode}|{text}|{host}")));
         format!("{mode}-{readable}-{}", &digest[..8])
     }
     pub fn path(&self, key: &str) -> Result<PathBuf> {

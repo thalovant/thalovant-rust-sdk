@@ -91,6 +91,10 @@ fn presentation_helpers_cover_empty_affixes_and_natural_order() {
 fn shared_python_reference_survives_sorted_json() {
     let data: serde_json::Value =
         serde_json::from_str(include_str!("data/inventory-vectors.json")).unwrap();
+    assert_eq!(
+        InventoryCache::key("hub", None),
+        data["cache_key"].as_str().unwrap()
+    );
     let inventory = Inventory::from_json(&data["inventory"].to_string()).unwrap();
     for row in data["examples"].as_array().unwrap() {
         assert_eq!(
@@ -109,4 +113,25 @@ fn shared_python_reference_survives_sorted_json() {
         );
     }
     assert_eq!(inventory.skills[1].speaks("en"), None);
+}
+
+#[test]
+fn cache_keys_hash_full_normalized_hosts() {
+    let path = std::env::temp_dir().join(format!("thalovant-key-{}.json", uuid::Uuid::new_v4()));
+    let first = format!("{}one.example", "a".repeat(40));
+    let second = format!("{}two.example", "a".repeat(40));
+    fs::write(
+        &path,
+        serde_json::json!({"default_master":first}).to_string(),
+    )
+    .unwrap();
+    assert_eq!(identity_host(&path), Some(first));
+    let key = InventoryCache::key("hub", Some(&path));
+    fs::write(
+        &path,
+        serde_json::json!({"default_master":second}).to_string(),
+    )
+    .unwrap();
+    assert_ne!(InventoryCache::key("hub", Some(&path)), key);
+    fs::remove_file(path).unwrap();
 }
