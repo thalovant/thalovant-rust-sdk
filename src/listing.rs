@@ -146,8 +146,25 @@ impl ListingRules {
     }
     /// Matching failures (including bounded backtracking) are returned explicitly.
     pub fn asks(&self, text: &str, lang: Option<&str>) -> Result<bool> {
-        if let Some(tag) = self.tag(lang) {
-            for pattern in &self.patterns[tag] {
+        if !self.available {
+            return Ok(false);
+        }
+        let text = text.trim();
+        if text.chars().last().is_some_and(|c| {
+            [
+                0x3f, 0xbf, 0x37e, 0x55e, 0x61f, 0x1367, 0x1945, 0x2047, 0x2049, 0x2753, 0x2754,
+                0x2a7b, 0x2a7c, 0x2cfa, 0x2cfb, 0x2e2e, 0x2e54, 0xa60f, 0xa6f7, 0xfe16, 0xfe56,
+                0xff1f, 0x11143, 0x1e95f, 0x1fbc4, 0xe003f,
+            ]
+            .contains(&(c as u32))
+        }) {
+            return Ok(true);
+        }
+        for (tag, patterns) in &self.patterns {
+            if lang.is_some_and(|l| !l.is_empty()) && self.tag(lang) != Some(tag.as_str()) {
+                continue;
+            }
+            for pattern in patterns {
                 if pattern.is_match(text).map_err(failure)? {
                     return Ok(true);
                 }

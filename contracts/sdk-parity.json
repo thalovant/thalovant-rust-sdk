@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "reference_digests": [
+    "1133ac83dca463a5b7c69c980d1b5db46a1314d08151b31508982ad1cf41b6c6",
+    "c13f62bf0c5ff9a8b06808542f89481f961e7c4e24af13928055598b76e2550c",
+    "2440dd10059c468ca5012a3e4e9e057c9bd2df7ef442eba1d5dcdeb4afb3eafd"
+  ],
+  "capabilities": {
+    "runtime": {
+      "status": "required",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct.",
+      "implementation": {
+        "src/transport.rs": "7792c0dcbc3d4980e835021d56832b51abe463f6c8a1d0fc5a2fa6cd790eea64",
+        "src/lib.rs": "739a213cea591a770c07cec1e9093dbea6e617b078404096fe71d034656040de"
+      },
+      "tests": {
+        "src/client.rs": "f950b4254651267dbe19e7a95d93cc0422dfc8db6f01911caa82f3b76f824457",
+        "src/transport_noise_tests.rs": "58b0e337de56a40cd7107510060e5c1bf5163ffdb5e637690cdd418e0efc2a1e",
+        "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8"
+      }
+    },
+    "control": {
+      "status": "required",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
+      "implementation": {
+        "src/lib.rs": "739a213cea591a770c07cec1e9093dbea6e617b078404096fe71d034656040de",
+        "src/request_helpers.rs": "ce50095abf3bb09055af099dc7ed028691f3c6285f3bac23270776094a56d754"
+      },
+      "tests": {
+        "src/control.rs": "9d20ea5873d2894ed3d9229d975f16fad3cd39acbab264fc678eb6c18b1b5f8f"
+      }
+    },
+    "identity": {
+      "status": "required",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
+      "implementation": {
+        "src/lib.rs": "739a213cea591a770c07cec1e9093dbea6e617b078404096fe71d034656040de",
+        "src/protocols.rs": "a42115fd0de0dc49c4cee86872130f5ee3ab510ebc4b10d33adff4dcbd978905"
+      },
+      "tests": {
+        "src/identity.rs": "7eeef6822788b239aafda4f682fac2ceae686cc3e27529385cac80d654d91f63"
+      }
+    },
+    "listing": {
+      "status": "required",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
+      "implementation": {
+        "src/listing.rs": "96e2981d0c37168ef3e98c1946241754b77d628350d1e94078046a4b351d2a38",
+        "src/intents.rs": "6c1087eb20a0a2846607ac7790913cb7f302f8502c36c4f34fade314c72b56fa"
+      },
+      "tests": {
+        "tests/listing.rs": "ed2be3c6a5f761117a158fba2d99e87911aca2eed09698fb7a908f09756cb299",
+        "tests/data/question-vectors.json": "046a163f1340976ae5898da153f080dbdd9326a733c97c4acbe7c2302474286e"
+      }
+    },
+    "inventory": {
+      "status": "required",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
+      "implementation": {
+        "src/inventory.rs": "fe1a8e75ad20f99752a224c95962f25fee6f77fcaf05b49927f0c4d56400c9c3"
+      },
+      "tests": {
+        "tests/inventory.rs": "e3dfc2ab4a18fbdf19051785bb8d004e80beb30b3711ea59dc2351c7f38ec3ac",
+        "tests/data/inventory-vectors.json": "4deb456540b8b08aa4b59f8366d4295318b743245e7936febbdb199eb2dcfae0"
+      }
+    },
+    "session": {
+      "status": "required",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. The connected-client factory owns failed connection cleanup; Python performs that dial internally and retains failed retirement before replacement. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
+      "implementation": {
+        "src/lib.rs": "739a213cea591a770c07cec1e9093dbea6e617b078404096fe71d034656040de"
+      },
+      "tests": {
+        "src/session.rs": "d5d5bcc1c465de7747e38f103ce60890fe0762fb317ce40260a5ecafcdf8798f"
+      }
+    },
+    "cli": {
+      "status": "not-applicable",
+      "reason": "Python command line entry point; consumers expose idiomatic language APIs or MCP tools."
+    }
+  }
+}

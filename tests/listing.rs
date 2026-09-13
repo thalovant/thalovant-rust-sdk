@@ -196,3 +196,25 @@ fn custom_non_boundaries_use_unicode_letters() {
     assert!(!rules.asks("été", Some("xq")).unwrap());
     assert!(rules.asks("pétéx", Some("xq")).unwrap());
 }
+
+#[test]
+fn question_reference() {
+    let data: Value = serde_json::from_str(include_str!("data/question-vectors.json")).unwrap();
+    for row in data["cases"].as_array().unwrap() {
+        assert_eq!(
+            DEFAULT_LISTING
+                .asks(row["text"].as_str().unwrap(), row["lang"].as_str())
+                .unwrap(),
+            row["expected"].as_bool().unwrap(),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn arabic_question_terminator_is_preserved() {
+    assert_eq!(
+        thalovant::listing::as_sentence("hello؟", Some("en")),
+        "Hello؟"
+    );
+}

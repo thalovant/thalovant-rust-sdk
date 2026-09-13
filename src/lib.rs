@@ -75,3 +75,13 @@ pub use listing::{
     as_sentence, speakable_with_language, IntentExampleOptions, ListingData, ListingLanguage,
     ListingRules, DEFAULT_LISTING,
 };
+
+pub mod inventory;
+pub use inventory::{
+    common_affix, compare_names, friendly_title, humanize, languages_present, strip_affix, Intent,
+    Inventory, InventoryCache, Skill,
+};
+pub mod session;
+pub use session::{
+    hub_hostname, HubSession, HubSessionEvent, HubSessionPolicy, OriginAttempt, OriginPreference,
+};

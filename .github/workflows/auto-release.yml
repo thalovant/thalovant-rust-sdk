@@ -16,9 +16,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Release unpublished version
+  sdk-parity:
+    uses: ./.github/workflows/sdk-parity.yml
+    permissions:
+      contents: read
+    with:
+      source_ref: ${{ github.sha }}
+
+  plan:
+    needs: sdk-parity
+    name: Plan release version
     runs-on: ubuntu-latest
+    outputs:
+      release_needed: ${{ steps.plan.outputs.release_needed }}
+      release_sha: ${{ steps.plan.outputs.release_sha }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -121,33 +134,58 @@ jobs:
               output.write(f"release_sha={git('rev-parse', 'HEAD')}\n")
           PY
 
+  planned-parity:
+    needs: plan
+    if: needs.plan.outputs.release_needed == 'true'
+    uses: ./.github/workflows/sdk-parity.yml
+    permissions:
+      contents: read
+    with:
+      source_ref: ${{ needs.plan.outputs.release_sha }}
+
+  release:
+    needs: [plan, planned-parity]
+    if: needs.plan.outputs.release_needed == 'true'
+    name: Release unpublished version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.plan.outputs.release_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+
       - name: Check formatting
-        if: steps.plan.outputs.release_needed == 'true'
+        if: needs.plan.outputs.release_needed == 'true'
         run: cargo fmt --check
 
       - name: Run clippy
-        if: steps.plan.outputs.release_needed == 'true'
+        if: needs.plan.outputs.release_needed == 'true'
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        if: steps.plan.outputs.release_needed == 'true'
+        if: needs.plan.outputs.release_needed == 'true'
         run: cargo test --all-features
 
       - name: Check package contents
-        if: steps.plan.outputs.release_needed == 'true'
+        if: needs.plan.outputs.release_needed == 'true'
         run: cargo package --allow-dirty --list
 
       - name: Create GitHub release
-        if: steps.plan.outputs.release_needed == 'true'
+        if: needs.plan.outputs.release_needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.plan.outputs.tag }}
-          RELEASE_SHA: ${{ steps.plan.outputs.release_sha }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_SHA: ${{ needs.plan.outputs.release_sha }}
         run: gh release create "$TAG" --target "$RELEASE_SHA" --title "$TAG" --notes "Release $TAG"
 
       - name: Dispatch crate publication
-        if: steps.plan.outputs.release_needed == 'true'
+        if: needs.plan.outputs.release_needed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.plan.outputs.tag }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: gh workflow run publish.yml --ref main -f release_tag="$TAG"
