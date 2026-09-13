@@ -464,6 +464,34 @@ impl Event {
     }
 }
 impl Reply {
+    /// Nonempty string pipeline stamps, unique in first-seen order.
+    pub fn pipeline_ids(&self) -> Vec<String> {
+        self.context_identifiers("pipeline_id")
+    }
+    /// Nonempty string skill stamps, unique in first-seen order.
+    pub fn skill_ids(&self) -> Vec<String> {
+        self.context_identifiers("skill_id")
+    }
+    /// Advisory claim status; unstamped successful legacy replies remain claimed.
+    pub fn claimed(&self) -> bool {
+        if !self.handled || !self.ok || self.failure_event.is_some() {
+            return false;
+        }
+        let stages = self.pipeline_ids();
+        stages.is_empty() || stages.iter().any(|stage| !stage.contains("fallback"))
+    }
+    fn context_identifiers(&self, key: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        for event in &self.events {
+            if let Some(value) = event.context.get(key).and_then(Value::as_str) {
+                if !value.is_empty() && !result.iter().any(|item| item == value) {
+                    result.push(value.to_owned());
+                }
+            }
+        }
+        result
+    }
+
     pub fn lang(&self) -> Option<String> {
         self.events.iter().find_map(Event::lang)
     }
