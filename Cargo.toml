@@ -46,5 +46,5 @@ fancy-regex = "0.19.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
-rcgen = "=0.14.5"
+rcgen = "=0.14.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
