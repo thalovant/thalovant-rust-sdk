@@ -387,6 +387,52 @@ impl ControlPlane {
         Ok(token)
     }
 
+    /// Exchange an authorization code for a scoped access token and store it.
+    ///
+    /// The other half of [`begin_native_sign_in`](crate::native_auth::begin_native_sign_in).
+    /// The verifier is sent here and nowhere else; it never entered the
+    /// browser, which is what makes an intercepted code useless to whoever
+    /// intercepted it.
+    ///
+    /// A code presented twice revokes the token the first exchange minted
+    /// (RFC 9700), so retrying a failed exchange with the same code destroys
+    /// the token it is trying to obtain. Start again instead.
+    pub async fn complete_native_sign_in(
+        &mut self,
+        code: impl Into<String>,
+        verifier: impl Into<String>,
+        client_id: impl Into<String>,
+        redirect_uri: impl Into<String>,
+    ) -> Result<Value> {
+        crate::native_auth::require_secure_token_exchange(&self.api_url)?;
+        let body = Map::from_iter([
+            ("code".to_string(), Value::String(code.into())),
+            ("code_verifier".to_string(), Value::String(verifier.into())),
+            ("client_id".to_string(), Value::String(client_id.into())),
+            (
+                "redirect_uri".to_string(),
+                Value::String(redirect_uri.into()),
+            ),
+        ]);
+        let token = self
+            .request(
+                "POST",
+                "/v1/auth/native/token",
+                Some(Value::Object(body)),
+                None,
+                false,
+            )
+            .await?;
+        let access_token = token
+            .get("access_token")
+            .and_then(json_string)
+            .ok_or_else(|| {
+                ThalovantError::Api("token response did not include access_token".to_string())
+            })?;
+        self.access_token = Some(access_token);
+        Ok(token)
+    }
+
     /// Sign in through the browser device flow and store the API token.
     ///
     /// This is the sign-in path for accounts without a password (for example
