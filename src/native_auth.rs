@@ -61,6 +61,9 @@ pub struct NativeSignIn {
     pub state: String,
     /// Never send this to the browser. Exchanged with the code, once.
     pub verifier: String,
+    /// What this attempt asked the callback to arrive at. One that lands
+    /// anywhere else is not this attempt's, however good its state looks.
+    pub redirect_uri: String,
 }
 
 fn base64_url(raw: &[u8]) -> String {
@@ -122,6 +125,7 @@ pub fn begin_native_sign_in(options: NativeSignInOptions) -> Result<NativeSignIn
             "redirect_uri is required to start a sign-in".to_string(),
         ));
     }
+    require_safe_dashboard(options.dashboard_url.as_deref())?;
     let verifier = new_verifier();
     let state = random_url_safe(24);
     let scopes = options.scopes.unwrap_or_else(|| {
@@ -150,6 +154,7 @@ pub fn begin_native_sign_in(options: NativeSignInOptions) -> Result<NativeSignIn
         authorization_url: url.to_string(),
         state,
         verifier,
+        redirect_uri,
     })
 }
 
@@ -163,6 +168,12 @@ impl NativeSignIn {
     /// handles them alike cannot accidentally treat one of them as success.
     pub fn code_from(&self, redirect: &str) -> Option<String> {
         let parsed = Url::parse(redirect).ok()?;
+        // The callback has to arrive where this attempt asked it to. State
+        // proves the answer belongs to this request; the address proves it
+        // came back to the app that made it.
+        if !same_target(&parsed, &self.redirect_uri) {
+            return None;
+        }
         let mut state = None;
         let mut code = None;
         let mut refused = false;
@@ -185,6 +196,51 @@ impl NativeSignIn {
     }
 }
 
+fn same_target(got: &Url, expected: &str) -> bool {
+    let Ok(want) = Url::parse(expected) else {
+        return false;
+    };
+    got.scheme().eq_ignore_ascii_case(want.scheme())
+        && got.host_str().map(str::to_ascii_lowercase)
+            == want.host_str().map(str::to_ascii_lowercase)
+        && got.path().trim_end_matches('/') == want.path().trim_end_matches('/')
+}
+
+/// Refuse to hand the authorization request to a dashboard that cannot be
+/// trusted with it.
+///
+/// The request carries the challenge, the scopes and the state. A caller may
+/// point this at their own dashboard -- a self-hosted control plane is a real
+/// thing -- but not at a cleartext one, and not at one whose address reads as
+/// a different host than it resolves to. Loopback is allowed: it never leaves
+/// the machine.
+fn require_safe_dashboard(url: Option<&str>) -> Result<()> {
+    let Some(raw) = url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(()); // the default is used instead
+    };
+    let parsed = Url::parse(raw)
+        .map_err(|_| ThalovantError::Api(format!("dashboard_url is not a URL: {raw}")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ThalovantError::Api(
+            "dashboard_url must not carry credentials".to_string(),
+        ));
+    }
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    if parsed.scheme() == "http"
+        && matches!(
+            parsed.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+        )
+    {
+        return Ok(());
+    }
+    Err(ThalovantError::Api(format!(
+        "dashboard_url must be https (or a loopback address while developing), not {raw}"
+    )))
+}
+
 /// Refuse to put an authorization code and its PKCE verifier on the wire in
 /// cleartext.
 ///
@@ -204,7 +260,10 @@ pub(crate) fn require_secure_token_exchange(api_url: &str) -> Result<()> {
     if parsed.scheme() == "https" {
         return Ok(());
     }
-    if matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1")) {
+    if matches!(
+        parsed.host_str(),
+        Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+    ) {
         return Ok(());
     }
     Err(ThalovantError::Api(format!(
@@ -400,6 +459,64 @@ mod tests {
             assert!(
                 require_secure_token_exchange(allowed).is_ok(),
                 "{allowed} was refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_callback_arriving_somewhere_else_is_refused() {
+        // CodeRabbit: state proves the answer belongs to this request; it does
+        // not prove it came back to the app that made it.
+        let begun = begin("app", "app://auth");
+        assert_eq!(
+            begun.code_from(&format!("app://auth?code=abc&state={}", begun.state)),
+            Some("abc".to_string())
+        );
+        for elsewhere in [
+            format!("app://elsewhere?code=abc&state={}", begun.state),
+            format!("https://evil.test/auth?code=abc&state={}", begun.state),
+        ] {
+            assert_eq!(
+                begun.code_from(&elsewhere),
+                None,
+                "{elsewhere} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dashboard_that_is_not_safe_is_refused() {
+        for bad in [
+            "http://dash.example.test",
+            "https://evil.test@dash.thalovant.com",
+            "ftp://dash.thalovant.com",
+        ] {
+            assert!(
+                begin_native_sign_in(NativeSignInOptions {
+                    client_id: "app".to_string(),
+                    redirect_uri: "app://auth".to_string(),
+                    dashboard_url: Some(bad.to_string()),
+                    ..Default::default()
+                })
+                .is_err(),
+                "{bad} was accepted"
+            );
+        }
+        // Self-hosted https is real, and loopback never leaves the machine.
+        for good in [
+            "https://dash.example.test",
+            "http://localhost:9000",
+            "http://127.0.0.1:9000",
+        ] {
+            assert!(
+                begin_native_sign_in(NativeSignInOptions {
+                    client_id: "app".to_string(),
+                    redirect_uri: "app://auth".to_string(),
+                    dashboard_url: Some(good.to_string()),
+                    ..Default::default()
+                })
+                .is_ok(),
+                "{good} was refused"
             );
         }
     }
