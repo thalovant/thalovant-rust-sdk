@@ -225,6 +225,14 @@ fn require_safe_dashboard(url: Option<&str>) -> Result<()> {
             "dashboard_url must not carry credentials".to_string(),
         ));
     }
+    // A query or a fragment breaks the address this builds: "<dash>#x" becomes
+    // "<dash>#x/authorize?client_id=..." and every parameter lands in the
+    // fragment, which a browser never sends. A query mangles the path likewise.
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(ThalovantError::Api(
+            "dashboard_url must not carry a query or a fragment".to_string(),
+        ));
+    }
     if parsed.scheme() == "https" {
         return Ok(());
     }
@@ -490,6 +498,9 @@ mod tests {
             "http://dash.example.test",
             "https://evil.test@dash.thalovant.com",
             "ftp://dash.thalovant.com",
+            // A fragment puts every parameter somewhere a browser never sends.
+            "https://dash.example.test#section",
+            "https://dash.example.test?next=/x",
         ] {
             assert!(
                 begin_native_sign_in(NativeSignInOptions {
