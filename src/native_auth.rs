@@ -92,6 +92,12 @@ pub fn is_thalovant_url(raw: &str) -> bool {
     if parsed.scheme() != "https" {
         return false;
     }
+    // Reject embedded credentials: https://evil.test@dash.thalovant.com/ has a
+    // host that passes, and a URL somebody is about to be sent to should not
+    // read as one host and resolve to another.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
     match parsed.host_str() {
         Some(host) => {
             let host = host.to_ascii_lowercase();
@@ -404,6 +410,8 @@ mod tests {
         assert!(!is_thalovant_url("http://dash.thalovant.com"));
         // The one that matters: a lookalike host ending in the same letters.
         assert!(!is_thalovant_url("https://dash.thalovant.com.evil.test"));
+        // A host that passes, reached through credentials reading as another.
+        assert!(!is_thalovant_url("https://evil.test@dash.thalovant.com"));
         assert!(!is_thalovant_url("https://notthalovant.com"));
         assert!(!is_thalovant_url("nonsense"));
     }

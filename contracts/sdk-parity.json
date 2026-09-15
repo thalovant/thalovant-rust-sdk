@@ -14,7 +14,7 @@
       "tests": {
         "src/control.rs": "52059824e8661485e5bd171c39e88a02c2e57f0469364ea34001b1a370f70475",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
-        "src/native_auth.rs": "2d5653aaf9e46c7afce438e2723f607df665eb67d76a0880001c37dcb657970b"
+        "src/native_auth.rs": "9f77b5008c74c06867dd960154d398deee8910c76f882cddcc8a5ad616ae41ed"
       }
     },
     "identity": {
@@ -86,7 +86,8 @@
     "676e935e66330f8614d6c23cccddd48e1c4577c3af761775f18e1ea0128b8007",
     "8b71292c815a4b7219be7b1a7a5d01e9500faaa23e7c97c6a48683fc0411e1d0",
     "e1a17c218e70eb278e4a06161314076269c6d7f3fd24afc522711e1eedb2c2e8",
-    "c1b37fdf37eba918c14fcbd234d02a4c80ffd6a72a55c3db5566cd8ed59e7a5b"
+    "c1b37fdf37eba918c14fcbd234d02a4c80ffd6a72a55c3db5566cd8ed59e7a5b",
+    "c18d57ee45159a53773222e64586c9d36769ebc55475d1a283dc483296bb9107"
   ],
   "schema_version": 1
 }
