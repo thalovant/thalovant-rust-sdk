@@ -151,24 +151,59 @@ impl NativeSignIn {
     /// or `None` when it is not an answer to this attempt.
     ///
     /// `None` rather than an error on a state mismatch, a missing code, or an
-    /// `error=` response: all three mean "do not continue", and a caller that
+    /// `error=` response -- including one that also carries a code: all of
+    /// those mean "do not continue", and a caller that
     /// handles them alike cannot accidentally treat one of them as success.
     pub fn code_from(&self, redirect: &str) -> Option<String> {
         let parsed = Url::parse(redirect).ok()?;
         let mut state = None;
         let mut code = None;
+        let mut refused = false;
         for (key, value) in parsed.query_pairs() {
             match key.as_ref() {
                 "state" => state = Some(value.into_owned()),
                 "code" => code = Some(value.into_owned()),
+                // A refusal that also carries a code is still a refusal.
+                // Checking only for a missing code accepted that pair and
+                // would have started an exchange on a code the server had just
+                // declined to issue.
+                "error" => refused = true,
                 _ => {}
             }
         }
-        if state.as_deref() != Some(self.state.as_str()) {
+        if refused || state.as_deref() != Some(self.state.as_str()) {
             return None;
         }
         code.filter(|value| !value.is_empty())
     }
+}
+
+/// Refuse to put an authorization code and its PKCE verifier on the wire in
+/// cleartext.
+///
+/// The control-plane URL accepts an `http` scheme -- a self-hosted or local
+/// deployment may legitimately be served that way -- and `request` hands
+/// whatever it is given to the HTTP client without looking. Every other call
+/// that would leak over http leaks a bearer token the caller already holds;
+/// this one leaks the two secrets that are about to become one, and a code is
+/// exchangeable by whoever sees it first.
+///
+/// Loopback is allowed: a request that never leaves the machine has no
+/// cleartext to observe, and that is how the control plane is run while
+/// somebody is working on it.
+pub(crate) fn require_secure_token_exchange(api_url: &str) -> Result<()> {
+    let parsed = Url::parse(api_url)
+        .map_err(|_| ThalovantError::Api(format!("API URL could not be read: {api_url}")))?;
+    if parsed.scheme() == "https" {
+        return Ok(());
+    }
+    if matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "::1")) {
+        return Ok(());
+    }
+    Err(ThalovantError::Api(format!(
+        "refusing to send an authorization code and PKCE verifier in cleartext to {}; use https, or a loopback address while developing",
+        parsed.host_str().unwrap_or(api_url)
+    )))
 }
 
 #[cfg(test)]
@@ -320,6 +355,46 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+    }
+
+    #[test]
+    fn a_refusal_that_also_carries_a_code_is_still_a_refusal() {
+        // CodeRabbit caught this: checking only for a missing code accepted
+        // error=access_denied&code=... and would have started an exchange on a
+        // code the authorization server had just declined to issue.
+        let begun = begin("app", "app://auth");
+        for redirect in [
+            format!(
+                "app://auth?error=access_denied&code=abc&state={}",
+                begun.state
+            ),
+            format!(
+                "app://auth?code=abc&error=server_error&state={}",
+                begun.state
+            ),
+        ] {
+            assert_eq!(
+                begun.code_from(&redirect),
+                None,
+                "{redirect} was treated as success"
+            );
+        }
+    }
+
+    #[test]
+    fn the_token_exchange_refuses_cleartext_and_allows_loopback() {
+        assert!(require_secure_token_exchange("http://control.example.test").is_err());
+        // Loopback has no cleartext to observe, and is how the API is run locally.
+        for allowed in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "https://api.thalovant.com",
+        ] {
+            assert!(
+                require_secure_token_exchange(allowed).is_ok(),
+                "{allowed} was refused"
+            );
+        }
     }
 
     #[test]

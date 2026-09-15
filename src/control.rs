@@ -404,6 +404,7 @@ impl ControlPlane {
         client_id: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Result<Value> {
+        crate::native_auth::require_secure_token_exchange(&self.api_url)?;
         let body = Map::from_iter([
             (
                 "grant_type".to_string(),
