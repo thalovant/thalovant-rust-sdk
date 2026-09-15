@@ -16,6 +16,7 @@
 //!     ..Default::default()
 //! })?;
 //! // open begun.authorization_url, then when the browser comes back:
+//! let redirect = format!("http://127.0.0.1:8765/?code=abc&state={}", begun.state);
 //! let code = begun.code_from(&redirect);   // None when it is not ours
 //! # Ok::<(), thalovant::errors::ThalovantError>(())
 //! ```

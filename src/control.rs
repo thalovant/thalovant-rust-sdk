@@ -406,10 +406,6 @@ impl ControlPlane {
     ) -> Result<Value> {
         crate::native_auth::require_secure_token_exchange(&self.api_url)?;
         let body = Map::from_iter([
-            (
-                "grant_type".to_string(),
-                Value::String("authorization_code".to_string()),
-            ),
             ("code".to_string(), Value::String(code.into())),
             ("code_verifier".to_string(), Value::String(verifier.into())),
             ("client_id".to_string(), Value::String(client_id.into())),
