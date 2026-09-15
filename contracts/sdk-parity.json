@@ -9,10 +9,12 @@
         "src/lib.rs": "ab450e1d3c1063ff33a8616543b591ca4b19b00e7722772363bebc9fee6d4b0c",
         "src/request_helpers.rs": "ce50095abf3bb09055af099dc7ed028691f3c6285f3bac23270776094a56d754"
       },
-      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "52059824e8661485e5bd171c39e88a02c2e57f0469364ea34001b1a370f70475"
+        "src/control.rs": "52059824e8661485e5bd171c39e88a02c2e57f0469364ea34001b1a370f70475",
+        "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
+        "src/native_auth.rs": "2d5653aaf9e46c7afce438e2723f607df665eb67d76a0880001c37dcb657970b"
       }
     },
     "identity": {
@@ -47,17 +49,6 @@
       "tests": {
         "tests/data/question-vectors.json": "046a163f1340976ae5898da153f080dbdd9326a733c97c4acbe7c2302474286e",
         "tests/listing.rs": "ed2be3c6a5f761117a158fba2d99e87911aca2eed09698fb7a908f09756cb299"
-      }
-    },
-    "native_auth": {
-      "implementation": {
-        "src/lib.rs": "ab450e1d3c1063ff33a8616543b591ca4b19b00e7722772363bebc9fee6d4b0c"
-      },
-      "reason": "Authorization-code sign-in with PKCE is implemented and exercised by the named regression suites: the challenge is checked to be S256 of the verifier, the verifier is checked never to reach the browser, a redirect answering a different attempt or carrying error= is refused, and the token exchange refuses cleartext to a non-loopback host. hubDisplayName is exercised against a catalog title, a name, a bare slug and a spec that is not shaped like a catalog. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports as implementation evidence.",
-      "status": "required",
-      "tests": {
-        "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
-        "src/native_auth.rs": "2d5653aaf9e46c7afce438e2723f607df665eb67d76a0880001c37dcb657970b"
       }
     },
     "runtime": {
