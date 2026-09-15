@@ -41,7 +41,7 @@ argon2 = "0.6.0"
 # time 0.3.55 fixes RUSTSEC-2026-0009; the patched line requires Rust 1.88.
 cookie_store = { version = "=0.22.1", default-features = false }
 time = { version = "=0.3.55", default-features = false }
-idna_adapter = "=1.2.0"
+idna_adapter = "=1.2.2"
 fancy-regex = "0.19.1"
 
 [dev-dependencies]
