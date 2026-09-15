@@ -12,6 +12,7 @@ pub mod errors;
 pub mod events;
 pub mod identity;
 pub mod intents;
+pub mod native_auth;
 pub mod noise;
 pub mod noise_store;
 pub mod protocols;
