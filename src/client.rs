@@ -40,14 +40,7 @@ pub struct Client {
     /// the oldest rather than whichever key `HashMap` iteration happened to
     /// yield -- that could drop the session being asked about right now, and
     /// the next turn would send no carried state at all.
-    pub(crate) conversations: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                (u64, Vec<String>, serde_json::Map<String, serde_json::Value>),
-            >,
-        >,
-    >,
+    pub(crate) conversations: std::sync::Arc<std::sync::Mutex<ConversationStore>>,
     /// Monotonic insert counter behind the map above. Shared with every clone
     /// of this client, because the map is.
     pub(crate) conversation_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -61,13 +54,15 @@ pub(crate) const MAX_REMEMBERED_CONVERSATIONS: usize = 32;
 /// could grow a single group without limit.
 pub(crate) const MAX_CONVERSATION_ALIASES: usize = 8;
 
+/// One conversation: when it was last touched, every id that reaches it, and
+/// the fields carried to the next turn.
+pub(crate) type ConversationEntry = (u64, Vec<String>, serde_json::Map<String, serde_json::Value>);
+
+/// Every conversation a client remembers, keyed by each of its aliases.
+pub(crate) type ConversationStore = std::collections::HashMap<String, ConversationEntry>;
+
 /// Conversations held, counting a group of aliases once.
-fn distinct_conversations(
-    conversations: &std::collections::HashMap<
-        String,
-        (u64, Vec<String>, serde_json::Map<String, serde_json::Value>),
-    >,
-) -> usize {
+fn distinct_conversations(conversations: &ConversationStore) -> usize {
     conversations
         .values()
         .map(|(inserted, _, _)| *inserted)
@@ -114,7 +109,7 @@ impl Client {
         };
         let mut keys: Vec<String> = Vec::with_capacity(session_ids.len());
         for id in session_ids {
-            if !keys.iter().any(|seen| seen == id) {
+            if !keys.iter().any(|seen| seen == *id) {
                 keys.push((*id).to_string());
             }
         }
@@ -129,7 +124,7 @@ impl Client {
             if let Some((_, group, _)) = conversations.remove(&keys[index]) {
                 for sibling in group {
                     conversations.remove(&sibling);
-                    if !keys.iter().any(|seen| *seen == sibling) {
+                    if !keys.contains(&sibling) {
                         keys.push(sibling);
                     }
                 }
