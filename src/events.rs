@@ -167,6 +167,70 @@ pub const HIVE_KINDS: [&str; 5] = [
     "rendezvous",
 ];
 
+/// Payload types a BINARY frame can carry, by their wire number.
+///
+/// A hub answers `speak:synth` by rendering the utterance and sending one of
+/// these back, so a client with no synthesiser of its own can still speak; a
+/// file arrives the same way. The wire numbers the type, this names it.
+pub const BINARY_PAYLOAD_KINDS: [(u8, &str); 6] = [
+    (1, "raw_audio"),
+    (2, "numpy_image"),
+    (3, "file"),
+    (4, "stt_transcribe"),
+    (5, "stt_handle"),
+    (6, "tts_audio"),
+];
+
+/// Name a payload type. One nobody has named still arrives, under its number,
+/// rather than being dropped.
+pub fn binary_kind_name(wire_number: u8) -> String {
+    BINARY_PAYLOAD_KINDS
+        .iter()
+        .find(|(number, _)| *number == wire_number)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| format!("binary:{wire_number}"))
+}
+
+/// A binary frame: the bytes a hub sent, and what it said about them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThalovantBinary {
+    /// `tts_audio`, `file`, ... or `binary:<wire number>` for an unnamed type.
+    pub kind: String,
+    /// The payload itself. Never parsed, never decompressed.
+    pub data: Vec<u8>,
+    /// What the hub sent beside it.
+    pub metadata: Map<String, Value>,
+    /// What was said, when this is rendered speech.
+    pub utterance: Option<String>,
+    /// The language it was said in.
+    pub lang: Option<String>,
+    /// The name a file arrived under. An empty name is no name.
+    pub file_name: Option<String>,
+}
+
+/// Read a hub's metadata into the shape above.
+///
+/// A value the hub did not send and one it sent empty both read as `None`:
+/// rendering `""` as a filename would put a blank name in front of somebody as
+/// though the hub had chosen it.
+pub fn binary_frame(kind: String, data: Vec<u8>, metadata: Map<String, Value>) -> ThalovantBinary {
+    let text = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    ThalovantBinary {
+        kind,
+        data,
+        utterance: text("utterance"),
+        lang: text("lang"),
+        file_name: text("file_name"),
+        metadata,
+    }
+}
+
 /// Session fields a client carries from one turn of a conversation to the next.
 ///
 /// A hub keeps nothing for a *named* session: OVOS-SESSION-2 §2.2 makes the

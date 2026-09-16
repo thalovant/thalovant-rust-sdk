@@ -1,10 +1,21 @@
 {
   "capabilities": {
     "binary": {
-      "implementation": {},
-      "reason": "src/wire.rs has a full WIRE-1 codec, but nothing surfaces a BINARY frame's payload type or bytes to a caller. No hub emits one today: hivemind-core listen never wires the audio protocol.",
-      "status": "planned",
-      "tests": {}
+      "implementation": {
+        "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
+        "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
+        "src/transport.rs": "508976629d8f73a008c01d98d670efa1ac6d75e847145979c0754982a5d84941",
+        "src/wire.rs": "495c1987d4f90269abc5385800eb45e8972cdd5c394320966ebf15637705c13e"
+      },
+      "reason": "decode_hive_binary_frame branches on BINARY: four bits of payload type, then the clip itself, never parsed or inflated. subscribe_binary delivers it. Run against the shared binary vectors and against binary-frames.json, which is hivemind-bus-client's own encoder output rather than frames this SDK built for itself.",
+      "status": "required",
+      "tests": {
+        "tests/binary_frames.rs": "2367cbcde11e55ab69a3ceb5de6a4f8d274d8ba922cd375143c0d6ae36c0cf5a"
+      },
+      "vectors": {
+        "binary-frames.json": "tests/conformance/binary-frames.json",
+        "binary-vectors.json": "tests/conformance/binary-vectors.json"
+      }
     },
     "cli": {
       "reason": "Python command line entry point; consumers expose idiomatic language APIs or MCP tools.",
@@ -12,7 +23,7 @@
     },
     "control": {
       "implementation": {
-        "src/lib.rs": "ab450e1d3c1063ff33a8616543b591ca4b19b00e7722772363bebc9fee6d4b0c",
+        "src/lib.rs": "5e48edf446249060b638cef0c5c2e74a4b063f412b3d28147b1a913c648f9b9e",
         "src/request_helpers.rs": "ce50095abf3bb09055af099dc7ed028691f3c6285f3bac23270776094a56d754"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
@@ -25,18 +36,21 @@
     },
     "conversation": {
       "implementation": {
-        "src/client.rs": "05625398e7b6372e845b3299ffad47b52b3b6892a56887f26dc58d9e02177d19",
-        "src/events.rs": "c7f32525f75b460a5fa932ab11d74f502708eeb8fe8767561c438e4223855051"
+        "src/client.rs": "317fe44dd611b108a22c486f92c99f6041edd982f5f17e39773f04c3ec80c255",
+        "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78"
       },
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
       "status": "required",
       "tests": {
         "tests/conversation_carry.rs": "9139f8deb02fd02323458f10cefec0c09ce2d6754d3fb29b74820d6f29f67f79"
+      },
+      "vectors": {
+        "conversation-vectors.json": "tests/conformance/conversation-vectors.json"
       }
     },
     "identity": {
       "implementation": {
-        "src/lib.rs": "ab450e1d3c1063ff33a8616543b591ca4b19b00e7722772363bebc9fee6d4b0c",
+        "src/lib.rs": "5e48edf446249060b638cef0c5c2e74a4b063f412b3d28147b1a913c648f9b9e",
         "src/protocols.rs": "a42115fd0de0dc49c4cee86872130f5ee3ab510ebc4b10d33adff4dcbd978905"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
@@ -52,8 +66,11 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "status": "required",
       "tests": {
-        "tests/data/inventory-vectors.json": "4deb456540b8b08aa4b59f8366d4295318b743245e7936febbdb199eb2dcfae0",
+        "tests/data/inventory-vectors.json": "f631ce993a84b21ae17d43f65ad4e062ebbd997ca7b9c02de4056c11ec73b1d0",
         "tests/inventory.rs": "e3dfc2ab4a18fbdf19051785bb8d004e80beb30b3711ea59dc2351c7f38ec3ac"
+      },
+      "vectors": {
+        "inventory-vectors.json": "tests/data/inventory-vectors.json"
       }
     },
     "listing": {
@@ -64,35 +81,50 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "status": "required",
       "tests": {
-        "tests/data/question-vectors.json": "046a163f1340976ae5898da153f080dbdd9326a733c97c4acbe7c2302474286e",
+        "tests/data/question-vectors.json": "a6ae21cb27eac6a33cf1026677f0c36be50f0e13faa7ce724bedc9a3b8bb8386",
         "tests/listing.rs": "ed2be3c6a5f761117a158fba2d99e87911aca2eed09698fb7a908f09756cb299"
+      },
+      "vectors": {
+        "question-vectors.json": "tests/data/question-vectors.json"
       }
     },
     "mesh": {
-      "implementation": {},
-      "reason": "HIVE_KINDS is declared and checked against the shared mesh vectors, but RuntimeTransport exposes only a broadcast channel of bus Events: a relayed frame has nowhere to go, and sending needs a hive-frame method on the transport first.",
-      "status": "planned",
-      "tests": {}
+      "implementation": {
+        "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
+        "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
+        "src/transport.rs": "508976629d8f73a008c01d98d670efa1ac6d75e847145979c0754982a5d84941"
+      },
+      "reason": "subscribe_hive over the five hive kinds, and propagate/escalate/broadcast. The kinds used to fall off the end of dispatch_noise_message with no arm and no log line. Run against the shared mesh vectors.",
+      "status": "required",
+      "tests": {
+        "tests/conversation_carry.rs": "9139f8deb02fd02323458f10cefec0c09ce2d6754d3fb29b74820d6f29f67f79"
+      },
+      "vectors": {
+        "mesh-vectors.json": "tests/conformance/mesh-vectors.json"
+      }
     },
     "runtime": {
       "implementation": {
-        "src/events.rs": "c7f32525f75b460a5fa932ab11d74f502708eeb8fe8767561c438e4223855051",
-        "src/lib.rs": "ab450e1d3c1063ff33a8616543b591ca4b19b00e7722772363bebc9fee6d4b0c",
-        "src/transport.rs": "7792c0dcbc3d4980e835021d56832b51abe463f6c8a1d0fc5a2fa6cd790eea64"
+        "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
+        "src/lib.rs": "5e48edf446249060b638cef0c5c2e74a4b063f412b3d28147b1a913c648f9b9e",
+        "src/transport.rs": "508976629d8f73a008c01d98d670efa1ac6d75e847145979c0754982a5d84941"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs.",
       "status": "required",
       "tests": {
-        "src/client.rs": "05625398e7b6372e845b3299ffad47b52b3b6892a56887f26dc58d9e02177d19",
+        "src/client.rs": "317fe44dd611b108a22c486f92c99f6041edd982f5f17e39773f04c3ec80c255",
         "src/transport_noise_tests.rs": "21b2ed8e8f6ca271cfaee88ec43157984e2abdd33d9f9874834b8eb762547cc9",
-        "tests/data/reply-claim-vectors.json": "bfcd4a649fa8ecb0cede0ccd495cdbdc1a9881760e4654cd776cf81bed558cb1",
+        "tests/data/reply-claim-vectors.json": "45f2731589e612d5a849376d94073c57b0fef426a92e1d065c58c48442b1ffdc",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
         "tests/reply_claims.rs": "28b12c2282adb27afbc267751ef8a4bfa989a70dc1e351d9e259e3ef7dfa0b69"
+      },
+      "vectors": {
+        "reply-claim-vectors.json": "tests/data/reply-claim-vectors.json"
       }
     },
     "session": {
       "implementation": {
-        "src/lib.rs": "ab450e1d3c1063ff33a8616543b591ca4b19b00e7722772363bebc9fee6d4b0c"
+        "src/lib.rs": "5e48edf446249060b638cef0c5c2e74a4b063f412b3d28147b1a913c648f9b9e"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. The connected-client factory owns failed connection cleanup; Python performs that dial internally and retains failed retirement before replacement. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "status": "required",
@@ -102,26 +134,10 @@
     }
   },
   "reference_digests": [
-    "1133ac83dca463a5b7c69c980d1b5db46a1314d08151b31508982ad1cf41b6c6",
-    "c13f62bf0c5ff9a8b06808542f89481f961e7c4e24af13928055598b76e2550c",
-    "2440dd10059c468ca5012a3e4e9e057c9bd2df7ef442eba1d5dcdeb4afb3eafd",
-    "4f17f2e999105c5629defd1c1ea71a197ecf725a9b559ff7b3bf9932638645bd",
-    "676e935e66330f8614d6c23cccddd48e1c4577c3af761775f18e1ea0128b8007",
-    "8b71292c815a4b7219be7b1a7a5d01e9500faaa23e7c97c6a48683fc0411e1d0",
-    "e1a17c218e70eb278e4a06161314076269c6d7f3fd24afc522711e1eedb2c2e8",
-    "c1b37fdf37eba918c14fcbd234d02a4c80ffd6a72a55c3db5566cd8ed59e7a5b",
-    "c18d57ee45159a53773222e64586c9d36769ebc55475d1a283dc483296bb9107",
-    "d02b21380724ae606673f1b7e74b57f7962c2dea1b0640fe642856c2f2be97e2",
-    "8c8c6d952c7d86633eb65eee20415f06ee114389b3cd5efc138e59a858ffdbab",
-    "20cc677bf3ca8d61c32f0f2d3fbf6562899cf83f951685d57a2bdd10e8d30a45",
-    "9ef680aa6e5dd5519ade3954b16ac14219117df45a87ca7112dca961fad7486d",
-    "c4973d48241c9f14e0aaf6aab6b4b1c7e798b81099d0c5783079af7b4a138392",
-    "a6fe69439f14c75a2cf37d14a2d2ad1e2426639def8e1757a738a3ec6683af17",
-    "8669034d6987af946303913780cce419efaff2a9181de7d46fbffe7092d7be9e",
-    "c0d883e69ee7fa301c6e4c1b1a5c433ed290d63f79a3e6b397fdb0a988d111fa",
     "49bab2a8922b69b5cd886e7acadf217cdaa78bd94bfb48374e2f4b1cde85dfc0",
     "003cdf02562e53bd24cc58ac8eb44411cc7ac42d06ba3bbfa46e82386ea92ef7",
-    "9af92bcafd77385cd7c9cfede859eeb3586f65d0b24c9dbff36352089e94821c"
+    "9af92bcafd77385cd7c9cfede859eeb3586f65d0b24c9dbff36352089e94821c",
+    "083b2da8b256cd970b3050218d8d51f13e7355633913d086c9f4147d8790165b"
   ],
   "schema_version": 1
 }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.0 — 2026-09-16
+
+- Speak the rest of the HiveMind protocol. A hub relays more than this client's conversation, and the five hive kinds -- `broadcast`, `propagate`, `escalate`, `intercom`, `rendezvous` -- fell off the end of `dispatch_noise_message` with no arm and no log line. `subscribe_hive` listens to one kind, and `propagate`, `escalate` and `broadcast` send. A refusal is a disconnection rather than an error: a hub's HELLO says nothing about what a client may do, so nothing can check first.
+- Receive binary frames. This is how a hub answers `speak:synth`: it renders the utterance and sends the audio back, so a client with no synthesiser of its own can still speak, and it is how a file arrives. `decode_hive_binary_frame` read the WIRE-1 header and then JSON-parsed the payload, so a frame carrying raw audio failed; it now reads the four payload-type bits and hands over the clip untouched, and `subscribe_binary` delivers it. Checked against `binary-frames.json` -- hivemind-bus-client's own encoder output, not frames this SDK built for itself.
+
 ## 0.9.0 — 2026-09-13
 
 - Expose advisory reply claim status and first-seen pipeline/skill identifiers, with shared conformance for fallback, mixed stages, legacy hubs and malformed stamps. Existing reply construction remains compatible.

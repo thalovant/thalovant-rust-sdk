@@ -1,7 +1,7 @@
 use crate::{
     constants::DEFAULT_USER_AGENT,
     errors::{Result, ThalovantError},
-    events::{event_from_bus_payload, Data, Event},
+    events::{event_from_bus_payload, Data, Event, ThalovantBinary},
     identity::{Identity, MqttBrokerCredentials},
     noise::{
         build_prologue, canonical_json, derive_psk, noise_protocol_name, select_noise_options,
@@ -94,6 +94,9 @@ pub struct HiveMessage {
     pub msg_type: String,
     #[serde(default)]
     pub payload: Map<String, Value>,
+    /// Set only on a BINARY frame, whose payload is bytes rather than JSON.
+    #[serde(skip)]
+    pub binary: Option<ThalovantBinary>,
     #[serde(default)]
     pub metadata: Map<String, Value>,
     #[serde(default)]
@@ -671,6 +674,7 @@ impl HttpTransport {
     ) -> Result<()> {
         self.send_hive_message(
             HiveMessage {
+                binary: None,
                 msg_type: "bus".to_string(),
                 payload: Map::from_iter([
                     ("type".to_string(), Value::String(event_type.to_string())),
@@ -1194,6 +1198,7 @@ impl WssTransport {
     ) -> Result<()> {
         self.send_hive_message(
             HiveMessage {
+                binary: None,
                 msg_type: "bus".to_string(),
                 payload: Map::from_iter([
                     ("type".to_string(), Value::String(event_type.to_string())),
@@ -1675,6 +1680,7 @@ impl MqttTransport {
     ) -> Result<()> {
         self.send_hive_message(
             HiveMessage {
+                binary: None,
                 msg_type: "bus".to_string(),
                 payload: Map::from_iter([
                     ("type".to_string(), Value::String(event_type.to_string())),
@@ -2153,7 +2159,11 @@ fn dispatch_noise_message(
                 let raw = serde_json::to_value(&message).ok();
                 let _ = bus.send(event_from_bus_payload(&message.payload, raw));
             }
-            "query" | "cascade" => {
+            "query" | "cascade" | "bin" | "broadcast" | "propagate" | "escalate" | "intercom"
+            | "rendezvous" => {
+                // The five mesh kinds and BINARY used to fall off the end of
+                // this match with no arm and no log line: a hub relaying them
+                // had nobody listening.
                 let _ = hive.send(message);
             }
             _ => {}
@@ -2188,6 +2198,7 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
 
 fn hello_hive_message(identity: &Identity, prefix: &str) -> HiveMessage {
     HiveMessage {
+        binary: None,
         msg_type: "hello".to_string(),
         payload: Map::from_iter([
             (

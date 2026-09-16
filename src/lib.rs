@@ -10,6 +10,7 @@ pub use request_helpers::{
 pub mod control;
 pub mod errors;
 pub mod events;
+pub mod hive;
 pub mod hubs;
 pub mod identity;
 pub mod intents;

@@ -477,6 +477,7 @@ impl Client {
         );
         let mut receiver = self.transport.subscribe_hive();
         let inner = HiveMessage {
+            binary: None,
             msg_type: "bus".to_string(),
             payload: Map::from_iter([
                 (
@@ -499,6 +500,7 @@ impl Client {
         send_and_collect(
             self.transport.send_hive_message(
                 HiveMessage {
+                    binary: None,
                     msg_type: "query".to_string(),
                     payload: hive_message_payload(&inner)?,
                     metadata: Map::from_iter([(
@@ -1020,6 +1022,7 @@ mod tests {
     #[test]
     fn query_message_extracts_bus_event() {
         let message = HiveMessage {
+            binary: None,
             msg_type: "query".to_string(),
             payload: Map::from_iter([
                 ("msg_type".to_string(), Value::String("bus".to_string())),
