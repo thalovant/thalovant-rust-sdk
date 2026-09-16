@@ -82,17 +82,45 @@ impl fmt::Debug for NativeSignIn {
             .field("authorization_url", &redacted_url(&self.authorization_url))
             .field("state", &"<redacted>")
             .field("verifier", &"<redacted>")
-            .field("redirect_uri", &self.redirect_uri)
+            // Only emptiness is rejected when this is supplied, so it can
+            // carry userinfo, a query or a fragment. An exact-match OAuth
+            // contract does not make any of those safe to log.
+            .field("redirect_uri", &redacted_url(&self.redirect_uri))
             .finish()
     }
 }
 
-/// The authorization endpoint without its query string.
+/// An endpoint without the parts of a URL that carry secrets.
+///
+/// The query holds `state` and the PKCE challenge; a fragment holds whatever
+/// an implicit flow put there; userinfo holds credentials outright. What is
+/// worth seeing in a log is the endpoint.
 fn redacted_url(raw: &str) -> String {
-    match raw.split_once('?') {
-        Some((endpoint, _)) => format!("{endpoint}?<redacted>"),
-        None => raw.to_string(),
-    }
+    let (before_fragment, fragment) = match raw.split_once('#') {
+        Some((head, _)) => (head, "#<redacted>"),
+        None => (raw, ""),
+    };
+    let (endpoint, query) = match before_fragment.split_once('?') {
+        Some((head, _)) => (head, "?<redacted>"),
+        None => (before_fragment, ""),
+    };
+    // `scheme://user:password@host/path` -- the authority is everything up to
+    // the first `/` after `://`, and userinfo is whatever precedes its last
+    // `@`. Anything without an authority has no userinfo to remove.
+    let endpoint = match endpoint.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = match rest.find('/') {
+                Some(cut) => (&rest[..cut], &rest[cut..]),
+                None => (rest, ""),
+            };
+            match authority.rsplit_once('@') {
+                Some((_, host)) => format!("{scheme}://<redacted>@{host}{path}"),
+                None => format!("{scheme}://{authority}{path}"),
+            }
+        }
+        None => endpoint.to_string(),
+    };
+    format!("{endpoint}{query}{fragment}")
 }
 
 fn base64_url(raw: &[u8]) -> String {
@@ -311,6 +339,23 @@ pub(crate) fn require_secure_token_exchange(api_url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_redacts_every_part_of_a_url_that_can_carry_a_secret() {
+        // begin_native_sign_in rejects only an empty redirect_uri, so it can
+        // arrive with userinfo, a query or a fragment. None of those are safe
+        // to put in a log.
+        let redacted = super::redacted_url("https://user:pw@app.example/cb?code=abc#tok=xyz");
+        assert!(!redacted.contains("pw"), "{redacted}");
+        assert!(!redacted.contains("abc"), "{redacted}");
+        assert!(!redacted.contains("xyz"), "{redacted}");
+        assert!(redacted.contains("app.example/cb"), "{redacted}");
+        // A plain endpoint survives intact -- redaction must not make a log useless.
+        assert_eq!(
+            super::redacted_url("https://app.example/cb"),
+            "https://app.example/cb"
+        );
+    }
+
     use super::*;
 
     // The authorization-code grant, which every client that needed it wrote

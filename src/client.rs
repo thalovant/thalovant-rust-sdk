@@ -42,7 +42,10 @@ pub struct Client {
     /// the next turn would send no carried state at all.
     pub(crate) conversations: std::sync::Arc<
         std::sync::Mutex<
-            std::collections::HashMap<String, (u64, serde_json::Map<String, serde_json::Value>)>,
+            std::collections::HashMap<
+                String,
+                (u64, Vec<String>, serde_json::Map<String, serde_json::Value>),
+            >,
         >,
     >,
     /// Monotonic insert counter behind the map above. Shared with every clone
@@ -53,9 +56,34 @@ pub struct Client {
 /// How many concurrent conversations one client remembers.
 pub(crate) const MAX_REMEMBERED_CONVERSATIONS: usize = 32;
 
+/// How many session ids one conversation answers to. The bound above counts a
+/// group once, so without this a hub that re-translates the id every turn
+/// could grow a single group without limit.
+pub(crate) const MAX_CONVERSATION_ALIASES: usize = 8;
+
+/// Conversations held, counting a group of aliases once.
+fn distinct_conversations(
+    conversations: &std::collections::HashMap<
+        String,
+        (u64, Vec<String>, serde_json::Map<String, serde_json::Value>),
+    >,
+) -> usize {
+    conversations
+        .values()
+        .map(|(inserted, _, _)| *inserted)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
 impl Client {
     /// Keep the session a hub returned, to send with the next utterance.
-    pub(crate) fn remember_conversation(&self, session_id: &str, context: &Context) {
+    /// Keep one conversation under every session id that reaches it.
+    ///
+    /// Filed as one entry per id they aged and were evicted separately, so a
+    /// caller continuing under the id it sent could lose the carry while one
+    /// using the hub's answering id kept it -- and the bound counted names
+    /// rather than conversations.
+    pub(crate) fn remember_conversation(&self, session_ids: &[&str], context: &Context) {
         let session = context
             .get("session")
             .and_then(serde_json::Value::as_object)
@@ -64,11 +92,17 @@ impl Client {
         let mut kept = serde_json::Map::new();
         for field in crate::events::CONVERSATION_SESSION_FIELDS {
             if let Some(value) = session.get(field) {
+                // The reference keeps a field only when it is truthy, so an
+                // empty scalar is not carried state. Keeping `response_mode: ""`
+                // spent one of the entries the bound allows on a cleared
+                // session, and eviction then dropped a session that had state.
                 let keep = match value {
                     serde_json::Value::Null => false,
+                    serde_json::Value::Bool(flag) => *flag,
+                    serde_json::Value::String(text) => !text.is_empty(),
+                    serde_json::Value::Number(number) => number.as_f64() != Some(0.0),
                     serde_json::Value::Array(items) => !items.is_empty(),
                     serde_json::Value::Object(fields) => !fields.is_empty(),
-                    _ => true,
                 };
                 if keep {
                     kept.insert(field.to_string(), value.clone());
@@ -78,25 +112,59 @@ impl Client {
         let Ok(mut conversations) = self.conversations.lock() else {
             return;
         };
-        // Forgetting is the state, not the absence of one: a turn that ended
-        // with nothing active must not leave the old entry to resurrect it.
-        conversations.remove(session_id);
-        if kept.is_empty() {
-            return;
-        }
-        if conversations.len() >= MAX_REMEMBERED_CONVERSATIONS {
-            let oldest = conversations
-                .iter()
-                .min_by_key(|(_, (inserted, _))| *inserted)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                conversations.remove(&oldest);
+        let mut keys: Vec<String> = Vec::with_capacity(session_ids.len());
+        for id in session_ids {
+            if !keys.iter().any(|seen| seen == id) {
+                keys.push((*id).to_string());
             }
         }
+        if keys.is_empty() {
+            return;
+        }
+        // Take over every id these already reach rather than dropping them: a
+        // turn continued under the hub's id must not forget the id a satellite
+        // still uses for the same conversation.
+        let mut index = 0;
+        while index < keys.len() {
+            if let Some((_, group, _)) = conversations.remove(&keys[index]) {
+                for sibling in group {
+                    conversations.remove(&sibling);
+                    if !keys.iter().any(|seen| *seen == sibling) {
+                        keys.push(sibling);
+                    }
+                }
+            }
+            index += 1;
+        }
+        // Forgetting is the state, not the absence of one: a turn that ended
+        // with nothing active must not leave the old entry to resurrect it.
+        if kept.is_empty() {
+            for key in &keys {
+                conversations.remove(key);
+            }
+            return;
+        }
+        // This turn's ids come first and inherited ones after, so the tail is
+        // the stalest: a hub answering under a fresh translated id every turn
+        // (HIVEMIND-BRIDGE-1 §4) would otherwise grow one group for ever.
+        keys.truncate(MAX_CONVERSATION_ALIASES);
         let inserted = self
             .conversation_sequence
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        conversations.insert(session_id.to_string(), (inserted, kept));
+        let group: Vec<String> = keys.clone();
+        for key in &keys {
+            conversations.insert(key.clone(), (inserted, group.clone(), kept.clone()));
+        }
+        while distinct_conversations(&conversations) > MAX_REMEMBERED_CONVERSATIONS {
+            let oldest = conversations
+                .values()
+                .min_by_key(|(inserted, _, _)| *inserted)
+                .map(|(_, group, _)| group.clone());
+            let Some(oldest) = oldest else { break };
+            for sibling in oldest {
+                conversations.remove(&sibling);
+            }
+        }
     }
 
     /// Put the last turn's conversation state back into this turn's context.
@@ -109,7 +177,7 @@ impl Client {
             let conversations = self.conversations.lock().ok()?;
             conversations
                 .get(session_id)
-                .map(|(_, kept)| kept.clone())?
+                .map(|(_, _, kept)| kept.clone())?
         };
         let mut next = context.cloned().unwrap_or_default();
         let session = next
@@ -458,20 +526,23 @@ impl Client {
                 deadline,
                 &options,
                 |event| {
-                    self.remember_conversation(&ask_session_id, &event.context);
-                    // And under the id the hub answered with, when it differs.
-                    // `Reply::session_id` hands the caller the first non-blank
-                    // *event* session id, so a caller that passes it to the
-                    // next ask looked up a key nothing was filed under and
-                    // sent no carried state at all.
-                    if let Some(answered_with) = event.session_id() {
+                    // Both ids in one call: the id the request used, which a
+                    // satellite reuses, and the one the hub answered with,
+                    // which is what `Reply::session_id` hands an ordinary
+                    // caller. Filed separately they aged and were evicted
+                    // separately, so with the store full the second could
+                    // evict the first.
+                    let answered_with = event.session_id().filter(|value| {
                         // Trimmed only to test emptiness: a hub answering with
                         // whitespace has told us nothing, but the raw value is
                         // what a caller would send back, so that is the key.
-                        if !answered_with.trim().is_empty() && answered_with != ask_session_id {
-                            self.remember_conversation(&answered_with, &event.context);
-                        }
+                        !value.trim().is_empty() && *value != ask_session_id
+                    });
+                    let mut keys: Vec<&str> = vec![&ask_session_id];
+                    if let Some(answered_with) = answered_with.as_deref() {
+                        keys.push(answered_with);
                     }
+                    self.remember_conversation(&keys, &event.context);
                 },
             ),
         )
@@ -1614,7 +1685,7 @@ mod tests {
 
 #[cfg(test)]
 mod conversation_cache_tests {
-    use super::{Client, MAX_REMEMBERED_CONVERSATIONS};
+    use super::{Client, MAX_CONVERSATION_ALIASES, MAX_REMEMBERED_CONVERSATIONS};
     use crate::identity::Identity;
 
     fn client() -> Client {
@@ -1627,6 +1698,53 @@ mod conversation_cache_tests {
             }))
             .expect("identity"),
         )
+    }
+
+    #[test]
+    fn both_session_aliases_survive_a_full_conversation_store() {
+        // Filed as two entries they aged and were evicted separately, so with
+        // the store full the second could evict the first and a caller
+        // continuing under the id it sent found no carry.
+        let client = client();
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "session".to_string(),
+            serde_json::json!({
+                "converse_handlers": [{"skill_id": "fart", "activated_at": 1.0}]
+            }),
+        );
+        for index in 0..MAX_REMEMBERED_CONVERSATIONS {
+            client.remember_conversation(&[&format!("filler-{index}")], &context);
+        }
+        client.remember_conversation(&["sat-1", "hub:sat-1"], &context);
+        for id in ["sat-1", "hub:sat-1"] {
+            assert!(
+                client.continue_conversation(None, id).is_some(),
+                "{id} lost its carry"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_aliases_are_bounded() {
+        // A hub answering under a fresh translated id every turn would
+        // otherwise grow one group for ever.
+        let client = client();
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "session".to_string(),
+            serde_json::json!({
+                "converse_handlers": [{"skill_id": "fart", "activated_at": 1.0}]
+            }),
+        );
+        for index in 0..(MAX_CONVERSATION_ALIASES * 3) {
+            client.remember_conversation(&["sat-1", &format!("hub-{index}")], &context);
+        }
+        let conversations = client.conversations.lock().unwrap();
+        let (_, group, _) = conversations
+            .get("sat-1")
+            .expect("the request id must survive");
+        assert!(group.len() <= MAX_CONVERSATION_ALIASES, "{}", group.len());
     }
 
     #[test]
@@ -1644,10 +1762,10 @@ mod conversation_cache_tests {
         );
 
         for index in 0..MAX_REMEMBERED_CONVERSATIONS {
-            client.remember_conversation(&format!("session-{index}"), &context);
+            client.remember_conversation(&[&format!("session-{index}")], &context);
         }
         // One more than the cache holds: the first one inserted is the one to go.
-        client.remember_conversation("session-new", &context);
+        client.remember_conversation(&["session-new"], &context);
 
         assert!(
             client.continue_conversation(None, "session-0").is_none(),
