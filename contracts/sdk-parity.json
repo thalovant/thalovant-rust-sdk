@@ -31,12 +31,12 @@
       "tests": {
         "src/control.rs": "f788506b0e760d980a4e7ba82d7d67e58e9d74fbd76bd0977e9b8eed646d5f04",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
-        "src/native_auth.rs": "e9d67e0bc1481482a8a0451a684b39f957e7705cc2c1c61bc22fe419e1858e1f"
+        "src/native_auth.rs": "1060cb0990138ec8278b7eb18bc4f2509163f2cb5ceab9560b67ed78954ccb04"
       }
     },
     "conversation": {
       "implementation": {
-        "src/client.rs": "af8b73a160cd1988b015ed99f8602b19f90df836d69ab5e82bd341d1ae0ff0ae",
+        "src/client.rs": "397d1eb7c6441829edb7c6d8385248fdb044cd64e53d0ae632fa20b13d347624",
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78"
       },
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
@@ -112,7 +112,7 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs.",
       "status": "required",
       "tests": {
-        "src/client.rs": "af8b73a160cd1988b015ed99f8602b19f90df836d69ab5e82bd341d1ae0ff0ae",
+        "src/client.rs": "397d1eb7c6441829edb7c6d8385248fdb044cd64e53d0ae632fa20b13d347624",
         "src/transport_noise_tests.rs": "fb25b5599f99758d86da43816f775db528b160e1720384a7b8a6c18185619805",
         "tests/data/reply-claim-vectors.json": "45f2731589e612d5a849376d94073c57b0fef426a92e1d065c58c48442b1ffdc",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
