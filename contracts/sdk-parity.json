@@ -31,12 +31,12 @@
       "tests": {
         "src/control.rs": "f484c7203ac978789d9870983f990e69bae6eff5912089ef3e480ffcfca72565",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
-        "src/native_auth.rs": "0f1467ada3f97f9416e4c051bc1e6f7c8d257e7c046d50d5d3c0d87901a7447b"
+        "src/native_auth.rs": "6f0d7c470077a074e69cc88047e3f872a4b7253c106a30305c7abe50826ac271"
       }
     },
     "conversation": {
       "implementation": {
-        "src/client.rs": "317fe44dd611b108a22c486f92c99f6041edd982f5f17e39773f04c3ec80c255",
+        "src/client.rs": "22c7b5c562630b10a08ef33e64e8202abe40f5d8783f91c315cd442a1143d356",
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78"
       },
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
@@ -112,8 +112,8 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs.",
       "status": "required",
       "tests": {
-        "src/client.rs": "317fe44dd611b108a22c486f92c99f6041edd982f5f17e39773f04c3ec80c255",
-        "src/transport_noise_tests.rs": "21b2ed8e8f6ca271cfaee88ec43157984e2abdd33d9f9874834b8eb762547cc9",
+        "src/client.rs": "22c7b5c562630b10a08ef33e64e8202abe40f5d8783f91c315cd442a1143d356",
+        "src/transport_noise_tests.rs": "108df19ed8ce61d457e4e6da24ec4f2ab52970cde20316cde638bf59641b9e6e",
         "tests/data/reply-claim-vectors.json": "45f2731589e612d5a849376d94073c57b0fef426a92e1d065c58c48442b1ffdc",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
         "tests/reply_claims.rs": "28b12c2282adb27afbc267751ef8a4bfa989a70dc1e351d9e259e3ef7dfa0b69"
@@ -137,7 +137,8 @@
     "49bab2a8922b69b5cd886e7acadf217cdaa78bd94bfb48374e2f4b1cde85dfc0",
     "003cdf02562e53bd24cc58ac8eb44411cc7ac42d06ba3bbfa46e82386ea92ef7",
     "9af92bcafd77385cd7c9cfede859eeb3586f65d0b24c9dbff36352089e94821c",
-    "083b2da8b256cd970b3050218d8d51f13e7355633913d086c9f4147d8790165b"
+    "083b2da8b256cd970b3050218d8d51f13e7355633913d086c9f4147d8790165b",
+    "1e8b76b34b755207bb754e5f4c7364334f14476dee70fce1d2687bfdc1545f30"
   ],
   "schema_version": 1
 }
