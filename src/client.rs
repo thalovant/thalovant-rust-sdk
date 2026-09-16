@@ -36,11 +36,21 @@ pub struct Client {
     /// next utterance or it is gone. Bounded, because a long-lived client
     /// handed a fresh session id per turn must not accumulate one entry per
     /// turn for ever; a satellite runs one session for its whole life.
+    /// Each entry carries the order it was inserted in, so a full cache evicts
+    /// the oldest rather than whichever key `HashMap` iteration happened to
+    /// yield -- that could drop the session being asked about right now, and
+    /// the next turn would send no carried state at all.
     pub(crate) conversations: std::sync::Arc<
         std::sync::Mutex<
-            std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>,
+            std::collections::HashMap<
+                String,
+                (u64, serde_json::Map<String, serde_json::Value>),
+            >,
         >,
     >,
+    /// Monotonic insert counter behind the map above. Shared with every clone
+    /// of this client, because the map is.
+    pub(crate) conversation_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// How many concurrent conversations one client remembers.
@@ -78,11 +88,18 @@ impl Client {
             return;
         }
         if conversations.len() >= MAX_REMEMBERED_CONVERSATIONS {
-            if let Some(oldest) = conversations.keys().next().cloned() {
+            let oldest = conversations
+                .iter()
+                .min_by_key(|(_, (inserted, _))| *inserted)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
                 conversations.remove(&oldest);
             }
         }
-        conversations.insert(session_id.to_string(), kept);
+        let inserted = self
+            .conversation_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        conversations.insert(session_id.to_string(), (inserted, kept));
     }
 
     /// Put the last turn's conversation state back into this turn's context.
@@ -93,7 +110,7 @@ impl Client {
     ) -> Option<Context> {
         let previous = {
             let conversations = self.conversations.lock().ok()?;
-            conversations.get(session_id).cloned()?
+            conversations.get(session_id).map(|(_, kept)| kept.clone())?
         };
         let mut next = context.cloned().unwrap_or_default();
         let session = next
@@ -188,6 +205,7 @@ impl Client {
             )),
             identity,
             conversations: Default::default(),
+            conversation_sequence: Default::default(),
         }
     }
 
@@ -197,6 +215,7 @@ impl Client {
             identity,
             transport,
             conversations: Default::default(),
+            conversation_sequence: Default::default(),
         })
     }
 
@@ -439,7 +458,19 @@ impl Client {
                 &request_id,
                 deadline,
                 &options,
-                |event| self.remember_conversation(&ask_session_id, &event.context),
+                |event| {
+                    self.remember_conversation(&ask_session_id, &event.context);
+                    // And under the id the hub answered with, when it differs.
+                    // `Reply::session_id` hands the caller the first non-blank
+                    // *event* session id, so a caller that passes it to the
+                    // next ask looked up a key nothing was filed under and
+                    // sent no carried state at all.
+                    if let Some(answered_with) = event.session_id() {
+                        if !answered_with.is_empty() && answered_with != ask_session_id {
+                            self.remember_conversation(&answered_with, &event.context);
+                        }
+                    }
+                },
             ),
         )
         .await
@@ -1576,5 +1607,58 @@ mod tests {
             .unwrap();
             assert_eq!(reply.session_id.as_deref(), Some("assigned-by-hub"));
         }
+    }
+}
+
+#[cfg(test)]
+mod conversation_cache_tests {
+    use super::{Client, MAX_REMEMBERED_CONVERSATIONS};
+    use crate::identity::Identity;
+
+    fn client() -> Client {
+        Client::new(
+            Identity::from_value(serde_json::json!({
+                "site_id": "test-site",
+                "key": "test-access",
+                "password": "test-password",
+                "default_master": "https://example.invalid",
+            }))
+            .expect("identity"),
+        )
+    }
+
+    #[test]
+    fn a_full_cache_evicts_the_oldest_not_an_arbitrary_key() {
+        // `HashMap::keys().next()` returns whichever key iteration yields, so a
+        // full cache could drop the session being asked about right now -- and
+        // the next turn would send no carried state at all.
+        let client = client();
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "session".to_string(),
+            serde_json::json!({
+                "converse_handlers": [{"skill_id": "fart", "activated_at": 1.0}]
+            }),
+        );
+
+        for index in 0..MAX_REMEMBERED_CONVERSATIONS {
+            client.remember_conversation(&format!("session-{index}"), &context);
+        }
+        // One more than the cache holds: the first one inserted is the one to go.
+        client.remember_conversation("session-new", &context);
+
+        assert!(
+            client.continue_conversation(None, "session-0").is_none(),
+            "the oldest entry should have been evicted"
+        );
+        for index in 1..MAX_REMEMBERED_CONVERSATIONS {
+            assert!(
+                client
+                    .continue_conversation(None, &format!("session-{index}"))
+                    .is_some(),
+                "session-{index} was evicted instead of the oldest"
+            );
+        }
+        assert!(client.continue_conversation(None, "session-new").is_some());
     }
 }

@@ -75,11 +75,23 @@ impl fmt::Debug for NativeSignIn {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NativeSignIn")
-            .field("authorization_url", &self.authorization_url)
+            // The query string carries `state` (and the challenge, and the
+            // redirect), so printing the URL whole put the state back in the
+            // log that redacting the field below was meant to keep it out of.
+            // The endpoint is what is worth seeing.
+            .field("authorization_url", &redacted_url(&self.authorization_url))
             .field("state", &"<redacted>")
             .field("verifier", &"<redacted>")
             .field("redirect_uri", &self.redirect_uri)
             .finish()
+    }
+}
+
+/// The authorization endpoint without its query string.
+fn redacted_url(raw: &str) -> String {
+    match raw.split_once('?') {
+        Some((endpoint, _)) => format!("{endpoint}?<redacted>"),
+        None => raw.to_string(),
     }
 }
 
@@ -573,8 +585,14 @@ mod redaction_tests {
         // has the verifier, so a log line carrying it is enough to lose the
         // exchange. The state is redacted with it: it is the other half of what
         // proves a redirect answers this attempt.
+        // Built the way begin_native_sign_in builds it, with the state in the
+        // query string: a hand-made URL without one let the first version of
+        // this test pass while Debug still printed the state.
         let sign_in = NativeSignIn {
-            authorization_url: "https://hub.example/authorize".into(),
+            authorization_url:
+                "https://hub.example/authorize?client_id=app&state=state-secret\
+                 &code_challenge=abc&response_type=code"
+                    .into(),
             state: "state-secret".into(),
             verifier: "verifier-secret".into(),
             redirect_uri: "http://127.0.0.1:0/callback".into(),
