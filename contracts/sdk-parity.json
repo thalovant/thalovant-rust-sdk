@@ -29,9 +29,9 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "e6011f4f60b68ea31a76eb9309b34693345066db975ba1220e6c7685f06dfbce",
+        "src/control.rs": "f484c7203ac978789d9870983f990e69bae6eff5912089ef3e480ffcfca72565",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
-        "src/native_auth.rs": "57209e8b5439e4e27963c228f82c721dca27160ee031cc4f8c0196da0dc92d1e"
+        "src/native_auth.rs": "0f1467ada3f97f9416e4c051bc1e6f7c8d257e7c046d50d5d3c0d87901a7447b"
       }
     },
     "conversation": {

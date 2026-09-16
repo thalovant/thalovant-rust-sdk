@@ -25,6 +25,7 @@
 //! That is what PKCE is for: a code intercepted by whatever else claimed the
 //! redirect is useless without it.
 
+use std::fmt;
 use base64::{engine::general_purpose, Engine as _};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -53,7 +54,11 @@ pub struct NativeSignInOptions {
 
 /// One sign-in attempt in progress. Keep it until the browser comes back; it
 /// holds the two secrets that make the round trip safe.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand rather than derived: the derived one prints the
+/// PKCE verifier, and an intercepted authorization code is redeemable by
+/// anyone who also has that. A log line is enough to leak it.
+#[derive(Clone)]
 pub struct NativeSignIn {
     /// Open this in a browser.
     pub authorization_url: String,
@@ -64,6 +69,18 @@ pub struct NativeSignIn {
     /// What this attempt asked the callback to arrive at. One that lands
     /// anywhere else is not this attempt's, however good its state looks.
     pub redirect_uri: String,
+}
+
+impl fmt::Debug for NativeSignIn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeSignIn")
+            .field("authorization_url", &self.authorization_url)
+            .field("state", &"<redacted>")
+            .field("verifier", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 fn base64_url(raw: &[u8]) -> String {
@@ -543,5 +560,28 @@ mod tests {
         assert!(!is_thalovant_url("https://evil.test@dash.thalovant.com"));
         assert!(!is_thalovant_url("https://notthalovant.com"));
         assert!(!is_thalovant_url("nonsense"));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_verifier_or_the_state() {
+        // An intercepted authorization code is redeemable by anyone who also
+        // has the verifier, so a log line carrying it is enough to lose the
+        // exchange. The state is redacted with it: it is the other half of what
+        // proves a redirect answers this attempt.
+        let sign_in = NativeSignIn {
+            authorization_url: "https://hub.example/authorize".into(),
+            state: "state-secret".into(),
+            verifier: "verifier-secret".into(),
+            redirect_uri: "http://127.0.0.1:0/callback".into(),
+        };
+        let printed = format!("{sign_in:?}");
+        assert!(!printed.contains("verifier-secret"), "{printed}");
+        assert!(!printed.contains("state-secret"), "{printed}");
+        assert!(printed.contains("https://hub.example/authorize"), "{printed}");
     }
 }

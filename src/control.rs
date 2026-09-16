@@ -377,11 +377,17 @@ impl ControlPlane {
                 false,
             )
             .await?;
+        // A string, not whatever `json_string` would coerce: a number or an
+        // object would be stored and reported as success, leaving a bearer token
+        // no request can use.
         let access_token = token
             .get("access_token")
-            .and_then(json_string)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
             .ok_or_else(|| {
-                ThalovantError::Api("token response did not include access_token".to_string())
+                ThalovantError::Api("token response did not include a usable access_token".to_string())
             })?;
         self.access_token = Some(access_token);
         Ok(token)
