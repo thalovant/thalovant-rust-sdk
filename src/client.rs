@@ -29,6 +29,82 @@ use tokio::{
 pub struct Client {
     pub identity: Identity,
     pub transport: RuntimeTransport,
+    /// The conversation each session id is in the middle of.
+    ///
+    /// A hub keeps nothing for a named session, so what the last turn activated
+    /// comes back on `ovos.utterance.handled` and has to be sent again with the
+    /// next utterance or it is gone. Bounded, because a long-lived client
+    /// handed a fresh session id per turn must not accumulate one entry per
+    /// turn for ever; a satellite runs one session for its whole life.
+    pub(crate) conversations: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, serde_json::Map<String, serde_json::Value>>,
+        >,
+    >,
+}
+
+/// How many concurrent conversations one client remembers.
+pub(crate) const MAX_REMEMBERED_CONVERSATIONS: usize = 32;
+
+impl Client {
+    /// Keep the session a hub returned, to send with the next utterance.
+    pub(crate) fn remember_conversation(&self, session_id: &str, context: &Context) {
+        let session = context
+            .get("session")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut kept = serde_json::Map::new();
+        for field in crate::events::CONVERSATION_SESSION_FIELDS {
+            if let Some(value) = session.get(field) {
+                let keep = match value {
+                    serde_json::Value::Null => false,
+                    serde_json::Value::Array(items) => !items.is_empty(),
+                    serde_json::Value::Object(fields) => !fields.is_empty(),
+                    _ => true,
+                };
+                if keep {
+                    kept.insert(field.to_string(), value.clone());
+                }
+            }
+        }
+        let Ok(mut conversations) = self.conversations.lock() else {
+            return;
+        };
+        // Forgetting is the state, not the absence of one: a turn that ended
+        // with nothing active must not leave the old entry to resurrect it.
+        conversations.remove(session_id);
+        if kept.is_empty() {
+            return;
+        }
+        if conversations.len() >= MAX_REMEMBERED_CONVERSATIONS {
+            if let Some(oldest) = conversations.keys().next().cloned() {
+                conversations.remove(&oldest);
+            }
+        }
+        conversations.insert(session_id.to_string(), kept);
+    }
+
+    /// Put the last turn's conversation state back into this turn's context.
+    pub(crate) fn continue_conversation(
+        &self,
+        context: Option<&Context>,
+        session_id: &str,
+    ) -> Option<Context> {
+        let previous = {
+            let conversations = self.conversations.lock().ok()?;
+            conversations.get(session_id).cloned()?
+        };
+        let mut next = context.cloned().unwrap_or_default();
+        let session = next
+            .get("session")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let carried = crate::events::carry_conversation(Some(&previous), &session);
+        next.insert("session".to_string(), serde_json::Value::Object(carried));
+        Some(next)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -111,6 +187,7 @@ impl Client {
                 identity.clone(),
             )),
             identity,
+            conversations: Default::default(),
         }
     }
 
@@ -119,6 +196,7 @@ impl Client {
         Ok(Self {
             identity,
             transport,
+            conversations: Default::default(),
         })
     }
 
@@ -335,9 +413,13 @@ impl Client {
         }
         let opts = &options.request;
         let lang = opts.lang.as_deref().unwrap_or("en-us");
+        let ask_session_id = opts.session_id.clone().unwrap_or_else(new_session_id);
+        // A hub keeps nothing between the turns of a named session, so the
+        // conversation only survives because this sends it back.
+        let carried = self.continue_conversation(opts.context.as_ref(), &ask_session_id);
         let context = context_with_correlation(
-            opts.context.as_ref(),
-            opts.session_id.as_deref(),
+            carried.as_ref().or(opts.context.as_ref()),
+            Some(&ask_session_id),
             Some(&self.identity.site_id),
             Some(lang),
             Some(&request_id),
@@ -351,7 +433,14 @@ impl Client {
                 utterance_payload(prompt, lang),
                 context.clone(),
             ),
-            collect_ask_reply(&mut receiver, &context, &request_id, deadline, &options),
+            collect_ask_reply(
+                &mut receiver,
+                &context,
+                &request_id,
+                deadline,
+                &options,
+                |event| self.remember_conversation(&ask_session_id, &event.context),
+            ),
         )
         .await
     }
@@ -657,6 +746,9 @@ async fn collect_ask_reply(
     request_id: &str,
     deadline: Instant,
     options: &AskOptions,
+    // The end of a turn is the one place a hub states what the conversation now
+    // is, and it keeps none of it for a named session.
+    remember: impl Fn(&Event),
 ) -> Result<Reply> {
     let mut events = Vec::new();
     let mut media_budget = crate::events::ReplyMediaBudget::default();
@@ -718,6 +810,7 @@ async fn collect_ask_reply(
             }
             EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => hard_failure = Some(event.clone()),
             EVENT_UTTERANCE_HANDLED => {
+                remember(&event);
                 empty_deadline.get_or_insert_with(|| {
                     Instant::now()
                         .checked_add(options.empty_reply_wait)
@@ -1011,8 +1104,22 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         let (a, b) = tokio::join!(
-            collect_ask_reply(&mut first, &first_context, "first", deadline, &options),
-            collect_ask_reply(&mut second, &second_context, "second", deadline, &options)
+            collect_ask_reply(
+                &mut first,
+                &first_context,
+                "first",
+                deadline,
+                &options,
+                |_| {}
+            ),
+            collect_ask_reply(
+                &mut second,
+                &second_context,
+                "second",
+                deadline,
+                &options,
+                |_| {}
+            )
         );
         for (reply, expected) in [(a.unwrap(), "first"), (b.unwrap(), "second")] {
             assert_eq!(reply.text, expected);
@@ -1061,6 +1168,7 @@ mod tests {
                 "test",
                 Instant::now() + Duration::from_millis(20),
                 &options,
+                |_| {},
             )
             .await;
             if hard {
@@ -1222,6 +1330,7 @@ mod tests {
                     "request",
                     started + Duration::from_millis(100),
                     &options,
+                    |_| {},
                 ),
             ),
         )
@@ -1255,6 +1364,7 @@ mod tests {
             "request",
             Instant::now() + Duration::from_millis(10),
             &AskOptions::default(),
+            |_| {},
         )
         .await;
         assert!(
@@ -1290,6 +1400,7 @@ mod tests {
                         "request",
                         Instant::now() + Duration::from_secs(12),
                         &AskOptions::default(),
+                        |_| {},
                     ),
                 ),
             )
@@ -1361,6 +1472,7 @@ mod tests {
                     "request",
                     Instant::now() + Duration::from_secs(12),
                     &AskOptions::default(),
+                    |_| {},
                 )
                 .await
             },
@@ -1411,6 +1523,7 @@ mod tests {
                     empty_reply_wait: Duration::from_millis(100),
                     ..Default::default()
                 },
+                |_| {},
             )
             .await;
             assert!(
@@ -1454,6 +1567,7 @@ mod tests {
                     reply_settle: Duration::ZERO,
                     ..Default::default()
                 },
+                |_| {},
             )
             .await
             .unwrap();

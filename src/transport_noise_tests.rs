@@ -607,6 +607,7 @@ async fn client_event_stream_uses_authenticated_http_and_reports_disconnect() {
     let client = crate::Client {
         identity: transport.identity().clone(),
         transport: RuntimeTransport::Http(transport.clone()),
+        conversations: Default::default(),
     };
     let mut events = client
         .listen(
@@ -1448,6 +1449,7 @@ async fn concurrent_connect_waits_for_authentication_and_joiner_timeout_is_local
     let client = crate::Client {
         identity,
         transport: RuntimeTransport::Wss(wss.clone()),
+        conversations: Default::default(),
     };
     let entered = Arc::new(Notify::new());
     let resume = Arc::new(Notify::new());
@@ -1855,6 +1857,7 @@ async fn active_reply_ids_reject_duplicates_on_a_shared_authenticated_transport(
         let client = crate::Client {
             identity: transport.identity().clone(),
             transport: RuntimeTransport::Http(transport.clone()),
+            conversations: Default::default(),
         };
         client.connect().await.unwrap();
         let first = tokio::spawn(invoke(
