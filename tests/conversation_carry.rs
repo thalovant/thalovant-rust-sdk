@@ -89,3 +89,33 @@ fn this_clients_own_traffic_is_not_a_hive_kind() {
         assert!(!HIVE_KINDS.contains(&refused), "{refused}");
     }
 }
+
+#[tokio::test]
+async fn subscribe_hive_refuses_every_kind_the_vectors_name() {
+    // Comparing HIVE_KINDS against refused_kinds only proved two lists agree.
+    // The refusal is behaviour: subscribe_hive rejects the kind before it ever
+    // reaches a transport, and a regression there would let a caller subscribe
+    // to "bus" or "query" and quietly compete with ask() for the same replies.
+    let client = thalovant::Client::new(
+        thalovant::identity::Identity::from_value(serde_json::json!({
+            "site_id": "test-site",
+            "key": "test-access",
+            "password": "test-password",
+            "default_master": "https://example.invalid",
+        }))
+        .expect("identity"),
+    );
+    let spec = vectors("mesh-vectors.json");
+    for refused in spec["refused_kinds"].as_array().expect("refused_kinds") {
+        let refused = refused.as_str().expect("string");
+        // HiveStream is not Debug, so match rather than expect_err.
+        let error = match client.subscribe_hive(refused).await {
+            Ok(_) => panic!("{refused} must be refused: it belongs to ask()"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(refused),
+            "the refusal must name the kind: {error}"
+        );
+    }
+}

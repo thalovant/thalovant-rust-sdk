@@ -380,17 +380,9 @@ impl ControlPlane {
         // A string, not whatever `json_string` would coerce: a number or an
         // object would be stored and reported as success, leaving a bearer token
         // no request can use.
-        let access_token = token
-            .get("access_token")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| {
-                ThalovantError::Api(
-                    "token response did not include a usable access_token".to_string(),
-                )
-            })?;
+        let access_token = access_token_value(&token).ok_or_else(|| {
+            ThalovantError::Api("token response did not include a usable access_token".to_string())
+        })?;
         self.access_token = Some(access_token);
         Ok(token)
     }
@@ -431,12 +423,9 @@ impl ControlPlane {
                 false,
             )
             .await?;
-        let access_token = token
-            .get("access_token")
-            .and_then(json_string)
-            .ok_or_else(|| {
-                ThalovantError::Api("token response did not include access_token".to_string())
-            })?;
+        let access_token = access_token_value(&token).ok_or_else(|| {
+            ThalovantError::Api("token response did not include a usable access_token".to_string())
+        })?;
         self.access_token = Some(access_token);
         Ok(token)
     }
@@ -508,12 +497,9 @@ impl ControlPlane {
         let token = self
             .poll_device_token(&grant.device_code, grant.poll_interval(), timeout)
             .await?;
-        let access_token = token
-            .get("access_token")
-            .and_then(json_string)
-            .ok_or_else(|| {
-                ThalovantError::Api("token response did not include access_token".to_string())
-            })?;
+        let access_token = access_token_value(&token).ok_or_else(|| {
+            ThalovantError::Api("token response did not include a usable access_token".to_string())
+        })?;
         self.access_token = Some(access_token);
         Ok(token)
     }
@@ -1801,6 +1787,20 @@ fn push_query_param(params: &mut Vec<String>, key: &str, value: Option<&str>) {
     }
 }
 
+/// An `access_token` field, accepted only as a trimmed, non-empty JSON string.
+///
+/// `json_string` renders a number or an object through `to_string()`, so a
+/// malformed response could be stored and reported as success, leaving a
+/// bearer token no request can use. Every grant reads the field through here.
+fn access_token_value(token: &Value) -> Option<String> {
+    token
+        .get("access_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn json_string(value: &Value) -> Option<String> {
     match value {
         Value::String(raw) => {
@@ -1894,6 +1894,28 @@ fn merge_runtime_config(base: &Value, delta: &Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_real_string_is_an_access_token() {
+        // json_string renders a number or an object through to_string(), so
+        // these used to be stored and reported as a successful sign-in --
+        // leaving a bearer token no request can use.
+        for body in [
+            serde_json::json!({"access_token": 12345}),
+            serde_json::json!({"access_token": {"token": "x"}}),
+            serde_json::json!({"access_token": ["x"]}),
+            serde_json::json!({"access_token": "   "}),
+            serde_json::json!({"access_token": ""}),
+            serde_json::json!({"access_token": null}),
+            serde_json::json!({}),
+        ] {
+            assert!(super::access_token_value(&body).is_none(), "{body}");
+        }
+        assert_eq!(
+            super::access_token_value(&serde_json::json!({"access_token": "  abc  "})),
+            Some("abc".to_string()),
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -29,9 +29,9 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "f788506b0e760d980a4e7ba82d7d67e58e9d74fbd76bd0977e9b8eed646d5f04",
+        "src/control.rs": "d196d3279e10b70fcf0939a09f473b17084d1d1f644a2459c7bc6564e5b90545",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
-        "src/native_auth.rs": "1060cb0990138ec8278b7eb18bc4f2509163f2cb5ceab9560b67ed78954ccb04"
+        "src/native_auth.rs": "c5e1d05fa71c4ae3ae37e1225deaa8157d504ebb54d4558b7e9f9fecfafda02f"
       }
     },
     "conversation": {
@@ -42,7 +42,7 @@
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
       "status": "required",
       "tests": {
-        "tests/conversation_carry.rs": "9139f8deb02fd02323458f10cefec0c09ce2d6754d3fb29b74820d6f29f67f79"
+        "tests/conversation_carry.rs": "99f485a0eb07266e3886a50ba65a2ed157898fc4ddd24d1a1541bc627151964d"
       },
       "vectors": {
         "conversation-vectors.json": "tests/conformance/conversation-vectors.json"
@@ -97,7 +97,7 @@
       "reason": "subscribe_hive over the five hive kinds, and propagate/escalate/broadcast. The kinds used to fall off the end of dispatch_noise_message with no arm and no log line. Run against the shared mesh vectors.",
       "status": "required",
       "tests": {
-        "tests/conversation_carry.rs": "9139f8deb02fd02323458f10cefec0c09ce2d6754d3fb29b74820d6f29f67f79"
+        "tests/conversation_carry.rs": "99f485a0eb07266e3886a50ba65a2ed157898fc4ddd24d1a1541bc627151964d"
       },
       "vectors": {
         "mesh-vectors.json": "tests/conformance/mesh-vectors.json"

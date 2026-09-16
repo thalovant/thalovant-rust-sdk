@@ -107,15 +107,22 @@ fn redacted_url(raw: &str) -> String {
     // `scheme://user:password@host/path` -- the authority is everything up to
     // the first `/` after `://`, and userinfo is whatever precedes its last
     // `@`. Anything without an authority has no userinfo to remove.
-    let endpoint = match endpoint.split_once("://") {
-        Some((scheme, rest)) => {
+    // ...and the network-path form `//user:password@host/path` that RFC 3986
+    // §4.2 allows: an authority is introduced by either marker. Matching only
+    // `://` let the second reach Debug with its credentials intact.
+    let split = endpoint
+        .find("://")
+        .map(|at| (&endpoint[..at + 3], &endpoint[at + 3..]))
+        .or_else(|| endpoint.strip_prefix("//").map(|rest| ("//", rest)));
+    let endpoint = match split {
+        Some((prefix, rest)) => {
             let (authority, path) = match rest.find('/') {
                 Some(cut) => (&rest[..cut], &rest[cut..]),
                 None => (rest, ""),
             };
             match authority.rsplit_once('@') {
-                Some((_, host)) => format!("{scheme}://<redacted>@{host}{path}"),
-                None => format!("{scheme}://{authority}{path}"),
+                Some((_, host)) => format!("{prefix}<redacted>@{host}{path}"),
+                None => format!("{prefix}{authority}{path}"),
             }
         }
         None => endpoint.to_string(),
@@ -354,6 +361,12 @@ mod tests {
             super::redacted_url("https://app.example/cb"),
             "https://app.example/cb"
         );
+        // RFC 3986 §4.2 network-path: an authority with no scheme. Matching
+        // only "://" let this through with its credentials intact.
+        let network_path = super::redacted_url("//user:pw@app.example/cb?code=abc");
+        assert!(!network_path.contains("pw"), "{network_path}");
+        assert!(!network_path.contains("abc"), "{network_path}");
+        assert!(network_path.contains("app.example/cb"), "{network_path}");
     }
 
     use super::*;
