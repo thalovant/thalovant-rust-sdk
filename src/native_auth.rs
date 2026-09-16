@@ -28,6 +28,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use std::fmt;
 use url::Url;
 
 use crate::errors::{Result, ThalovantError};
@@ -53,7 +54,11 @@ pub struct NativeSignInOptions {
 
 /// One sign-in attempt in progress. Keep it until the browser comes back; it
 /// holds the two secrets that make the round trip safe.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is written by hand rather than derived: the derived one prints the
+/// PKCE verifier, and an intercepted authorization code is redeemable by
+/// anyone who also has that. A log line is enough to leak it.
+#[derive(Clone)]
 pub struct NativeSignIn {
     /// Open this in a browser.
     pub authorization_url: String,
@@ -64,6 +69,65 @@ pub struct NativeSignIn {
     /// What this attempt asked the callback to arrive at. One that lands
     /// anywhere else is not this attempt's, however good its state looks.
     pub redirect_uri: String,
+}
+
+impl fmt::Debug for NativeSignIn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NativeSignIn")
+            // The query string carries `state` (and the challenge, and the
+            // redirect), so printing the URL whole put the state back in the
+            // log that redacting the field below was meant to keep it out of.
+            // The endpoint is what is worth seeing.
+            .field("authorization_url", &redacted_url(&self.authorization_url))
+            .field("state", &"<redacted>")
+            .field("verifier", &"<redacted>")
+            // Only emptiness is rejected when this is supplied, so it can
+            // carry userinfo, a query or a fragment. An exact-match OAuth
+            // contract does not make any of those safe to log.
+            .field("redirect_uri", &redacted_url(&self.redirect_uri))
+            .finish()
+    }
+}
+
+/// An endpoint without the parts of a URL that carry secrets.
+///
+/// The query holds `state` and the PKCE challenge; a fragment holds whatever
+/// an implicit flow put there; userinfo holds credentials outright. What is
+/// worth seeing in a log is the endpoint.
+fn redacted_url(raw: &str) -> String {
+    let (before_fragment, fragment) = match raw.split_once('#') {
+        Some((head, _)) => (head, "#<redacted>"),
+        None => (raw, ""),
+    };
+    let (endpoint, query) = match before_fragment.split_once('?') {
+        Some((head, _)) => (head, "?<redacted>"),
+        None => (before_fragment, ""),
+    };
+    // `scheme://user:password@host/path` -- the authority is everything up to
+    // the first `/` after `://`, and userinfo is whatever precedes its last
+    // `@`. Anything without an authority has no userinfo to remove.
+    // ...and the network-path form `//user:password@host/path` that RFC 3986
+    // §4.2 allows: an authority is introduced by either marker. Matching only
+    // `://` let the second reach Debug with its credentials intact.
+    let split = endpoint
+        .find("://")
+        .map(|at| (&endpoint[..at + 3], &endpoint[at + 3..]))
+        .or_else(|| endpoint.strip_prefix("//").map(|rest| ("//", rest)));
+    let endpoint = match split {
+        Some((prefix, rest)) => {
+            let (authority, path) = match rest.find('/') {
+                Some(cut) => (&rest[..cut], &rest[cut..]),
+                None => (rest, ""),
+            };
+            match authority.rsplit_once('@') {
+                Some((_, host)) => format!("{prefix}<redacted>@{host}{path}"),
+                None => format!("{prefix}{authority}{path}"),
+            }
+        }
+        None => endpoint.to_string(),
+    };
+    format!("{endpoint}{query}{fragment}")
 }
 
 fn base64_url(raw: &[u8]) -> String {
@@ -282,6 +346,29 @@ pub(crate) fn require_secure_token_exchange(api_url: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_redacts_every_part_of_a_url_that_can_carry_a_secret() {
+        // begin_native_sign_in rejects only an empty redirect_uri, so it can
+        // arrive with userinfo, a query or a fragment. None of those are safe
+        // to put in a log.
+        let redacted = super::redacted_url("https://user:pw@app.example/cb?code=abc#tok=xyz");
+        assert!(!redacted.contains("pw"), "{redacted}");
+        assert!(!redacted.contains("abc"), "{redacted}");
+        assert!(!redacted.contains("xyz"), "{redacted}");
+        assert!(redacted.contains("app.example/cb"), "{redacted}");
+        // A plain endpoint survives intact -- redaction must not make a log useless.
+        assert_eq!(
+            super::redacted_url("https://app.example/cb"),
+            "https://app.example/cb"
+        );
+        // RFC 3986 §4.2 network-path: an authority with no scheme. Matching
+        // only "://" let this through with its credentials intact.
+        let network_path = super::redacted_url("//user:pw@app.example/cb?code=abc");
+        assert!(!network_path.contains("pw"), "{network_path}");
+        assert!(!network_path.contains("abc"), "{network_path}");
+        assert!(network_path.contains("app.example/cb"), "{network_path}");
+    }
+
     use super::*;
 
     // The authorization-code grant, which every client that needed it wrote
@@ -543,5 +630,36 @@ mod tests {
         assert!(!is_thalovant_url("https://evil.test@dash.thalovant.com"));
         assert!(!is_thalovant_url("https://notthalovant.com"));
         assert!(!is_thalovant_url("nonsense"));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_prints_the_verifier_or_the_state() {
+        // An intercepted authorization code is redeemable by anyone who also
+        // has the verifier, so a log line carrying it is enough to lose the
+        // exchange. The state is redacted with it: it is the other half of what
+        // proves a redirect answers this attempt.
+        // Built the way begin_native_sign_in builds it, with the state in the
+        // query string: a hand-made URL without one let the first version of
+        // this test pass while Debug still printed the state.
+        let sign_in = NativeSignIn {
+            authorization_url: "https://hub.example/authorize?client_id=app&state=state-secret\
+                 &code_challenge=abc&response_type=code"
+                .into(),
+            state: "state-secret".into(),
+            verifier: "verifier-secret".into(),
+            redirect_uri: "http://127.0.0.1:0/callback".into(),
+        };
+        let printed = format!("{sign_in:?}");
+        assert!(!printed.contains("verifier-secret"), "{printed}");
+        assert!(!printed.contains("state-secret"), "{printed}");
+        assert!(
+            printed.contains("https://hub.example/authorize"),
+            "{printed}"
+        );
     }
 }

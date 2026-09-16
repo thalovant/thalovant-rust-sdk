@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0 — 2026-09-16
+
+- **Breaking for code that constructs `Client` or `HiveMessage` by literal.** Both gained fields this release -- `Client` the conversation cache and its sequence, `HiveMessage` a `binary` payload. The new fields are `pub(crate)`, so they are invisible outside this crate, but their presence makes an existing `Client { identity, transport }` literal and any exhaustive `HiveMessage` pattern fail to compile. Build them through `Client::new` and the transport constructors. 0.5.2 deliberately preserved public `Client` literals; the 0.9.x-to-0.10.0 boundary is where that changes.
+- One conversation, however many session ids reach it. The request id and the id a hub answered with were filed as separate entries, so they aged and were evicted separately: with the cache full, storing the second could evict the first and a caller continuing under the id it sent found no carry. Aliases are now one group with one place in the bound, capped so a hub that re-translates the id every turn cannot grow a group for ever. An empty scalar is no longer carried state, matching the reference.
+- `NativeSignIn`'s `Debug` redacts the whole shape of a URL that can carry a secret -- userinfo and fragment as well as the query -- for `redirect_uri` as well as `authorization_url`. Only emptiness is rejected when a redirect is supplied, so it can arrive carrying any of them.
+
+- Speak the rest of the HiveMind protocol. A hub relays more than this client's conversation, and the five hive kinds -- `broadcast`, `propagate`, `escalate`, `intercom`, `rendezvous` -- fell off the end of `dispatch_noise_message` with no arm and no log line. `subscribe_hive` listens to one kind, and `propagate`, `escalate` and `broadcast` send. A refusal is a disconnection rather than an error: a hub's HELLO says nothing about what a client may do, so nothing can check first.
+- Receive binary frames. This is how a hub answers `speak:synth`: it renders the utterance and sends the audio back, so a client with no synthesiser of its own can still speak, and it is how a file arrives. `decode_hive_binary_frame` read the WIRE-1 header and then JSON-parsed the payload, so a frame carrying raw audio failed; it now reads the four payload-type bits and hands over the clip untouched, and `subscribe_binary` delivers it. Checked against `binary-frames.json` -- hivemind-bus-client's own encoder output, not frames this SDK built for itself.
+
 ## 0.9.0 — 2026-09-13
 
 - Expose advisory reply claim status and first-seen pipeline/skill identifiers, with shared conformance for fallback, mixed stages, legacy hubs and malformed stamps. Existing reply construction remains compatible.

@@ -1,5 +1,6 @@
 use crate::{
     errors::{Result, ThalovantError},
+    events::{binary_frame, binary_kind_name},
     transport::HiveMessage,
 };
 use flate2::read::ZlibDecoder;
@@ -42,13 +43,33 @@ pub fn decode_hive_binary_frame(payload: &[u8]) -> Result<HiveMessage> {
         &reader.read_bytes(metadata_len)?,
         compressed,
     )?)?;
+    let msg_type = hive_int_to_type(type_id).to_string();
+    if msg_type == "bin" {
+        // A BINARY frame does not carry JSON. Four bits name the payload type,
+        // and everything after them is the clip itself: raw, misaligned because
+        // the padding goes on the front, and never parsed or decompressed.
+        let kind = reader.read_uint(4)? as u8;
+        let clip = reader.read_remaining_bytes()?;
+        return Ok(HiveMessage {
+            msg_type,
+            payload: Map::new(),
+            binary: Some(binary_frame(binary_kind_name(kind), clip, metadata.clone())),
+            metadata,
+            route: vec![],
+            node: None,
+            target_site_id: None,
+            target_pubkey: None,
+            source_peer: None,
+        });
+    }
     let payload = parse_map(&decode_wire_text(
         &reader.read_remaining_bytes()?,
         compressed,
     )?)?;
     Ok(HiveMessage {
-        msg_type: hive_int_to_type(type_id).to_string(),
+        msg_type,
         payload,
+        binary: None,
         metadata,
         route: vec![],
         node: None,
@@ -173,6 +194,7 @@ mod tests {
     #[test]
     fn hive_binary_frame_round_trips() {
         let message = HiveMessage {
+            binary: None,
             msg_type: "bus".to_string(),
             payload: json!({
                 "type": "test.event",

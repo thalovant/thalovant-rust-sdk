@@ -29,6 +29,161 @@ use tokio::{
 pub struct Client {
     pub identity: Identity,
     pub transport: RuntimeTransport,
+    /// The conversation each session id is in the middle of.
+    ///
+    /// A hub keeps nothing for a named session, so what the last turn activated
+    /// comes back on `ovos.utterance.handled` and has to be sent again with the
+    /// next utterance or it is gone. Bounded, because a long-lived client
+    /// handed a fresh session id per turn must not accumulate one entry per
+    /// turn for ever; a satellite runs one session for its whole life.
+    /// Each entry carries the order it was inserted in, so a full cache evicts
+    /// the oldest rather than whichever key `HashMap` iteration happened to
+    /// yield -- that could drop the session being asked about right now, and
+    /// the next turn would send no carried state at all.
+    pub(crate) conversations: std::sync::Arc<std::sync::Mutex<ConversationStore>>,
+    /// Monotonic insert counter behind the map above. Shared with every clone
+    /// of this client, because the map is.
+    pub(crate) conversation_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// How many concurrent conversations one client remembers.
+pub(crate) const MAX_REMEMBERED_CONVERSATIONS: usize = 32;
+
+/// How many session ids one conversation answers to. The bound above counts a
+/// group once, so without this a hub that re-translates the id every turn
+/// could grow a single group without limit.
+pub(crate) const MAX_CONVERSATION_ALIASES: usize = 8;
+
+/// One conversation: when it was last touched, every id that reaches it, and
+/// the fields carried to the next turn.
+pub(crate) type ConversationEntry = (u64, Vec<String>, serde_json::Map<String, serde_json::Value>);
+
+/// Every conversation a client remembers, keyed by each of its aliases.
+pub(crate) type ConversationStore = std::collections::HashMap<String, ConversationEntry>;
+
+/// Conversations held, counting a group of aliases once.
+fn distinct_conversations(conversations: &ConversationStore) -> usize {
+    conversations
+        .values()
+        .map(|(inserted, _, _)| *inserted)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+impl Client {
+    /// Keep the session a hub returned, to send with the next utterance.
+    /// Keep one conversation under every session id that reaches it.
+    ///
+    /// Filed as one entry per id they aged and were evicted separately, so a
+    /// caller continuing under the id it sent could lose the carry while one
+    /// using the hub's answering id kept it -- and the bound counted names
+    /// rather than conversations.
+    pub(crate) fn remember_conversation(&self, session_ids: &[&str], context: &Context) {
+        let session = context
+            .get("session")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut kept = serde_json::Map::new();
+        for field in crate::events::CONVERSATION_SESSION_FIELDS {
+            if let Some(value) = session.get(field) {
+                // The reference keeps a field only when it is truthy, so an
+                // empty scalar is not carried state. Keeping `response_mode: ""`
+                // spent one of the entries the bound allows on a cleared
+                // session, and eviction then dropped a session that had state.
+                let keep = match value {
+                    serde_json::Value::Null => false,
+                    serde_json::Value::Bool(flag) => *flag,
+                    serde_json::Value::String(text) => !text.is_empty(),
+                    serde_json::Value::Number(number) => number.as_f64() != Some(0.0),
+                    serde_json::Value::Array(items) => !items.is_empty(),
+                    serde_json::Value::Object(fields) => !fields.is_empty(),
+                };
+                if keep {
+                    kept.insert(field.to_string(), value.clone());
+                }
+            }
+        }
+        let Ok(mut conversations) = self.conversations.lock() else {
+            return;
+        };
+        let mut keys: Vec<String> = Vec::with_capacity(session_ids.len());
+        for id in session_ids {
+            if !keys.iter().any(|seen| seen == *id) {
+                keys.push((*id).to_string());
+            }
+        }
+        if keys.is_empty() {
+            return;
+        }
+        // Take over every id these already reach rather than dropping them: a
+        // turn continued under the hub's id must not forget the id a satellite
+        // still uses for the same conversation.
+        let mut index = 0;
+        while index < keys.len() {
+            if let Some((_, group, _)) = conversations.remove(&keys[index]) {
+                for sibling in group {
+                    conversations.remove(&sibling);
+                    if !keys.contains(&sibling) {
+                        keys.push(sibling);
+                    }
+                }
+            }
+            index += 1;
+        }
+        // Forgetting is the state, not the absence of one: a turn that ended
+        // with nothing active must not leave the old entry to resurrect it.
+        if kept.is_empty() {
+            for key in &keys {
+                conversations.remove(key);
+            }
+            return;
+        }
+        // This turn's ids come first and inherited ones after, so the tail is
+        // the stalest: a hub answering under a fresh translated id every turn
+        // (HIVEMIND-BRIDGE-1 §4) would otherwise grow one group for ever.
+        keys.truncate(MAX_CONVERSATION_ALIASES);
+        let inserted = self
+            .conversation_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let group: Vec<String> = keys.clone();
+        for key in &keys {
+            conversations.insert(key.clone(), (inserted, group.clone(), kept.clone()));
+        }
+        while distinct_conversations(&conversations) > MAX_REMEMBERED_CONVERSATIONS {
+            let oldest = conversations
+                .values()
+                .min_by_key(|(inserted, _, _)| *inserted)
+                .map(|(_, group, _)| group.clone());
+            let Some(oldest) = oldest else { break };
+            for sibling in oldest {
+                conversations.remove(&sibling);
+            }
+        }
+    }
+
+    /// Put the last turn's conversation state back into this turn's context.
+    pub(crate) fn continue_conversation(
+        &self,
+        context: Option<&Context>,
+        session_id: &str,
+    ) -> Option<Context> {
+        let previous = {
+            let conversations = self.conversations.lock().ok()?;
+            conversations
+                .get(session_id)
+                .map(|(_, _, kept)| kept.clone())?
+        };
+        let mut next = context.cloned().unwrap_or_default();
+        let session = next
+            .get("session")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let carried = crate::events::carry_conversation(Some(&previous), &session);
+        next.insert("session".to_string(), serde_json::Value::Object(carried));
+        Some(next)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -111,6 +266,8 @@ impl Client {
                 identity.clone(),
             )),
             identity,
+            conversations: Default::default(),
+            conversation_sequence: Default::default(),
         }
     }
 
@@ -119,6 +276,8 @@ impl Client {
         Ok(Self {
             identity,
             transport,
+            conversations: Default::default(),
+            conversation_sequence: Default::default(),
         })
     }
 
@@ -335,9 +494,13 @@ impl Client {
         }
         let opts = &options.request;
         let lang = opts.lang.as_deref().unwrap_or("en-us");
+        let ask_session_id = opts.session_id.clone().unwrap_or_else(new_session_id);
+        // A hub keeps nothing between the turns of a named session, so the
+        // conversation only survives because this sends it back.
+        let carried = self.continue_conversation(opts.context.as_ref(), &ask_session_id);
         let context = context_with_correlation(
-            opts.context.as_ref(),
-            opts.session_id.as_deref(),
+            carried.as_ref().or(opts.context.as_ref()),
+            Some(&ask_session_id),
             Some(&self.identity.site_id),
             Some(lang),
             Some(&request_id),
@@ -351,7 +514,32 @@ impl Client {
                 utterance_payload(prompt, lang),
                 context.clone(),
             ),
-            collect_ask_reply(&mut receiver, &context, &request_id, deadline, &options),
+            collect_ask_reply(
+                &mut receiver,
+                &context,
+                &request_id,
+                deadline,
+                &options,
+                |event| {
+                    // Both ids in one call: the id the request used, which a
+                    // satellite reuses, and the one the hub answered with,
+                    // which is what `Reply::session_id` hands an ordinary
+                    // caller. Filed separately they aged and were evicted
+                    // separately, so with the store full the second could
+                    // evict the first.
+                    let answered_with = event.session_id().filter(|value| {
+                        // Trimmed only to test emptiness: a hub answering with
+                        // whitespace has told us nothing, but the raw value is
+                        // what a caller would send back, so that is the key.
+                        !value.trim().is_empty() && *value != ask_session_id
+                    });
+                    let mut keys: Vec<&str> = vec![&ask_session_id];
+                    if let Some(answered_with) = answered_with.as_deref() {
+                        keys.push(answered_with);
+                    }
+                    self.remember_conversation(&keys, &event.context);
+                },
+            ),
         )
         .await
     }
@@ -388,6 +576,7 @@ impl Client {
         );
         let mut receiver = self.transport.subscribe_hive();
         let inner = HiveMessage {
+            binary: None,
             msg_type: "bus".to_string(),
             payload: Map::from_iter([
                 (
@@ -410,6 +599,7 @@ impl Client {
         send_and_collect(
             self.transport.send_hive_message(
                 HiveMessage {
+                    binary: None,
                     msg_type: "query".to_string(),
                     payload: hive_message_payload(&inner)?,
                     metadata: Map::from_iter([(
@@ -657,6 +847,9 @@ async fn collect_ask_reply(
     request_id: &str,
     deadline: Instant,
     options: &AskOptions,
+    // The end of a turn is the one place a hub states what the conversation now
+    // is, and it keeps none of it for a named session.
+    remember: impl Fn(&Event),
 ) -> Result<Reply> {
     let mut events = Vec::new();
     let mut media_budget = crate::events::ReplyMediaBudget::default();
@@ -718,6 +911,7 @@ async fn collect_ask_reply(
             }
             EVENT_POLICY_DENIED | EVENT_QUERY_TIMEOUT => hard_failure = Some(event.clone()),
             EVENT_UTTERANCE_HANDLED => {
+                remember(&event);
                 empty_deadline.get_or_insert_with(|| {
                     Instant::now()
                         .checked_add(options.empty_reply_wait)
@@ -927,6 +1121,7 @@ mod tests {
     #[test]
     fn query_message_extracts_bus_event() {
         let message = HiveMessage {
+            binary: None,
             msg_type: "query".to_string(),
             payload: Map::from_iter([
                 ("msg_type".to_string(), Value::String("bus".to_string())),
@@ -1011,8 +1206,22 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(1);
         let (a, b) = tokio::join!(
-            collect_ask_reply(&mut first, &first_context, "first", deadline, &options),
-            collect_ask_reply(&mut second, &second_context, "second", deadline, &options)
+            collect_ask_reply(
+                &mut first,
+                &first_context,
+                "first",
+                deadline,
+                &options,
+                |_| {}
+            ),
+            collect_ask_reply(
+                &mut second,
+                &second_context,
+                "second",
+                deadline,
+                &options,
+                |_| {}
+            )
         );
         for (reply, expected) in [(a.unwrap(), "first"), (b.unwrap(), "second")] {
             assert_eq!(reply.text, expected);
@@ -1061,6 +1270,7 @@ mod tests {
                 "test",
                 Instant::now() + Duration::from_millis(20),
                 &options,
+                |_| {},
             )
             .await;
             if hard {
@@ -1222,6 +1432,7 @@ mod tests {
                     "request",
                     started + Duration::from_millis(100),
                     &options,
+                    |_| {},
                 ),
             ),
         )
@@ -1255,6 +1466,7 @@ mod tests {
             "request",
             Instant::now() + Duration::from_millis(10),
             &AskOptions::default(),
+            |_| {},
         )
         .await;
         assert!(
@@ -1290,6 +1502,7 @@ mod tests {
                         "request",
                         Instant::now() + Duration::from_secs(12),
                         &AskOptions::default(),
+                        |_| {},
                     ),
                 ),
             )
@@ -1361,6 +1574,7 @@ mod tests {
                     "request",
                     Instant::now() + Duration::from_secs(12),
                     &AskOptions::default(),
+                    |_| {},
                 )
                 .await
             },
@@ -1411,6 +1625,7 @@ mod tests {
                     empty_reply_wait: Duration::from_millis(100),
                     ..Default::default()
                 },
+                |_| {},
             )
             .await;
             assert!(
@@ -1454,10 +1669,111 @@ mod tests {
                     reply_settle: Duration::ZERO,
                     ..Default::default()
                 },
+                |_| {},
             )
             .await
             .unwrap();
             assert_eq!(reply.session_id.as_deref(), Some("assigned-by-hub"));
         }
+    }
+}
+
+#[cfg(test)]
+mod conversation_cache_tests {
+    use super::{Client, MAX_CONVERSATION_ALIASES, MAX_REMEMBERED_CONVERSATIONS};
+    use crate::identity::Identity;
+
+    fn client() -> Client {
+        Client::new(
+            Identity::from_value(serde_json::json!({
+                "site_id": "test-site",
+                "key": "test-access",
+                "password": "test-password",
+                "default_master": "https://example.invalid",
+            }))
+            .expect("identity"),
+        )
+    }
+
+    #[test]
+    fn both_session_aliases_survive_a_full_conversation_store() {
+        // Filed as two entries they aged and were evicted separately, so with
+        // the store full the second could evict the first and a caller
+        // continuing under the id it sent found no carry.
+        let client = client();
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "session".to_string(),
+            serde_json::json!({
+                "converse_handlers": [{"skill_id": "fart", "activated_at": 1.0}]
+            }),
+        );
+        for index in 0..MAX_REMEMBERED_CONVERSATIONS {
+            client.remember_conversation(&[&format!("filler-{index}")], &context);
+        }
+        client.remember_conversation(&["sat-1", "hub:sat-1"], &context);
+        for id in ["sat-1", "hub:sat-1"] {
+            assert!(
+                client.continue_conversation(None, id).is_some(),
+                "{id} lost its carry"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_aliases_are_bounded() {
+        // A hub answering under a fresh translated id every turn would
+        // otherwise grow one group for ever.
+        let client = client();
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "session".to_string(),
+            serde_json::json!({
+                "converse_handlers": [{"skill_id": "fart", "activated_at": 1.0}]
+            }),
+        );
+        for index in 0..(MAX_CONVERSATION_ALIASES * 3) {
+            client.remember_conversation(&["sat-1", &format!("hub-{index}")], &context);
+        }
+        let conversations = client.conversations.lock().unwrap();
+        let (_, group, _) = conversations
+            .get("sat-1")
+            .expect("the request id must survive");
+        assert!(group.len() <= MAX_CONVERSATION_ALIASES, "{}", group.len());
+    }
+
+    #[test]
+    fn a_full_cache_evicts_the_oldest_not_an_arbitrary_key() {
+        // `HashMap::keys().next()` returns whichever key iteration yields, so a
+        // full cache could drop the session being asked about right now -- and
+        // the next turn would send no carried state at all.
+        let client = client();
+        let mut context = serde_json::Map::new();
+        context.insert(
+            "session".to_string(),
+            serde_json::json!({
+                "converse_handlers": [{"skill_id": "fart", "activated_at": 1.0}]
+            }),
+        );
+
+        for index in 0..MAX_REMEMBERED_CONVERSATIONS {
+            client.remember_conversation(&[&format!("session-{index}")], &context);
+        }
+        // One more than the cache holds: the first one inserted is the one to go.
+        client.remember_conversation(&["session-new"], &context);
+
+        assert!(
+            client.continue_conversation(None, "session-0").is_none(),
+            "the oldest entry should have been evicted"
+        );
+        for index in 1..MAX_REMEMBERED_CONVERSATIONS {
+            assert!(
+                client
+                    .continue_conversation(None, &format!("session-{index}"))
+                    .is_some(),
+                "session-{index} was evicted instead of the oldest"
+            );
+        }
+        assert!(client.continue_conversation(None, "session-new").is_some());
     }
 }

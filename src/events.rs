@@ -154,6 +154,140 @@ pub fn merge_context(base: Option<&Context>, extra: Option<&Context>) -> Context
     merged
 }
 
+/// The hive's own frame kinds, which a client may subscribe to.
+///
+/// `query` and `cascade` are deliberately absent: they are this client's own
+/// request/response traffic and `ask` already owns them, so subscribing to one
+/// would quietly compete for the same replies.
+pub const HIVE_KINDS: [&str; 5] = [
+    "broadcast",
+    "propagate",
+    "escalate",
+    "intercom",
+    "rendezvous",
+];
+
+/// Payload types a BINARY frame can carry, by their wire number.
+///
+/// A hub answers `speak:synth` by rendering the utterance and sending one of
+/// these back, so a client with no synthesiser of its own can still speak; a
+/// file arrives the same way. The wire numbers the type, this names it.
+pub const BINARY_PAYLOAD_KINDS: [(u8, &str); 6] = [
+    (1, "raw_audio"),
+    (2, "numpy_image"),
+    (3, "file"),
+    (4, "stt_transcribe"),
+    (5, "stt_handle"),
+    (6, "tts_audio"),
+];
+
+/// Name a payload type. One nobody has named still arrives, under its number,
+/// rather than being dropped.
+pub fn binary_kind_name(wire_number: u8) -> String {
+    BINARY_PAYLOAD_KINDS
+        .iter()
+        .find(|(number, _)| *number == wire_number)
+        .map(|(_, name)| (*name).to_string())
+        .unwrap_or_else(|| format!("binary:{wire_number}"))
+}
+
+/// A binary frame: the bytes a hub sent, and what it said about them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThalovantBinary {
+    /// `tts_audio`, `file`, ... or `binary:<wire number>` for an unnamed type.
+    pub kind: String,
+    /// The payload itself. Never parsed, never decompressed.
+    pub data: Vec<u8>,
+    /// What the hub sent beside it.
+    pub metadata: Map<String, Value>,
+    /// What was said, when this is rendered speech.
+    pub utterance: Option<String>,
+    /// The language it was said in.
+    pub lang: Option<String>,
+    /// The name a file arrived under. An empty name is no name.
+    pub file_name: Option<String>,
+}
+
+/// Read a hub's metadata into the shape above.
+///
+/// A value the hub did not send and one it sent empty both read as `None`:
+/// rendering `""` as a filename would put a blank name in front of somebody as
+/// though the hub had chosen it.
+pub fn binary_frame(kind: String, data: Vec<u8>, metadata: Map<String, Value>) -> ThalovantBinary {
+    let text = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    ThalovantBinary {
+        kind,
+        data,
+        utterance: text("utterance"),
+        lang: text("lang"),
+        file_name: text("file_name"),
+        metadata,
+    }
+}
+
+/// Session fields a client carries from one turn of a conversation to the next.
+///
+/// A hub keeps nothing for a *named* session: OVOS-SESSION-2 §2.2 makes the
+/// orchestrator stateless for those, so the carrier a client sends is the whole
+/// snapshot and whatever the last turn activated is discarded the moment it
+/// ends. Without `converse_handlers` the converse pipeline has no skill to poll
+/// and every follow-up reaches the fallback instead of the skill that just
+/// answered.
+///
+/// An allow-list, not a deny-list. Deliberately absent: the caller's own
+/// per-turn settings (`lang`, `pipeline`, `site_id`), because a client that
+/// decides the language per utterance would otherwise be pinned to whichever
+/// one the conversation opened in; and the live device flags, which describe a
+/// moment that has passed by the time the next turn is sent.
+pub const CONVERSATION_SESSION_FIELDS: [&str; 6] = [
+    "converse_handlers",
+    "active_handlers",
+    "active_skills",
+    "context",
+    "utterance_states",
+    "response_mode",
+];
+
+fn is_carried(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::Object(fields) => !fields.is_empty(),
+        _ => true,
+    }
+}
+
+/// Fill the conversation fields of `session` from the hub's last reply.
+///
+/// This turn's own values win: a field the caller set is never overwritten,
+/// only one it left out is taken from the turn before.
+pub fn carry_conversation(
+    previous: Option<&serde_json::Map<String, serde_json::Value>>,
+    session: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut carried = session.clone();
+    let Some(previous) = previous else {
+        return carried;
+    };
+    for field in CONVERSATION_SESSION_FIELDS {
+        if carried.contains_key(field) {
+            continue;
+        }
+        if let Some(value) = previous.get(field) {
+            if is_carried(value) {
+                carried.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    carried
+}
+
 pub fn context_with_correlation(
     context: Option<&Context>,
     session_id: Option<&str>,
