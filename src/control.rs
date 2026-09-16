@@ -387,7 +387,9 @@ impl ControlPlane {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .ok_or_else(|| {
-                ThalovantError::Api("token response did not include a usable access_token".to_string())
+                ThalovantError::Api(
+                    "token response did not include a usable access_token".to_string(),
+                )
             })?;
         self.access_token = Some(access_token);
         Ok(token)

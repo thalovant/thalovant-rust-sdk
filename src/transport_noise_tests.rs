@@ -608,7 +608,7 @@ async fn client_event_stream_uses_authenticated_http_and_reports_disconnect() {
         identity: transport.identity().clone(),
         transport: RuntimeTransport::Http(transport.clone()),
         conversations: Default::default(),
-            conversation_sequence: Default::default(),
+        conversation_sequence: Default::default(),
     };
     let mut events = client
         .listen(
@@ -1451,7 +1451,7 @@ async fn concurrent_connect_waits_for_authentication_and_joiner_timeout_is_local
         identity,
         transport: RuntimeTransport::Wss(wss.clone()),
         conversations: Default::default(),
-            conversation_sequence: Default::default(),
+        conversation_sequence: Default::default(),
     };
     let entered = Arc::new(Notify::new());
     let resume = Arc::new(Notify::new());

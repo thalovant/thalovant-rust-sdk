@@ -25,10 +25,10 @@
 //! That is what PKCE is for: a code intercepted by whatever else claimed the
 //! redirect is useless without it.
 
-use std::fmt;
 use base64::{engine::general_purpose, Engine as _};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
+use std::fmt;
 use url::Url;
 
 use crate::errors::{Result, ThalovantError};
@@ -589,10 +589,9 @@ mod redaction_tests {
         // query string: a hand-made URL without one let the first version of
         // this test pass while Debug still printed the state.
         let sign_in = NativeSignIn {
-            authorization_url:
-                "https://hub.example/authorize?client_id=app&state=state-secret\
+            authorization_url: "https://hub.example/authorize?client_id=app&state=state-secret\
                  &code_challenge=abc&response_type=code"
-                    .into(),
+                .into(),
             state: "state-secret".into(),
             verifier: "verifier-secret".into(),
             redirect_uri: "http://127.0.0.1:0/callback".into(),
@@ -600,6 +599,9 @@ mod redaction_tests {
         let printed = format!("{sign_in:?}");
         assert!(!printed.contains("verifier-secret"), "{printed}");
         assert!(!printed.contains("state-secret"), "{printed}");
-        assert!(printed.contains("https://hub.example/authorize"), "{printed}");
+        assert!(
+            printed.contains("https://hub.example/authorize"),
+            "{printed}"
+        );
     }
 }

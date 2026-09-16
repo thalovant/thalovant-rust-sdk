@@ -42,10 +42,7 @@ pub struct Client {
     /// the next turn would send no carried state at all.
     pub(crate) conversations: std::sync::Arc<
         std::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                (u64, serde_json::Map<String, serde_json::Value>),
-            >,
+            std::collections::HashMap<String, (u64, serde_json::Map<String, serde_json::Value>)>,
         >,
     >,
     /// Monotonic insert counter behind the map above. Shared with every clone
@@ -110,7 +107,9 @@ impl Client {
     ) -> Option<Context> {
         let previous = {
             let conversations = self.conversations.lock().ok()?;
-            conversations.get(session_id).map(|(_, kept)| kept.clone())?
+            conversations
+                .get(session_id)
+                .map(|(_, kept)| kept.clone())?
         };
         let mut next = context.cloned().unwrap_or_default();
         let session = next
@@ -466,7 +465,10 @@ impl Client {
                     // next ask looked up a key nothing was filed under and
                     // sent no carried state at all.
                     if let Some(answered_with) = event.session_id() {
-                        if !answered_with.is_empty() && answered_with != ask_session_id {
+                        // Trimmed only to test emptiness: a hub answering with
+                        // whitespace has told us nothing, but the raw value is
+                        // what a caller would send back, so that is the key.
+                        if !answered_with.trim().is_empty() && answered_with != ask_session_id {
                             self.remember_conversation(&answered_with, &event.context);
                         }
                     }
