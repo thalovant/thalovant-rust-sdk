@@ -10,7 +10,7 @@
       "reason": "decode_hive_binary_frame branches on BINARY: four bits of payload type, then the clip itself, never parsed or inflated. subscribe_binary delivers it. Run against the shared binary vectors and against binary-frames.json, which is hivemind-bus-client's own encoder output rather than frames this SDK built for itself.",
       "status": "required",
       "tests": {
-        "tests/binary_frames.rs": "7fb03258bea3572a2f5eab19fe0b9eae67fba9adfa8c771b9ec93305953b6cf8"
+        "tests/binary_frames.rs": "e86f3468b32b7eecf0c3bc599d7e31ad77f3d76e9eb19c86b48b276b7a45c677"
       },
       "vectors": {
         "binary-frames.json": "tests/conformance/binary-frames.json",
@@ -42,7 +42,7 @@
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
       "status": "required",
       "tests": {
-        "tests/conversation_carry.rs": "99f485a0eb07266e3886a50ba65a2ed157898fc4ddd24d1a1541bc627151964d"
+        "tests/conversation_carry.rs": "7b9dc2904387a5c109a79fe79c8d6e3327c280e29290e2277a201647c312f189"
       },
       "vectors": {
         "conversation-vectors.json": "tests/conformance/conversation-vectors.json"
@@ -97,7 +97,7 @@
       "reason": "subscribe_hive over the five hive kinds, and propagate/escalate/broadcast. The kinds used to fall off the end of dispatch_noise_message with no arm and no log line. Run against the shared mesh vectors.",
       "status": "required",
       "tests": {
-        "tests/conversation_carry.rs": "99f485a0eb07266e3886a50ba65a2ed157898fc4ddd24d1a1541bc627151964d"
+        "tests/conversation_carry.rs": "7b9dc2904387a5c109a79fe79c8d6e3327c280e29290e2277a201647c312f189"
       },
       "vectors": {
         "mesh-vectors.json": "tests/conformance/mesh-vectors.json"
@@ -139,7 +139,8 @@
     "9af92bcafd77385cd7c9cfede859eeb3586f65d0b24c9dbff36352089e94821c",
     "083b2da8b256cd970b3050218d8d51f13e7355633913d086c9f4147d8790165b",
     "1e8b76b34b755207bb754e5f4c7364334f14476dee70fce1d2687bfdc1545f30",
-    "f6a74ead44d53658228da3f4457334f3e922b67dd1e33b43c3ba8b6f7c066bf9"
+    "f6a74ead44d53658228da3f4457334f3e922b67dd1e33b43c3ba8b6f7c066bf9",
+    "6f5f697b07eb86da6877faf8aa27138430f886495ac965d08a28fba780e411cd"
   ],
   "schema_version": 1
 }

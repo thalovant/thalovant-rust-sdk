@@ -13,6 +13,8 @@
 use serde_json::Value;
 use thalovant::events::{carry_conversation, CONVERSATION_SESSION_FIELDS, HIVE_KINDS};
 
+mod common;
+
 fn vectors(name: &str) -> Value {
     let raw = std::fs::read_to_string(format!("tests/conformance/{name}"))
         .unwrap_or_else(|error| panic!("read {name}: {error}"));
@@ -26,12 +28,14 @@ fn the_carry_matches_conversation_vectors() {
         let previous = case["previous"].as_object().cloned().unwrap_or_default();
         let session = case["session"].as_object().cloned().unwrap_or_default();
         let expected = case["expected"].as_object().cloned().unwrap_or_default();
-        assert_eq!(
-            carry_conversation(Some(&previous), &session),
-            expected,
-            "{}",
-            case["name"],
+        let carried = carry_conversation(Some(&previous), &session);
+        // Recorded before the assert, for the same reason as the binary vectors.
+        common::record(
+            "conversation-vectors.json",
+            case["name"].as_str().expect("name"),
+            &Value::Object(carried.clone()),
         );
+        assert_eq!(carried, expected, "{}", case["name"]);
     }
 }
 
