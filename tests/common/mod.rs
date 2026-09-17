@@ -80,7 +80,10 @@ pub fn record(vector_file: &str, case: &str, produced: &Value) {
     let digest = canonical_digest(produced);
     let entry = mine.entry(vector_file.to_string()).or_default();
     if let Some(previous) = entry.get(case) {
-        assert_eq!(previous, &digest, "{vector_file}/{case}: recorded twice with different outputs");
+        assert_eq!(
+            previous, &digest,
+            "{vector_file}/{case}: recorded twice with different outputs"
+        );
     }
     entry.insert(case.to_string(), digest);
     fs::write(&shard, serde_json::to_string(&mine).expect("shard")).expect("write shard");
@@ -97,7 +100,9 @@ fn merge(parts: &Path, target: &Path) {
         .collect();
     shards.sort();
     for shard in shards {
-        let Ok(raw) = fs::read_to_string(&shard) else { continue };
+        let Ok(raw) = fs::read_to_string(&shard) else {
+            continue;
+        };
         let Ok(cases) = serde_json::from_str::<BTreeMap<String, BTreeMap<String, String>>>(&raw)
         else {
             continue;
