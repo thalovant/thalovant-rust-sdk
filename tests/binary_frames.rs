@@ -12,6 +12,8 @@ use serde_json::Value;
 use thalovant::events::{binary_kind_name, BINARY_PAYLOAD_KINDS};
 use thalovant::wire::decode_hive_binary_frame;
 
+mod common;
+
 fn vectors(name: &str) -> Value {
     let raw = std::fs::read_to_string(format!("tests/conformance/{name}"))
         .unwrap_or_else(|error| panic!("read {name}: {error}"));
@@ -114,6 +116,18 @@ fn every_case_the_vectors_describe_decodes_as_it_says() {
             .binary
             .as_ref()
             .unwrap_or_else(|| panic!("{name}: no binary"));
+        // Recorded before the assert: what this SDK produced, not a
+        // restatement of what the vector says it should have.
+        common::record(
+            "binary-vectors.json",
+            name,
+            &serde_json::json!({
+                "kind": binary.kind,
+                "utterance": binary.utterance,
+                "lang": binary.lang,
+                "file_name": binary.file_name,
+            }),
+        );
         let expected = &case["expected"];
         assert_eq!(
             binary.kind,
