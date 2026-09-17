@@ -45,6 +45,9 @@ idna_adapter = "=1.2.2"
 fancy-regex = "0.19.1"
 
 [dev-dependencies]
+# The conformance recorder locks its output: each file under tests/ is its
+# own test binary, so several of them reach the merge at once.
+fs2 = "0.4.3"
 tokio = { version = "1", features = ["test-util"] }
 rcgen = "=0.14.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

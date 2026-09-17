@@ -10,7 +10,8 @@
       "reason": "decode_hive_binary_frame branches on BINARY: four bits of payload type, then the clip itself, never parsed or inflated. subscribe_binary delivers it. Run against the shared binary vectors and against binary-frames.json, which is hivemind-bus-client's own encoder output rather than frames this SDK built for itself.",
       "status": "required",
       "tests": {
-        "tests/binary_frames.rs": "e86f3468b32b7eecf0c3bc599d7e31ad77f3d76e9eb19c86b48b276b7a45c677"
+        "tests/binary_frames.rs": "e86f3468b32b7eecf0c3bc599d7e31ad77f3d76e9eb19c86b48b276b7a45c677",
+        "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b"
       },
       "vectors": {
         "binary-frames.json": "tests/conformance/binary-frames.json",
@@ -42,6 +43,7 @@
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
       "status": "required",
       "tests": {
+        "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conversation_carry.rs": "7b9dc2904387a5c109a79fe79c8d6e3327c280e29290e2277a201647c312f189"
       },
       "vectors": {
@@ -97,6 +99,7 @@
       "reason": "subscribe_hive over the five hive kinds, and propagate/escalate/broadcast. The kinds used to fall off the end of dispatch_noise_message with no arm and no log line. Run against the shared mesh vectors.",
       "status": "required",
       "tests": {
+        "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conversation_carry.rs": "7b9dc2904387a5c109a79fe79c8d6e3327c280e29290e2277a201647c312f189"
       },
       "vectors": {
