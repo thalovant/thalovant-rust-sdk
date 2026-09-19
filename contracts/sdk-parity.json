@@ -115,8 +115,8 @@
       "status": "required",
       "tests": {
         "src/client.rs": "70868567005c73b69dbb685290cedc414c1d26aa55b515c74c77ff93fc1ee9fb",
-        "src/refusal.rs": "70a6032ccaa83a0b32be155cf67eaa2a6db69ff96ac7fbf4d7da5f90a95c65da",
-        "tests/data/refusal-vectors.json": "08a55b252514427ea7123294685f1f6dd72306ee274cff77013590870d8fde7e"
+        "src/refusal.rs": "fc3785d40bf58130afb83a7aaf4171918fc5cc028c9d3023324ddb3aa5163d04",
+        "tests/data/refusal-vectors.json": "6b0f4128f1cc9fd8a54944410ce93c6515bac6cde9257284e313a4fea825bfcb"
       },
       "vectors": {
         "refusal-vectors.json": "tests/data/refusal-vectors.json"
@@ -160,7 +160,7 @@
     "1e8b76b34b755207bb754e5f4c7364334f14476dee70fce1d2687bfdc1545f30",
     "f6a74ead44d53658228da3f4457334f3e922b67dd1e33b43c3ba8b6f7c066bf9",
     "6f5f697b07eb86da6877faf8aa27138430f886495ac965d08a28fba780e411cd",
-    "e0de5ebc373fcec60d083651e4001e22da8978419ad0d24a24d326db1e4e8e2a"
+    "2377330566e575bb3fda77998d943667bf0795940f9d569a5b8bc7f4f0e5e486"
   ],
   "schema_version": 1
 }

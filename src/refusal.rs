@@ -51,20 +51,31 @@ pub(crate) fn refusal_belongs_to_ask(
     }
 }
 
+/// The largest count the wire can carry, being the largest whole number every
+/// JSON decoder holds exactly. Above it a decoder backed by a double can no
+/// longer tell one whole number from the next, so two SDKs would report
+/// different allowances for the same denial -- and a count nobody can agree on
+/// is worse than none.
+const MAX_COUNT: i64 = (1 << 53) - 1;
+
 /// A whole, non-negative count from the wire, or 0: never a bool, never a
 /// guess. A negative limit, usage or reset time is not something a policy can
 /// mean, and passing one through would have an app say "-1 of -5 questions
 /// used".
 fn whole_count(value: Option<&Value>) -> u64 {
-    // Whole, non-negative, and inside a signed 64-bit integer: past that is not
-    // a count a policy can have meant, and every other SDK's parser stops in
-    // the same place.
-    match value {
+    // Whole, non-negative, and no larger than MAX_COUNT: past that it is not a
+    // count a policy can have meant, and not one two SDKs could agree on.
+    let whole = match value {
         Some(Value::Number(number)) if number.is_i64() || number.is_u64() => {
-            number.as_i64().unwrap_or(0).max(0) as u64
+            number.as_i64().unwrap_or(0)
         }
-        Some(Value::String(text)) => text.trim().parse::<i64>().unwrap_or(0).max(0) as u64,
+        Some(Value::String(text)) => text.trim().parse::<i64>().unwrap_or(0),
         _ => 0,
+    };
+    if (0..=MAX_COUNT).contains(&whole) {
+        whole as u64
+    } else {
+        0
     }
 }
 
