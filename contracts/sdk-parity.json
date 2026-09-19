@@ -4,7 +4,7 @@
       "implementation": {
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
-        "src/transport.rs": "b313d86921ad63082717f8af5c4fb70683c67cbed8cbfb31fd7b7cc519b05a86",
+        "src/transport.rs": "3f41fe90d00b091350fad2cd03970c85545fb0a6e91339e50eed5e41d6561f62",
         "src/wire.rs": "495c1987d4f90269abc5385800eb45e8972cdd5c394320966ebf15637705c13e"
       },
       "reason": "decode_hive_binary_frame branches on BINARY: four bits of payload type, then the clip itself, never parsed or inflated. subscribe_binary delivers it. Run against the shared binary vectors and against binary-frames.json, which is hivemind-bus-client's own encoder output rather than frames this SDK built for itself.",
@@ -37,7 +37,7 @@
     },
     "conversation": {
       "implementation": {
-        "src/client.rs": "869d7028e0f5e56b6d9bd0a3b799dab30092b859671e7523778340cb5b2c37b8",
+        "src/client.rs": "f01938942ab9cbcdde405a691d2f55c02271dfb2535821e87572be9d44414bad",
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78"
       },
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
@@ -94,7 +94,7 @@
       "implementation": {
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
-        "src/transport.rs": "b313d86921ad63082717f8af5c4fb70683c67cbed8cbfb31fd7b7cc519b05a86"
+        "src/transport.rs": "3f41fe90d00b091350fad2cd03970c85545fb0a6e91339e50eed5e41d6561f62"
       },
       "reason": "subscribe_hive over the five hive kinds, and propagate/escalate/broadcast. The kinds used to fall off the end of dispatch_noise_message with no arm and no log line. Run against the shared mesh vectors.",
       "status": "required",
@@ -108,15 +108,15 @@
     },
     "refusal": {
       "implementation": {
-        "src/errors.rs": "6b3eb7bbf641c793857941857f23d860e4c1d26d9db57f9ef1a335583f4af435",
-        "src/transport.rs": "b313d86921ad63082717f8af5c4fb70683c67cbed8cbfb31fd7b7cc519b05a86"
+        "src/errors.rs": "abe21639be16b02f7a0ec75fb2604e42b9ec927681146775f3908571fe29ba80",
+        "src/transport.rs": "3f41fe90d00b091350fad2cd03970c85545fb0a6e91339e50eed5e41d6561f62"
       },
-      "reason": "refusal_belongs_to_ask() and failure_error() live in src/refusal.rs with their vector suite colocated, as this SDK's private unit suites are, so the module is recorded as test evidence beside the errors and transport it rests on; collect_ask_reply() in client.rs applies the rule with the transport's count of asks, queries and fire-and-forget utterances inside the shared grace window, and its ask-level cases are colocated there too. ThalovantError gains Unanswered and PolicyDenied.quota, boxed so the enum every Result carries stays inside clippy's result_large_err limit.",
+      "reason": "refusal_belongs_to_ask() and failure_error() live in src/refusal.rs with their vector suite colocated, as this SDK's private unit suites are, so the module is recorded as test evidence beside the errors and transport it rests on; collect_ask_reply() in client.rs applies the rule with the transport's count of asks, queries and fire-and-forget utterances inside the shared grace window, and a send whose publish never happened is dropped again. ThalovantError gains Unanswered and PolicyDenied.quota, boxed so the enum every Result carries stays inside clippy's result_large_err limit.",
       "status": "required",
       "tests": {
-        "src/client.rs": "869d7028e0f5e56b6d9bd0a3b799dab30092b859671e7523778340cb5b2c37b8",
-        "src/refusal.rs": "458649161387d1d6d133ca861338f05ebdf6dbb25e46b0ecf88248990da4c756",
-        "tests/data/refusal-vectors.json": "12301b6ac38137c871e80e04e2a4fc94581be47655ebe0fb87a008b33119d925"
+        "src/client.rs": "f01938942ab9cbcdde405a691d2f55c02271dfb2535821e87572be9d44414bad",
+        "src/refusal.rs": "70a6032ccaa83a0b32be155cf67eaa2a6db69ff96ac7fbf4d7da5f90a95c65da",
+        "tests/data/refusal-vectors.json": "8795fcd9d8b5ac790176c13ea077b701a5dc1fd584a717ed08744bcab8d21c82"
       },
       "vectors": {
         "refusal-vectors.json": "tests/data/refusal-vectors.json"
@@ -126,12 +126,12 @@
       "implementation": {
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
         "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35",
-        "src/transport.rs": "b313d86921ad63082717f8af5c4fb70683c67cbed8cbfb31fd7b7cc519b05a86"
+        "src/transport.rs": "3f41fe90d00b091350fad2cd03970c85545fb0a6e91339e50eed5e41d6561f62"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs.",
       "status": "required",
       "tests": {
-        "src/client.rs": "869d7028e0f5e56b6d9bd0a3b799dab30092b859671e7523778340cb5b2c37b8",
+        "src/client.rs": "f01938942ab9cbcdde405a691d2f55c02271dfb2535821e87572be9d44414bad",
         "src/transport_noise_tests.rs": "fb25b5599f99758d86da43816f775db528b160e1720384a7b8a6c18185619805",
         "tests/data/reply-claim-vectors.json": "45f2731589e612d5a849376d94073c57b0fef426a92e1d065c58c48442b1ffdc",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
@@ -160,7 +160,7 @@
     "1e8b76b34b755207bb754e5f4c7364334f14476dee70fce1d2687bfdc1545f30",
     "f6a74ead44d53658228da3f4457334f3e922b67dd1e33b43c3ba8b6f7c066bf9",
     "6f5f697b07eb86da6877faf8aa27138430f886495ac965d08a28fba780e411cd",
-    "8a58831221dc0529b40e1b336203455fad9b5d8f7d017cf04b609acbb7f9ac8c"
+    "4c7780ced5bb3e011d10a0ac502bba61c08eaebfd27de6c827c5d47351ac2b4e"
   ],
   "schema_version": 1
 }

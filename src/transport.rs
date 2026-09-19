@@ -195,15 +195,30 @@ impl Drop for ConnectionAttempt {
 impl RuntimeTransport {
     /// Records a fire-and-forget utterance: nothing will wait on it, but the
     /// hub may refuse it, and that refusal carries no request id.
-    pub(crate) fn record_untracked_send(&self) {
+    pub(crate) fn record_untracked_send(&self) -> std::time::Instant {
         let mut sends = self
             .control()
             .untracked_sends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        sends.push_back(std::time::Instant::now());
+        let sent = std::time::Instant::now();
+        sends.push_back(sent);
         while sends.len() > 1024 {
             sends.pop_front();
+        }
+        sent
+    }
+
+    /// Forget a send whose publish never happened: nothing reached the hub, so
+    /// there is nothing for it to refuse.
+    pub(crate) fn drop_untracked_send(&self, sent: std::time::Instant) {
+        let mut sends = self
+            .control()
+            .untracked_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = sends.iter().position(|entry| *entry == sent) {
+            sends.remove(at);
         }
     }
 

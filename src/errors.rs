@@ -37,6 +37,12 @@ fn refusal_message(
     quota: &Option<Box<Quota>>,
 ) -> String {
     if let Some(quota) = quota {
+        if quota.limit == 0 && quota.used == 0 && quota.reset_after == 0 && quota.period.is_empty()
+        {
+            // Refused on a quota, with none of the numbers. "All questions
+            // used" would be inventing one.
+            return format!("policy denied: the hub refused `{denied_type}`: a quota has run out.");
+        }
         let used = if quota.limit > 0 {
             format!("{} of {}", quota.used, quota.limit)
         } else {

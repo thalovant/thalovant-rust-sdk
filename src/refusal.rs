@@ -56,12 +56,13 @@ pub(crate) fn refusal_belongs_to_ask(
 /// mean, and passing one through would have an app say "-1 of -5 questions
 /// used".
 fn whole_count(value: Option<&Value>) -> u64 {
+    // Whole, non-negative, and inside a signed 64-bit integer: past that is not
+    // a count a policy can have meant, and every other SDK's parser stops in
+    // the same place.
     match value {
-        Some(Value::Number(number)) => number
-            .as_i64()
-            .filter(|_| number.is_i64() || number.is_u64())
-            .unwrap_or(0)
-            .max(0) as u64,
+        Some(Value::Number(number)) if number.is_i64() || number.is_u64() => {
+            number.as_i64().unwrap_or(0).max(0) as u64
+        }
         Some(Value::String(text)) => text.trim().parse::<i64>().unwrap_or(0).max(0) as u64,
         _ => 0,
     }
@@ -116,17 +117,12 @@ pub(crate) fn policy_denied(event: &Event) -> ThalovantError {
 pub(crate) fn failure_error(event: &Event) -> ThalovantError {
     match event.name.as_str() {
         EVENT_POLICY_DENIED => policy_denied(event),
-        EVENT_INTENT_UNMATCHED | EVENT_INTENT_FAILURE => {
-            let said = string_field(&event.data, "reason");
-            let said = if said.is_empty() {
-                string_field(&event.data, "error")
-            } else {
-                said
-            };
-            ThalovantError::Unanswered {
-                said: said.trim().to_string(),
-            }
-        }
+        EVENT_INTENT_UNMATCHED | EVENT_INTENT_FAILURE => ThalovantError::Unanswered {
+            // What the person said: both names carry the input, and that is
+            // what a caller shows. `reason` is not on these events at all, so
+            // reading it left `said` empty.
+            said: event.text().trim().to_string(),
+        },
         _ => ThalovantError::Runtime(event.name.clone()),
     }
 }
@@ -166,10 +162,11 @@ mod tests {
             let expect = &case["expect"];
             let error = failure_error(&event_of(case));
             if expect["kind"] == "unanswered" {
-                assert!(
-                    matches!(error, ThalovantError::Unanswered { .. }),
-                    "{name}: {error}"
-                );
+                let ThalovantError::Unanswered { said } = &error else {
+                    panic!("{name}: wanted an unanswered question, got {error}");
+                };
+                // What the person said, which is what a caller shows.
+                assert_eq!(said.as_str(), expect["said"], "{name}");
                 continue;
             }
             let ThalovantError::PolicyDenied {

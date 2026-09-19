@@ -1,11 +1,15 @@
 # Changelog
 
-## 0.10.2 — 2026-09-18
+## 0.11.0 — 2026-09-18
 
 - A refusal ends an ask at once instead of letting it run to the deadline. The hub sends `hive.policy.denied` the instant it refuses, with no request id, and the request-id gate dropped it: the ask waited out its whole budget while a caller told somebody their hub "did not answer in time" about a question it had refused and explained. A denial with no request id is taken when it names the type this ask sent and this ask is the only utterance the client has out; a second ask, a query, or a fire-and-forget utterance still inside the shared grace window makes it ambiguous, so neither takes it.
 - `ThalovantError::PolicyDenied` carries `quota` -- period, limit, used, reset_after -- for a spent `intent_quota_exceeded`, and its message fits the refusal rather than offering allow-list advice for a spent day or for `backend_unavailable`. The field is boxed so the enum every `Result` carries stays inside clippy's `result_large_err` limit.
 - `ThalovantError::Unanswered` is new: `ovos.intent.unmatched` is the hub understanding a question and having nothing for it, which is not a failure. The enum is `#[non_exhaustive]`, so a caller with a wildcard arm keeps compiling.
-- `allowed` holds only non-blank, trimmed strings, and quota counts are never negative.
+- `allowed` holds only non-blank, trimmed strings; quota counts are whole, never negative and never past a signed 64-bit integer.
+- `ThalovantError::Unanswered { said }` carries what the person said. Both event names put the input in the event's text; the old read of `reason`/`error` left it empty.
+- A fire-and-forget utterance whose publish never happened is dropped again, rather than suppressing a real refusal for the rest of the grace window.
+- A refusal on a quota the hub sent no numbers for says a quota has run out, rather than claiming "all questions used".
+- **Breaking:** `ThalovantError::PolicyDenied` gained a `quota` field, so a match that names every field without `..` no longer compiles. Hence 0.11.0 rather than a patch.
 - Declares the parity contract's new `refusal` capability, run against the Python reference's `refusal-vectors.json`.
 
 ## 0.10.0 — 2026-09-16

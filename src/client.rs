@@ -328,19 +328,39 @@ impl Client {
     }
 
     pub async fn emit(&self, event_type: &str, data: Data, context: Context) -> Result<()> {
-        if event_type == EVENT_RECOGNIZER_LOOP_UTTERANCE {
-            // A fire-and-forget utterance: nothing will wait on it, but the
-            // hub may refuse it, and that refusal carries no request id.
-            self.transport.record_untracked_send();
+        if event_type != EVENT_RECOGNIZER_LOOP_UTTERANCE {
+            self.connect().await?;
+            return self
+                .transport
+                .emit_bus(
+                    event_type,
+                    data,
+                    self.context_with_identity_metadata(context),
+                )
+                .await;
         }
-        self.connect().await?;
-        self.transport
-            .emit_bus(
-                event_type,
-                data,
-                self.context_with_identity_metadata(context),
-            )
-            .await
+        // A fire-and-forget utterance: nothing will wait on it, but the hub may
+        // refuse it, and that refusal carries no request id. Recorded before
+        // the publish so a denial cannot beat the record, and dropped again if
+        // the publish never happened -- a send that failed to leave leaves
+        // nothing for the hub to refuse, and a phantom would suppress a real
+        // refusal for the whole grace window.
+        let sent = self.transport.record_untracked_send();
+        let published = async {
+            self.connect().await?;
+            self.transport
+                .emit_bus(
+                    event_type,
+                    data,
+                    self.context_with_identity_metadata(context),
+                )
+                .await
+        }
+        .await;
+        if published.is_err() {
+            self.transport.drop_untracked_send(sent);
+        }
+        published
     }
 
     fn context_with_identity_metadata(&self, context: Context) -> Context {
