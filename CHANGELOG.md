@@ -7,7 +7,7 @@
 - `ThalovantError::Unanswered` is new: `ovos.intent.unmatched` is the hub understanding a question and having nothing for it, which is not a failure. The enum is `#[non_exhaustive]`, so a caller with a wildcard arm keeps compiling.
 - `allowed` holds only non-blank, trimmed strings; quota counts are whole, never negative and never past a signed 64-bit integer.
 - `ThalovantError::Unanswered { said }` carries what the person said. Both event names put the input in the event's text; the old read of `reason`/`error` left it empty.
-- A fire-and-forget utterance whose publish never happened is dropped again, rather than suppressing a real refusal for the rest of the grace window.
+- A fire-and-forget utterance is recorded once the connection is up and immediately before the publish, so the grace window is not spent on a handshake; a connect that fails records nothing, and a publish that errors keeps its record, because `emit_bus` over HTTP can fail after the hub already holds the frame. The deque is pruned as entries are added, so a client that only ever sends does not keep them for its lifetime.
 - A refusal on a quota the hub sent no numbers for says a quota has run out, rather than claiming "all questions used".
 - **Breaking:** `ThalovantError::PolicyDenied` gained a `quota` field, so a match that names every field without `..` no longer compiles. Hence 0.11.0 rather than a patch.
 - Declares the parity contract's new `refusal` capability, run against the Python reference's `refusal-vectors.json`.

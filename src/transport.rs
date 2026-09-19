@@ -131,6 +131,20 @@ struct ConnectionControl {
     retired: Notify,
 }
 
+/// Drops what is past the grace window, and any excess beyond the cap.
+fn prune_untracked_sends(sends: &mut std::collections::VecDeque<std::time::Instant>) {
+    let now = std::time::Instant::now();
+    while sends
+        .front()
+        .is_some_and(|sent| now.duration_since(*sent) > crate::refusal::UNTRACKED_UTTERANCE_GRACE)
+    {
+        sends.pop_front();
+    }
+    while sends.len() > 1024 {
+        sends.pop_front();
+    }
+}
+
 /// Retains the shared transport identity without changing public Client literals.
 pub(crate) struct ReplyReservation {
     transport: RuntimeTransport,
@@ -195,36 +209,19 @@ impl Drop for ConnectionAttempt {
 impl RuntimeTransport {
     /// Records a fire-and-forget utterance: nothing will wait on it, but the
     /// hub may refuse it, and that refusal carries no request id.
-    pub(crate) fn record_untracked_send(&self) -> std::time::Instant {
+    /// Notes a fire-and-forget utterance, pruning as it goes: a client that
+    /// only ever sends and never asks would otherwise keep one entry per send
+    /// for as long as it lives.
+    pub(crate) fn record_untracked_send(&self) {
         let mut sends = self
             .control()
             .untracked_sends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sent = std::time::Instant::now();
-        sends.push_back(sent);
-        while sends.len() > 1024 {
-            sends.pop_front();
-        }
-        sent
+        sends.push_back(std::time::Instant::now());
+        prune_untracked_sends(&mut sends);
     }
 
-    /// Forget a send whose publish never happened: nothing reached the hub, so
-    /// there is nothing for it to refuse.
-    pub(crate) fn drop_untracked_send(&self, sent: std::time::Instant) {
-        let mut sends = self
-            .control()
-            .untracked_sends
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(at) = sends.iter().position(|entry| *entry == sent) {
-            sends.remove(at);
-        }
-    }
-
-    /// How many utterances this client may still have refused, for a denial
-    /// with no request id: asks and queries while they wait, and a
-    /// fire-and-forget utterance for the shared grace window after it was sent.
     pub(crate) fn utterances_in_flight(&self) -> (usize, usize, usize) {
         let control = self.control();
         let active = control
@@ -238,12 +235,7 @@ impl RuntimeTransport {
             .untracked_sends
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = std::time::Instant::now();
-        while sends.front().is_some_and(|sent| {
-            now.duration_since(*sent) > crate::refusal::UNTRACKED_UTTERANCE_GRACE
-        }) {
-            sends.pop_front();
-        }
+        prune_untracked_sends(&mut sends);
         (asks, queries, sends.len())
     }
 

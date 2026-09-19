@@ -340,27 +340,28 @@ impl Client {
                 .await;
         }
         // A fire-and-forget utterance: nothing will wait on it, but the hub may
-        // refuse it, and that refusal carries no request id. Recorded before
-        // the publish so a denial cannot beat the record, and dropped again if
-        // the publish never happened -- a send that failed to leave leaves
-        // nothing for the hub to refuse, and a phantom would suppress a real
-        // refusal for the whole grace window.
-        let sent = self.transport.record_untracked_send();
-        let published = async {
-            self.connect().await?;
-            self.transport
-                .emit_bus(
-                    event_type,
-                    data,
-                    self.context_with_identity_metadata(context),
-                )
-                .await
-        }
-        .await;
-        if published.is_err() {
-            self.transport.drop_untracked_send(sent);
-        }
-        published
+        // refuse it, and that refusal carries no request id.
+        //
+        // Recorded once the connection is up and immediately before the
+        // publish. Connecting can wait on a transport and its handshake, and
+        // starting the window there would spend the grace on it -- leaving a
+        // denial to land after it, where an unrelated ask would take it. A
+        // connect that fails publishes nothing, so it records nothing.
+        //
+        // A publish that errors keeps its record: `emit_bus` over HTTP can
+        // fail after `/send_message` already has the frame, and the hub
+        // refuses what it holds. A record that need not have been there costs
+        // an ask its deadline; a missing one ends a question the hub never
+        // refused.
+        self.connect().await?;
+        self.transport.record_untracked_send();
+        self.transport
+            .emit_bus(
+                event_type,
+                data,
+                self.context_with_identity_metadata(context),
+            )
+            .await
     }
 
     fn context_with_identity_metadata(&self, context: Context) -> Context {
