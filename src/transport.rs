@@ -121,6 +121,9 @@ pub enum RuntimeTransport {
 #[derive(Default)]
 struct ConnectionControl {
     active_replies: std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
+    /// When each fire-and-forget utterance went out; see
+    /// [`RuntimeTransport::utterances_in_flight`].
+    untracked_sends: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
     gate: Mutex<()>,
     generation: std::sync::atomic::AtomicU64,
     cancelled: AtomicBool,
@@ -190,6 +193,45 @@ impl Drop for ConnectionAttempt {
 }
 
 impl RuntimeTransport {
+    /// Records a fire-and-forget utterance: nothing will wait on it, but the
+    /// hub may refuse it, and that refusal carries no request id.
+    pub(crate) fn record_untracked_send(&self) {
+        let mut sends = self
+            .control()
+            .untracked_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sends.push_back(std::time::Instant::now());
+        while sends.len() > 1024 {
+            sends.pop_front();
+        }
+    }
+
+    /// How many utterances this client may still have refused, for a denial
+    /// with no request id: asks and queries while they wait, and a
+    /// fire-and-forget utterance for the shared grace window after it was sent.
+    pub(crate) fn utterances_in_flight(&self) -> (usize, usize, usize) {
+        let control = self.control();
+        let active = control
+            .active_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queries = active.iter().filter(|(query, _)| *query).count();
+        let asks = active.len() - queries;
+        drop(active);
+        let mut sends = control
+            .untracked_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        while sends.front().is_some_and(|sent| {
+            now.duration_since(*sent) > crate::refusal::UNTRACKED_UTTERANCE_GRACE
+        }) {
+            sends.pop_front();
+        }
+        (asks, queries, sends.len())
+    }
+
     pub(crate) fn reserve_reply(&self, query: bool, id: &str) -> Result<ReplyReservation> {
         let key = (query, id.to_string());
         let mut active = self
