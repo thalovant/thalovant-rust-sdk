@@ -647,30 +647,11 @@ where
 }
 
 /// [`ThalovantError::PolicyDenied`] from the hub's `hive.policy.denied`.
+///
+/// One parser for the whole crate: the shared refusal vectors pin what it
+/// reads, including the quota numbers a spent allowance sends.
 fn policy_denied(event: &Event) -> ThalovantError {
-    let allowed = event
-        .data
-        .get("data")
-        .and_then(Value::as_object)
-        .and_then(|inner| inner.get("allowed"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            // Only strings: a number or a null in the hub's list is not a
-            // message type, and rendering one would put "3" or "null" in
-            // front of an operator reading which types to allow.
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    ThalovantError::PolicyDenied {
-        denied_type: string_field(&event.data, "denied_type"),
-        code: string_field(&event.data, "code"),
-        reason: string_field(&event.data, "reason"),
-        allowed,
-    }
+    crate::refusal::policy_denied(event)
 }
 
 fn denied_type_of(event: &Event) -> Option<&str> {
@@ -1738,6 +1719,7 @@ mod tests {
                 code,
                 reason,
                 allowed,
+                ..
             } => {
                 assert_eq!(denied_type, EVENT_INTENT_LIST);
                 assert_eq!(code, "acl_disallowed_type");
@@ -1758,6 +1740,7 @@ mod tests {
             code: String::new(),
             reason: String::new(),
             allowed: Vec::new(),
+            quota: None,
         };
         assert_eq!(
             error.to_string(),
@@ -1770,6 +1753,7 @@ mod tests {
             code: "acl_disallowed_type".to_string(),
             reason: String::new(),
             allowed: Vec::new(),
+            quota: None,
         };
         assert!(coded.to_string().contains(": acl_disallowed_type."));
     }

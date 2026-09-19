@@ -4,7 +4,7 @@
       "implementation": {
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
-        "src/transport.rs": "508976629d8f73a008c01d98d670efa1ac6d75e847145979c0754982a5d84941",
+        "src/transport.rs": "a4ac5fb449bc5bacb3d8f967c7be748a650a765716d0f60731290b9127d675d1",
         "src/wire.rs": "495c1987d4f90269abc5385800eb45e8972cdd5c394320966ebf15637705c13e"
       },
       "reason": "decode_hive_binary_frame branches on BINARY: four bits of payload type, then the clip itself, never parsed or inflated. subscribe_binary delivers it. Run against the shared binary vectors and against binary-frames.json, which is hivemind-bus-client's own encoder output rather than frames this SDK built for itself.",
@@ -24,7 +24,7 @@
     },
     "control": {
       "implementation": {
-        "src/lib.rs": "5e48edf446249060b638cef0c5c2e74a4b063f412b3d28147b1a913c648f9b9e",
+        "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35",
         "src/request_helpers.rs": "ce50095abf3bb09055af099dc7ed028691f3c6285f3bac23270776094a56d754"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
@@ -37,7 +37,7 @@
     },
     "conversation": {
       "implementation": {
-        "src/client.rs": "51ff037222ee36c1bc60cc961efd5ad1a8dee524eb7f8257eec28acf6b974c94",
+        "src/client.rs": "70868567005c73b69dbb685290cedc414c1d26aa55b515c74c77ff93fc1ee9fb",
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78"
       },
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
@@ -52,7 +52,7 @@
     },
     "identity": {
       "implementation": {
-        "src/lib.rs": "5e48edf446249060b638cef0c5c2e74a4b063f412b3d28147b1a913c648f9b9e",
+        "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35",
         "src/protocols.rs": "a42115fd0de0dc49c4cee86872130f5ee3ab510ebc4b10d33adff4dcbd978905"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
@@ -77,7 +77,7 @@
     },
     "listing": {
       "implementation": {
-        "src/intents.rs": "6c1087eb20a0a2846607ac7790913cb7f302f8502c36c4f34fade314c72b56fa",
+        "src/intents.rs": "afcfd2ce005119bab4e5d37e7378d814dddff5e4480e0bd1e9b469fd5d7fb252",
         "src/listing.rs": "96e2981d0c37168ef3e98c1946241754b77d628350d1e94078046a4b351d2a38"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
@@ -94,7 +94,7 @@
       "implementation": {
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
-        "src/transport.rs": "508976629d8f73a008c01d98d670efa1ac6d75e847145979c0754982a5d84941"
+        "src/transport.rs": "a4ac5fb449bc5bacb3d8f967c7be748a650a765716d0f60731290b9127d675d1"
       },
       "reason": "subscribe_hive over the five hive kinds, and propagate/escalate/broadcast. The kinds used to fall off the end of dispatch_noise_message with no arm and no log line. Run against the shared mesh vectors.",
       "status": "required",
@@ -106,16 +106,32 @@
         "mesh-vectors.json": "tests/conformance/mesh-vectors.json"
       }
     },
+    "refusal": {
+      "implementation": {
+        "src/errors.rs": "abe21639be16b02f7a0ec75fb2604e42b9ec927681146775f3908571fe29ba80",
+        "src/transport.rs": "a4ac5fb449bc5bacb3d8f967c7be748a650a765716d0f60731290b9127d675d1"
+      },
+      "reason": "refusal_belongs_to_ask() and failure_error() live in src/refusal.rs with their vector suite colocated, as this SDK's private unit suites are, so the module is recorded as test evidence beside the errors and transport it rests on; collect_ask_reply() in client.rs applies the rule with the transport's count of asks, queries and fire-and-forget utterances inside the shared grace window -- recorded once connected and immediately before the publish, and kept when the publish errors, since emit_bus over HTTP can fail after the hub holds the frame. ThalovantError gains Unanswered and PolicyDenied.quota, boxed so the enum every Result carries stays inside clippy's result_large_err limit.",
+      "status": "required",
+      "tests": {
+        "src/client.rs": "70868567005c73b69dbb685290cedc414c1d26aa55b515c74c77ff93fc1ee9fb",
+        "src/refusal.rs": "fc3785d40bf58130afb83a7aaf4171918fc5cc028c9d3023324ddb3aa5163d04",
+        "tests/data/refusal-vectors.json": "6b0f4128f1cc9fd8a54944410ce93c6515bac6cde9257284e313a4fea825bfcb"
+      },
+      "vectors": {
+        "refusal-vectors.json": "tests/data/refusal-vectors.json"
+      }
+    },
     "runtime": {
       "implementation": {
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
-        "src/lib.rs": "5e48edf446249060b638cef0c5c2e74a4b063f412b3d28147b1a913c648f9b9e",
-        "src/transport.rs": "508976629d8f73a008c01d98d670efa1ac6d75e847145979c0754982a5d84941"
+        "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35",
+        "src/transport.rs": "a4ac5fb449bc5bacb3d8f967c7be748a650a765716d0f60731290b9127d675d1"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs.",
       "status": "required",
       "tests": {
-        "src/client.rs": "51ff037222ee36c1bc60cc961efd5ad1a8dee524eb7f8257eec28acf6b974c94",
+        "src/client.rs": "70868567005c73b69dbb685290cedc414c1d26aa55b515c74c77ff93fc1ee9fb",
         "src/transport_noise_tests.rs": "fb25b5599f99758d86da43816f775db528b160e1720384a7b8a6c18185619805",
         "tests/data/reply-claim-vectors.json": "45f2731589e612d5a849376d94073c57b0fef426a92e1d065c58c48442b1ffdc",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
@@ -127,7 +143,7 @@
     },
     "session": {
       "implementation": {
-        "src/lib.rs": "5e48edf446249060b638cef0c5c2e74a4b063f412b3d28147b1a913c648f9b9e"
+        "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. The connected-client factory owns failed connection cleanup; Python performs that dial internally and retains failed retirement before replacement. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "status": "required",
@@ -143,7 +159,8 @@
     "083b2da8b256cd970b3050218d8d51f13e7355633913d086c9f4147d8790165b",
     "1e8b76b34b755207bb754e5f4c7364334f14476dee70fce1d2687bfdc1545f30",
     "f6a74ead44d53658228da3f4457334f3e922b67dd1e33b43c3ba8b6f7c066bf9",
-    "6f5f697b07eb86da6877faf8aa27138430f886495ac965d08a28fba780e411cd"
+    "6f5f697b07eb86da6877faf8aa27138430f886495ac965d08a28fba780e411cd",
+    "2377330566e575bb3fda77998d943667bf0795940f9d569a5b8bc7f4f0e5e486"
   ],
   "schema_version": 1
 }

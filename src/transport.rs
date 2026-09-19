@@ -121,11 +121,28 @@ pub enum RuntimeTransport {
 #[derive(Default)]
 struct ConnectionControl {
     active_replies: std::sync::Mutex<std::collections::HashSet<(bool, String)>>,
+    /// When each fire-and-forget utterance went out; see
+    /// [`RuntimeTransport::utterances_in_flight`].
+    untracked_sends: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
     gate: Mutex<()>,
     generation: std::sync::atomic::AtomicU64,
     cancelled: AtomicBool,
     active_attempt: AtomicBool,
     retired: Notify,
+}
+
+/// Drops what is past the grace window, and any excess beyond the cap.
+fn prune_untracked_sends(sends: &mut std::collections::VecDeque<std::time::Instant>) {
+    let now = std::time::Instant::now();
+    while sends
+        .front()
+        .is_some_and(|sent| now.duration_since(*sent) > crate::refusal::UNTRACKED_UTTERANCE_GRACE)
+    {
+        sends.pop_front();
+    }
+    while sends.len() > 1024 {
+        sends.pop_front();
+    }
 }
 
 /// Retains the shared transport identity without changing public Client literals.
@@ -190,6 +207,38 @@ impl Drop for ConnectionAttempt {
 }
 
 impl RuntimeTransport {
+    /// Records a fire-and-forget utterance: nothing will wait on it, but the
+    /// hub may refuse it, and that refusal carries no request id.
+    /// Notes a fire-and-forget utterance, pruning as it goes: a client that
+    /// only ever sends and never asks would otherwise keep one entry per send
+    /// for as long as it lives.
+    pub(crate) fn record_untracked_send(&self) {
+        let mut sends = self
+            .control()
+            .untracked_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        sends.push_back(std::time::Instant::now());
+        prune_untracked_sends(&mut sends);
+    }
+
+    pub(crate) fn utterances_in_flight(&self) -> (usize, usize, usize) {
+        let control = self.control();
+        let active = control
+            .active_replies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let queries = active.iter().filter(|(query, _)| *query).count();
+        let asks = active.len() - queries;
+        drop(active);
+        let mut sends = control
+            .untracked_sends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_untracked_sends(&mut sends);
+        (asks, queries, sends.len())
+    }
+
     pub(crate) fn reserve_reply(&self, query: bool, id: &str) -> Result<ReplyReservation> {
         let key = (query, id.to_string());
         let mut active = self

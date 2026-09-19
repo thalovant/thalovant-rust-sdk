@@ -16,6 +16,7 @@ use crate::{
         DEFAULT_INTENT_TIMEOUT,
     },
     protocols::{HubProtocol, DEFAULT_PROTOCOL_PREFERENCE},
+    refusal::{failure_error, refusal_belongs_to_ask},
     transport::{HiveMessage, RuntimeTransport, TransportConnectionInfo, TransportHealth},
 };
 use serde_json::{Map, Value};
@@ -327,7 +328,33 @@ impl Client {
     }
 
     pub async fn emit(&self, event_type: &str, data: Data, context: Context) -> Result<()> {
+        if event_type != EVENT_RECOGNIZER_LOOP_UTTERANCE {
+            self.connect().await?;
+            return self
+                .transport
+                .emit_bus(
+                    event_type,
+                    data,
+                    self.context_with_identity_metadata(context),
+                )
+                .await;
+        }
+        // A fire-and-forget utterance: nothing will wait on it, but the hub may
+        // refuse it, and that refusal carries no request id.
+        //
+        // Recorded once the connection is up and immediately before the
+        // publish. Connecting can wait on a transport and its handshake, and
+        // starting the window there would spend the grace on it -- leaving a
+        // denial to land after it, where an unrelated ask would take it. A
+        // connect that fails publishes nothing, so it records nothing.
+        //
+        // A publish that errors keeps its record: `emit_bus` over HTTP can
+        // fail after `/send_message` already has the frame, and the hub
+        // refuses what it holds. A record that need not have been there costs
+        // an ask its deadline; a missing one ends a question the hub never
+        // refused.
         self.connect().await?;
+        self.transport.record_untracked_send();
         self.transport
             .emit_bus(
                 event_type,
@@ -539,6 +566,7 @@ impl Client {
                     }
                     self.remember_conversation(&keys, &event.context);
                 },
+                || self.transport.utterances_in_flight(),
             ),
         )
         .await
@@ -850,6 +878,9 @@ async fn collect_ask_reply(
     // The end of a turn is the one place a hub states what the conversation now
     // is, and it keeps none of it for a named session.
     remember: impl Fn(&Event),
+    // Asks, queries and recent fire-and-forget utterances, for a denial the
+    // hub could not correlate.
+    utterances_in_flight: impl Fn() -> (usize, usize, usize),
 ) -> Result<Reply> {
     let mut events = Vec::new();
     let mut media_budget = crate::events::ReplyMediaBudget::default();
@@ -881,8 +912,23 @@ async fn collect_ask_reply(
             }
         };
         // A runtime may replace the session ID. The request ID is required:
-        // ambient or uncorrelated events must never satisfy a concurrent Ask.
-        if event.request_id().as_deref() != Some(request_id) {
+        // ambient or uncorrelated events must never satisfy a concurrent Ask
+        // -- except the one reply the hub cannot correlate. A denial carries
+        // no request id, only the type it refused, and dropping it here turned
+        // a refusal the hub made at once into a full timeout.
+        if event.name == EVENT_POLICY_DENIED {
+            let (asks, queries, sends) = utterances_in_flight();
+            if !refusal_belongs_to_ask(
+                event.request_id().as_deref(),
+                request_id,
+                event.data.get("denied_type").and_then(Value::as_str),
+                asks,
+                queries,
+                sends,
+            ) {
+                continue;
+            }
+        } else if event.request_id().as_deref() != Some(request_id) {
             continue;
         }
         if !media_budget.accept(&event) {
@@ -930,7 +976,9 @@ async fn collect_ask_reply(
         hard_failure.or_else(|| fragments.is_empty().then_some(soft_failure).flatten());
     if fragments.is_empty() {
         return Err(match failure_event {
-            Some(event) => ThalovantError::Runtime(event.name),
+            // Typed: a refusal, a question the hub has nothing for, and a
+            // fault need three different sentences.
+            Some(event) => failure_error(&event),
             None => ThalovantError::Timeout("hub finished without a speak reply".into()),
         });
     }
@@ -1212,7 +1260,8 @@ mod tests {
                 "first",
                 deadline,
                 &options,
-                |_| {}
+                |_| {},
+                || (1, 0, 0)
             ),
             collect_ask_reply(
                 &mut second,
@@ -1220,7 +1269,8 @@ mod tests {
                 "second",
                 deadline,
                 &options,
-                |_| {}
+                |_| {},
+                || (1, 0, 0)
             )
         );
         for (reply, expected) in [(a.unwrap(), "first"), (b.unwrap(), "second")] {
@@ -1271,6 +1321,7 @@ mod tests {
                 Instant::now() + Duration::from_millis(20),
                 &options,
                 |_| {},
+                || (1, 0, 0),
             )
             .await;
             if hard {
@@ -1282,6 +1333,120 @@ mod tests {
             }
         }
     }
+    /// The production shape: refused at once, no request id, numbers nested.
+    fn quota_denial() -> Event {
+        Event::new(
+            EVENT_POLICY_DENIED,
+            json!({
+                "denied_type": EVENT_RECOGNIZER_LOOP_UTTERANCE,
+                "code": "intent_quota_exceeded",
+                "reason": "daily intent quota exceeded",
+                "data": {"period": "daily", "limit": 50, "used": 50, "reset_after": 36120},
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            json!({"source": "hivemind-core"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn an_uncorrelated_quota_refusal_ends_the_ask_at_once_with_its_numbers() {
+        let (tx, mut receiver) = broadcast::channel(16);
+        let context = context_with_correlation(None, None, None, None, Some("req-own"));
+        tx.send(quota_denial()).unwrap();
+        let started = Instant::now();
+        let result = collect_ask_reply(
+            &mut receiver,
+            &context,
+            "req-own",
+            Instant::now() + Duration::from_secs(5),
+            &AskOptions::default(),
+            |_| {},
+            || (1, 0, 0),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "it waited out the deadline instead of taking the refusal"
+        );
+        let Err(ThalovantError::PolicyDenied { quota, .. }) = result else {
+            panic!("wanted a refusal, got {result:?}");
+        };
+        assert_eq!(
+            quota.map(|quota| *quota),
+            Some(crate::errors::Quota {
+                period: "daily".into(),
+                limit: 50,
+                used: 50,
+                reset_after: 36120,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncorrelated_denial_is_left_alone_when_it_could_be_another_message() {
+        // A second ask, a query, or a fire-and-forget utterance still inside
+        // the grace window: either could be the one refused, and ending the
+        // wrong one fails a question the hub never refused.
+        for counts in [(2, 0, 0), (1, 1, 0), (1, 0, 1)] {
+            let (tx, mut receiver) = broadcast::channel(16);
+            let context = context_with_correlation(None, None, None, None, Some("req-own"));
+            tx.send(quota_denial()).unwrap();
+            let result = collect_ask_reply(
+                &mut receiver,
+                &context,
+                "req-own",
+                Instant::now() + Duration::from_millis(60),
+                &AskOptions::default(),
+                |_| {},
+                || counts,
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ThalovantError::Timeout(_))),
+                "{counts:?} took a denial that could be another message's: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_intent_is_an_unanswered_question_not_a_failure() {
+        let (tx, mut receiver) = broadcast::channel(16);
+        let context = context_with_correlation(None, None, None, None, Some("req-own"));
+        tx.send(Event::new(
+            EVENT_INTENT_UNMATCHED,
+            json!({"utterance": "book me a flight to the moon"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            context.clone(),
+            None,
+        ))
+        .unwrap();
+        let result = collect_ask_reply(
+            &mut receiver,
+            &context,
+            "req-own",
+            Instant::now() + Duration::from_millis(80),
+            &AskOptions {
+                empty_reply_wait: Duration::from_millis(20),
+                ..Default::default()
+            },
+            |_| {},
+            || (1, 0, 0),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(ThalovantError::Unanswered { .. })),
+            "wanted an unanswered question, got {result:?}"
+        );
+    }
+
     fn fixture_query_event(name: &str, text: &str) -> HiveMessage {
         HiveMessage {
             msg_type: "cascade".into(),
@@ -1433,6 +1598,7 @@ mod tests {
                     started + Duration::from_millis(100),
                     &options,
                     |_| {},
+                    || (1, 0, 0),
                 ),
             ),
         )
@@ -1467,6 +1633,7 @@ mod tests {
             Instant::now() + Duration::from_millis(10),
             &AskOptions::default(),
             |_| {},
+            || (1, 0, 0),
         )
         .await;
         assert!(
@@ -1503,6 +1670,7 @@ mod tests {
                         Instant::now() + Duration::from_secs(12),
                         &AskOptions::default(),
                         |_| {},
+                        || (1, 0, 0),
                     ),
                 ),
             )
@@ -1575,6 +1743,7 @@ mod tests {
                     Instant::now() + Duration::from_secs(12),
                     &AskOptions::default(),
                     |_| {},
+                    || (1, 0, 0),
                 )
                 .await
             },
@@ -1626,6 +1795,7 @@ mod tests {
                     ..Default::default()
                 },
                 |_| {},
+                || (1, 0, 0),
             )
             .await;
             assert!(
@@ -1670,6 +1840,7 @@ mod tests {
                     ..Default::default()
                 },
                 |_| {},
+                || (1, 0, 0),
             )
             .await
             .unwrap();
@@ -1693,6 +1864,17 @@ mod conversation_cache_tests {
             }))
             .expect("identity"),
         )
+    }
+
+    #[test]
+    fn a_fire_and_forget_utterance_counts_as_in_flight_until_the_grace_passes() {
+        // The wiring behind the shared correlation rule: nothing waits on a
+        // fire-and-forget utterance, so unless it is recorded when it goes out
+        // an ask beside it would take a denial that could be the send's.
+        let client = client();
+        assert_eq!(client.transport.utterances_in_flight(), (0, 0, 0));
+        client.transport.record_untracked_send();
+        assert_eq!(client.transport.utterances_in_flight(), (0, 0, 1));
     }
 
     #[test]

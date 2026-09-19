@@ -19,6 +19,7 @@ pub mod noise;
 pub mod noise_store;
 pub mod protocols;
 mod redact;
+mod refusal;
 pub mod rich;
 pub mod stream;
 mod tls;
