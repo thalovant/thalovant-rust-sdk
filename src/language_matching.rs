@@ -218,7 +218,8 @@ pub fn usual_form(tag: &str) -> Option<String> {
         format!("{}-{}", likely.language, likely.region)
     }
     .to_lowercase();
-    if crate::intents::same_language(&usual, tag) {
+    // Byte comparison, NOT sameLanguage. They are not the same test, and the difference is the whole point: the canonical spelling is en-US, the manifest is keyed en-us, and sameLanguage calls those equal -- so the retry that exists for exactly this case suppressed itself.
+    if usual == tag.trim() {
         None
     } else {
         Some(usual)
@@ -267,9 +268,12 @@ mod usual_form_tests {
     fn a_tag_already_usual_has_nothing_to_retry_with() {
         // None rather than the same tag, so a hub that answered is never
         // asked twice.
-        assert_eq!(usual_form("en-US"), None);
+        // Only byte-for-byte. The capital spelling is a different string to
+        // a manifest keyed `en-us`, and suppressing its retry was the bug.
+        assert_eq!(usual_form("en-US").as_deref(), Some("en-us"));
+        assert_eq!(usual_form("fr-FR").as_deref(), Some("fr-fr"));
         assert_eq!(usual_form("en-us"), None);
-        assert_eq!(usual_form("fr-FR"), None);
+        assert_eq!(usual_form("fr-fr"), None);
     }
 
     #[test]
