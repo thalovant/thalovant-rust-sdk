@@ -93,6 +93,11 @@ pub struct IntentInventoryOptions {
     /// instead and return names only, marked `engine-manifests`. Off, the
     /// refusal or silence is returned as [`ThalovantError::PolicyDenied`] or [`ThalovantError::Timeout`].
     pub fallback: bool,
+    /// Retry an empty listing once in the language's usual form. On by
+    /// default: a listing that returns nothing from a hub which demonstrably
+    /// answers in that language is a fault, not a preference. See
+    /// [`crate::language_matching::usual_form`].
+    pub nearest: bool,
 }
 
 impl Default for IntentInventoryOptions {
@@ -101,6 +106,7 @@ impl Default for IntentInventoryOptions {
             timeout: None,
             describe: true,
             fallback: true,
+            nearest: true,
         }
     }
 }
@@ -422,6 +428,12 @@ pub struct HubIntentInventory {
     pub source: IntentInventorySource,
     /// Legacy name: queries unavailable through denial or silence, not proof of an ACL denial.
     pub denied: Vec<String>,
+    /// The tag the hub actually listed each requested language under, in
+    /// `languages` order. Equal to `languages` unless a listing came back
+    /// empty and the language's usual form answered instead, which is the
+    /// only way the two differ. Callers rendering sentences must read them
+    /// from the tag that answered.
+    pub listed_in: Vec<String>,
 }
 
 impl HubIntentInventory {
@@ -1068,8 +1080,12 @@ fn inventory_from_names(
                 });
         }
     }
+    // Nothing was listed by manifest at all, so the tags that answered are
+    // the tags that were asked for.
+    let listed_in = languages.clone();
     HubIntentInventory {
         languages,
+        listed_in,
         skills: by_skill
             .into_iter()
             .map(|(skill_id, intents)| HubSkillIntents {
@@ -1108,7 +1124,29 @@ where
     let mut listed: Vec<(String, Vec<IntentRegistration>)> = Vec::new();
     for lang in &asked {
         match list_intents(link, lang, &list_opts).await {
-            Ok(rows) => listed.push((lang.clone(), rows)),
+            Ok(rows) => {
+                // Listing and asking do not agree about languages. The hub
+                // matches an utterance to the closest language it knows, so a
+                // phone set to en-CA is understood by skills registered under
+                // en-US; the manifest is keyed by exact tag, so the same hub
+                // lists nothing for en-CA and a person is shown an empty hub
+                // by the hub that is answering them.
+                //
+                // Once only, and only on an empty listing: a hub that
+                // answered is never asked twice, and a language whose usual
+                // form is itself has nothing to retry with.
+                if rows.is_empty() && opts.nearest {
+                    if let Some(usual) = crate::language_matching::usual_form(lang) {
+                        if let Ok(retried) = list_intents(link, &usual, &list_opts).await {
+                            if !retried.is_empty() {
+                                listed.push((usual, retried));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                listed.push((lang.clone(), rows));
+            }
             Err(error) => {
                 let listing_refused = matches!(
                     &error,
@@ -1194,8 +1232,10 @@ where
                 phrases: per_language,
             });
     }
+    let listed_in: Vec<String> = listed.iter().map(|(lang, _)| lang.clone()).collect();
     Ok(HubIntentInventory {
         languages: asked,
+        listed_in,
         skills: by_skill
             .into_iter()
             .map(|(skill_id, mut intents)| {
