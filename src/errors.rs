@@ -1,6 +1,105 @@
+use std::fmt;
+use std::ops::Deref;
+
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, ThalovantError>;
+
+/// What the API said when it refused a control-plane request: the whole error
+/// body, parsed.
+///
+/// Every Thalovant API refusal is a Problem+JSON document, and many carry
+/// structured fields beside their sentence: a `platform_image_required` 403
+/// names `refused_images`, `allowed_images` and `allowed_repositories`; a
+/// `plan_limit` 403 names `resource`, `limit`, `used` and `plan`. They are all
+/// here, including fields the API adds after this crate was released.
+///
+/// [`code`](Self::code) and [`detail`](Self::detail) read the body's
+/// machine-readable code and its sentence. The rest is a
+/// [`serde_json::Map`]: [`get`](Self::get), or any `Map` method through
+/// `Deref`.
+///
+/// The body is kept as sent, so it can hold a value it echoed back from the
+/// request (a validation error repeats what it was given). `Debug` redacts
+/// every secret-named key, so `{:?}` and an `unwrap()` panic never print one;
+/// reading the map directly gives the values as they are.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct ApiProblem(Map<String, Value>);
+
+impl ApiProblem {
+    /// The body's machine-readable code, such as `platform_image_required` or
+    /// `plan_limit`.
+    ///
+    /// `code` when it is a string with at least one non-whitespace character;
+    /// else, when `detail` is itself an object (FastAPI's own envelope, which
+    /// the API's Problem+JSON handler normally lifts), that object's `code`
+    /// under the same rule; else `None`. Returned exactly as sent.
+    pub fn code(&self) -> Option<&str> {
+        problem_text(self.0.get("code")).or_else(|| problem_text(self.nested()?.get("code")))
+    }
+
+    /// The API's own sentence, whole and exactly as sent: never trimmed,
+    /// collapsed or shortened.
+    ///
+    /// `detail` when it is a string with at least one non-whitespace
+    /// character; else, when `detail` is itself an object, that object's
+    /// `detail` under the same rule; else `None`.
+    pub fn detail(&self) -> Option<&str> {
+        problem_text(self.0.get("detail")).or_else(|| problem_text(self.nested()?.get("detail")))
+    }
+
+    /// One member of the body, for example `allowed_images`.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.0.get(key)
+    }
+
+    /// The whole body.
+    pub fn as_map(&self) -> &Map<String, Value> {
+        &self.0
+    }
+
+    /// The whole body, owned.
+    pub fn into_map(self) -> Map<String, Value> {
+        self.0
+    }
+
+    fn nested(&self) -> Option<&Map<String, Value>> {
+        self.0.get("detail").and_then(Value::as_object)
+    }
+}
+
+/// A string with something in it, exactly as sent; anything else is absent.
+fn problem_text(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+impl Deref for ApiProblem {
+    type Target = Map<String, Value>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Map<String, Value>> for ApiProblem {
+    fn from(map: Map<String, Value>) -> Self {
+        Self(map)
+    }
+}
+
+impl fmt::Debug for ApiProblem {
+    /// Written by hand: `ThalovantError` derives `Debug`, so whatever this
+    /// prints is what `{:?}` and an `unwrap()` panic print, and the body can
+    /// echo a password the request sent.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ApiProblem")
+            .field(&crate::redact::redact_map(&self.0))
+            .finish()
+    }
+}
 
 /// The numbers behind a refusal that is a spent allowance, not a policy.
 ///
@@ -133,8 +232,29 @@ pub enum ThalovantError {
     },
     #[error("api error: {0}")]
     Api(String),
+    /// The control-plane API answered with an error status.
+    ///
+    /// The message is one bounded line for display and can be shortened, so
+    /// it is never where to read what the API said: use
+    /// [`ThalovantError::api_code`], [`ThalovantError::api_detail`] and
+    /// [`ThalovantError::api_problem`].
     #[error("api error: HTTP {status_code}: {detail}")]
-    ApiResponse { status_code: u16, detail: String },
+    ApiResponse {
+        /// The HTTP status.
+        status_code: u16,
+        /// The display line: the body as redacted JSON, whitespace collapsed
+        /// and cut at 200 characters, or a fixed sentence when the body is
+        /// not a JSON object. Not the API's `detail` member; that is
+        /// [`ThalovantError::api_detail`].
+        detail: String,
+        /// The whole error body, parsed, when it is a JSON object; `None`
+        /// for an empty body, one that is not JSON, or JSON that is not an
+        /// object, and for a refused redirect.
+        ///
+        /// Boxed for the same reason as `PolicyDenied::quota`: every
+        /// `Result` in this crate carries this enum.
+        problem: Option<Box<ApiProblem>>,
+    },
     #[error("device authorization denied: the sign-in request was denied in the browser")]
     DeviceAuthorizationDenied,
     #[error("device authorization expired: the code expired before it was approved; call login_with_browser again to request a new code")]
@@ -175,6 +295,29 @@ impl ThalovantError {
             Self::Http(e) => e.status().map(|s| s.as_u16()),
             _ => None,
         }
+    }
+
+    /// The error body the API sent, parsed, when it is a JSON object.
+    ///
+    /// `None` for every other error, and for an API error whose body was
+    /// empty, not JSON, or JSON that is not an object.
+    pub fn api_problem(&self) -> Option<&ApiProblem> {
+        match self {
+            Self::ApiResponse { problem, .. } => problem.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The API's machine-readable code, such as `platform_image_required` or
+    /// `plan_limit`; see [`ApiProblem::code`].
+    pub fn api_code(&self) -> Option<&str> {
+        self.api_problem().and_then(ApiProblem::code)
+    }
+
+    /// The API's own sentence, whole and exactly as sent; see
+    /// [`ApiProblem::detail`].
+    pub fn api_detail(&self) -> Option<&str> {
+        self.api_problem().and_then(ApiProblem::detail)
     }
 }
 
