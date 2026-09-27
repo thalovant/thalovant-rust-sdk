@@ -243,6 +243,13 @@ pub struct MemoryListOptions {
 /// Every field is optional and only the ones you set are sent; omitted fields
 /// fall back to the workspace release policy. Setting `images` switches the
 /// target to `custom` mode unless you also set `mode`.
+///
+/// Unless the caller is a platform administrator, `images` may name only
+/// platform images: a catalog, current or recommended image, or any tag or
+/// digest of the platform's own repository for that key
+/// (`ghcr.io/thalovant/ovos-core` for a runtime group's `core`,
+/// `ghcr.io/thalovant/hivemind-listener` for a hub's `listener`). The API
+/// refuses anything else with HTTP 403 `platform_image_required`.
 #[derive(Clone, Debug, Default)]
 pub struct ReleaseOptions {
     pub channel: Option<String>,
@@ -855,7 +862,11 @@ impl ControlPlane {
     ///
     /// Every option is optional; omitted fields fall back to the workspace
     /// release policy. Passing `images` switches the hub to `custom` mode
-    /// unless you also pass `mode`.
+    /// unless you also pass `mode`. Unless you are a platform administrator,
+    /// those must be platform images: a catalog, current or recommended image,
+    /// or any tag or digest of `ghcr.io/thalovant/hivemind-listener` for
+    /// `listener`. The API refuses anything else with HTTP 403
+    /// `platform_image_required`.
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope.
     pub async fn release_hub(&self, hub_id: &str, opts: ReleaseOptions) -> Result<Value> {
@@ -1081,7 +1092,9 @@ impl ControlPlane {
 
     /// Apply a runtime image policy and return the updated runtime group.
     ///
-    /// Options behave like [`ControlPlane::release_hub`].
+    /// Options behave like [`ControlPlane::release_hub`], including the
+    /// platform-image rule; here any tag or digest of
+    /// `ghcr.io/thalovant/ovos-core` is accepted for `core`.
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope.
     pub async fn release_runtime_group(
