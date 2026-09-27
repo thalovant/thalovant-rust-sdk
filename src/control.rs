@@ -2,7 +2,7 @@ mod hub_skills;
 pub use hub_skills::HubSkillWaitOptions;
 
 use crate::{
-    errors::{Result, ThalovantError},
+    errors::{ApiProblem, Result, ThalovantError},
     identity::Identity,
     protocols::{
         endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,
@@ -244,12 +244,16 @@ pub struct MemoryListOptions {
 /// fall back to the workspace release policy. Setting `images` switches the
 /// target to `custom` mode unless you also set `mode`.
 ///
-/// Unless the caller is a platform administrator, `images` may name only
-/// platform images: a catalog, current or recommended image, or any tag or
-/// digest of the platform's own repository for that key
-/// (`ghcr.io/thalovant/ovos-core` for a runtime group's `core`,
-/// `ghcr.io/thalovant/hivemind-listener` for a hub's `listener`). The API
-/// refuses anything else with HTTP 403 `platform_image_required`.
+/// Unless the caller is a platform administrator, each image must be one the
+/// platform releases for its key: a catalog pin of the stable or alpha channel,
+/// the resource's current, recommended or release-policy image, or the
+/// platform's default image. A runtime group's `core` and a hub's `listener`
+/// also accept any tag or digest of the platform's own repository
+/// (`ghcr.io/thalovant/ovos-core`, `ghcr.io/thalovant/hivemind-listener`);
+/// `bus` and `preview_bridge` take only the listed images. The API refuses
+/// anything else with HTTP 403 `platform_image_required`, whose
+/// [`crate::ThalovantError::api_problem`] names what each refused key may be
+/// instead.
 #[derive(Clone, Debug, Default)]
 pub struct ReleaseOptions {
     pub channel: Option<String>,
@@ -863,10 +867,12 @@ impl ControlPlane {
     /// Every option is optional; omitted fields fall back to the workspace
     /// release policy. Passing `images` switches the hub to `custom` mode
     /// unless you also pass `mode`. Unless you are a platform administrator,
-    /// those must be platform images: a catalog, current or recommended image,
-    /// or any tag or digest of `ghcr.io/thalovant/hivemind-listener` for
-    /// `listener`. The API refuses anything else with HTTP 403
-    /// `platform_image_required`.
+    /// each image must be one the platform releases for its key: a catalog pin
+    /// of the stable or alpha channel, the hub's current, recommended or
+    /// release-policy image, or the platform's default image. `listener` also
+    /// accepts any tag or digest of `ghcr.io/thalovant/hivemind-listener`;
+    /// `preview_bridge` takes only those images. The API refuses anything else
+    /// with HTTP 403 `platform_image_required`.
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope.
     pub async fn release_hub(&self, hub_id: &str, opts: ReleaseOptions) -> Result<Value> {
@@ -1093,8 +1099,9 @@ impl ControlPlane {
     /// Apply a runtime image policy and return the updated runtime group.
     ///
     /// Options behave like [`ControlPlane::release_hub`], including the
-    /// platform-image rule; here any tag or digest of
-    /// `ghcr.io/thalovant/ovos-core` is accepted for `core`.
+    /// platform-image rule: `core` also accepts any tag or digest of
+    /// `ghcr.io/thalovant/ovos-core`, and `bus` takes only the images the
+    /// platform releases for it.
     ///
     /// Requires a paid plan and a token with the `hubs:write` scope.
     pub async fn release_runtime_group(
@@ -1445,10 +1452,7 @@ impl ControlPlane {
     ) -> Result<Value> {
         let (status, body) = self.send_request(method, path, body, headers, auth).await?;
         if !status.is_success() {
-            return Err(ThalovantError::ApiResponse {
-                status_code: status.as_u16(),
-                detail: server_error_detail(&body),
-            });
+            return Err(api_response_error(status, &body));
         }
         if body.trim().is_empty() {
             return Ok(Value::Null);
@@ -1456,6 +1460,7 @@ impl ControlPlane {
         serde_json::from_str::<Value>(&body).map_err(|_| ThalovantError::ApiResponse {
             status_code: status.as_u16(),
             detail: "invalid JSON response".into(),
+            problem: None,
         })
     }
 
@@ -1512,6 +1517,7 @@ impl ControlPlane {
             return Err(ThalovantError::ApiResponse {
                 status_code: status.as_u16(),
                 detail: "control-plane redirects are refused; configure the final API URL".into(),
+                problem: None,
             });
         }
         let body = if status.is_success() {
@@ -1520,7 +1526,12 @@ impl ControlPlane {
                 .await
                 .map_err(|err| ThalovantError::Api(err.without_url().to_string()))?
         } else {
-            response.text().await.unwrap_or_default()
+            // UTF-8 whatever the Content-Type says: the API sends
+            // `application/problem+json` with no charset, and every SDK has
+            // to read the same body the same way.
+            let bytes = response.bytes().await.unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes);
+            text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()
         };
         Ok((status, body))
     }
@@ -1833,8 +1844,33 @@ fn json_string(value: &Value) -> Option<String> {
 /// collapsed and the result is length-bounded so a large or multi-line body
 /// never lands verbatim in `last_error`, logs, or a bug report.
 fn server_error_detail(body: &str) -> String {
-    let rendered = match serde_json::from_str::<Value>(body) {
-        Ok(value) if value.is_object() => crate::redact::redact_value(&value).to_string(),
+    error_display_line(serde_json::from_str::<Value>(body).ok().as_ref())
+}
+
+/// The error for a response the API answered with a failure status.
+///
+/// The body is parsed once. When it is a JSON object it rides on the error
+/// whole, as `problem`, where its `code` and its unshortened `detail` are read;
+/// the display line is the bounded, redacted one it always was.
+fn api_response_error(status: reqwest::StatusCode, body: &str) -> ThalovantError {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let detail = error_display_line(parsed.as_ref());
+    let problem = match parsed {
+        Some(Value::Object(map)) => Some(Box::new(ApiProblem::from(map))),
+        _ => None,
+    };
+    ThalovantError::ApiResponse {
+        status_code: status.as_u16(),
+        detail,
+        problem,
+    }
+}
+
+/// `server_error_detail` for a body already parsed (`None` when it was not
+/// JSON).
+fn error_display_line(parsed: Option<&Value>) -> String {
+    let rendered = match parsed {
+        Some(value) if value.is_object() => crate::redact::redact_value(value).to_string(),
         _ => "(server error response omitted)".to_string(),
     };
     let collapsed = rendered.split_whitespace().collect::<Vec<_>>().join(" ");

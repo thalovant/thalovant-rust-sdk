@@ -201,7 +201,8 @@ routes need a **paid plan** and a token with the **`hubs:write`** scope
 ("Create and update your hubs" on the dashboard's API Tokens page). A free-plan
 token fails with HTTP 402 `API access requires a paid plan.`, and a token
 without the scope fails with HTTP 403 `Insufficient scopes`; both surface as
-`ThalovantError::ApiResponse` carrying the status and redacted detail.
+`ThalovantError::ApiResponse` carrying the status and redacted detail (and
+what the API said; see [Reading An API Error](#reading-an-api-error)).
 
 ```rust
 use serde_json::json;
@@ -835,11 +836,62 @@ for item in items {
 
 Both 429s apply to token-authenticated control-plane calls and surface as
 `ThalovantError::ApiResponse`, carrying the status and a bounded, redacted JSON error
-object. Unstructured response bodies are omitted. The SDK does not expose
-HTTP headers or structured retry metadata and does not retry automatically.
+object. Unstructured response bodies are omitted. The body's fields (`quota`,
+`limit`, `used`, `retry_after_seconds`) are in `api_problem()`; see
+[Reading An API Error](#reading-an-api-error). The SDK does not expose HTTP
+headers and does not retry automatically.
 When inspecting a direct API response, `Retry-After` is authoritative; honor it before
 resending. Per-plan limits are listed in the dashboard and at
 <https://docs.thalovant.com/developers/sdks/rust/>.
+
+## Reading An API Error
+
+A refused control-plane request fails with `ThalovantError::ApiResponse`. Its
+message is one line for display and can be shortened, so read what the API
+said from the error itself:
+
+- `status_code()`: the HTTP status.
+- `api_code()`: the machine-readable code, such as `platform_image_required`
+  or `plan_limit`, or `None`.
+- `api_detail()`: the API's whole sentence, exactly as sent, or `None`.
+- `api_problem()`: the whole error body as an `ApiProblem` when it is a JSON
+  object, or `None`. `ApiProblem` derefs to a `serde_json::Map`, so every
+  structured field the API sends is there, including ones added after this
+  crate was released.
+
+```rust
+use std::collections::BTreeMap;
+use serde_json::Value;
+use thalovant::ReleaseOptions;
+
+let images = BTreeMap::from([("core".to_string(), "docker.io/me/ovos-core:dev".to_string())]);
+let options = ReleaseOptions { images: Some(images), ..Default::default() };
+match control.release_runtime_group(&group_id, options).await {
+    Ok(group) => println!("released {}", group["id"]),
+    Err(error) => {
+        let field = |name: &str| {
+            let value = error.api_problem().and_then(|problem| problem.get(name));
+            value.cloned().unwrap_or(Value::Null)
+        };
+        match error.api_code() {
+            Some("platform_image_required") => {
+                println!("{}", error.api_detail().unwrap_or_default());
+                println!("{}", field("allowed_images")); // per image key
+                println!("{}", field("allowed_repositories")); // any tag or digest of these
+            }
+            Some("plan_limit") => {
+                println!("{}: {} of {}", field("resource"), field("used"), field("limit"));
+            }
+            _ => return Err(error.into()),
+        }
+    }
+}
+```
+
+A value the body echoes back from your request (a validation error repeats
+what it was sent) is only ever in `api_problem()`, never in the message.
+`ApiProblem`'s `Debug` redacts secret-named keys, so `{:?}` and an `unwrap()`
+panic do not print them either.
 
 ## API Shape
 
@@ -902,6 +954,7 @@ resending. Per-plan limits are listed in the dashboard and at
 - `client.intents(languages, options)` (`IntentInventoryOptions`; the hub's intent manifest, sentences per language)
 - `client.list_intents(lang, options)` (`IntentListOptions`)
 - `client.describe_intent(skill_id, intent_name, lang, options)` (`IntentDescribeOptions`)
+- `error.status_code()`, `error.api_code()`, `error.api_detail()`, `error.api_problem()` (`ApiProblem`) on a `ThalovantError`; see [Reading An API Error](#reading-an-api-error)
 
 ## Development
 

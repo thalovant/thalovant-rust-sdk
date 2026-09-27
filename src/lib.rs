@@ -39,7 +39,7 @@ pub use control::{
     ReleaseOptions, SkillInstallOptions, DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL,
     DEFAULT_SKILL_SOURCE_TYPE,
 };
-pub use errors::{Result, ThalovantError};
+pub use errors::{ApiProblem, Result, ThalovantError};
 pub use events::{
     context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
     utterance_payload, Context, Data, Event, Reply,

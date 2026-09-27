@@ -1,5 +1,22 @@
 {
   "capabilities": {
+    "api-errors": {
+      "implementation": {
+        "src/control.rs": "6edead33bd1738c091e832360ae7b1f2085068451af7b221ae784f4f12f405e2",
+        "src/errors.rs": "9ac598c119a3ac59bcec3b3c482f5f8aab2ca51ab79eef09c31ab0dd38638511",
+        "src/lib.rs": "8df20b2ef53d4eee8ec4c46d8aaaa1c6d689f83aab52a336b9910e5bb7dea30c"
+      },
+      "reason": "ApiProblem and ThalovantError's api_problem/api_code/api_detail live in src/errors.rs; api_response_error() in src/control.rs parses every failure body once and fills ApiResponse.problem, leaving the bounded, redacted display line as it was, and ApiProblem's hand-written Debug redacts secret-named keys so {:?} and an unwrap() panic cannot print an echoed password. tests/api_errors.rs serves each shared vector from a loopback HTTP peer, reads it back through ControlPlane::get_hub and records what it produced through tests/common/mod.rs, which is hashed beside it because it controls canonicalisation.",
+      "status": "required",
+      "tests": {
+        "tests/api_errors.rs": "9571b93d8e00a591f11466b72eeabd31b86d711f5f63b145477b62c15d822ef9",
+        "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
+        "tests/conformance/api-error-vectors.json": "f0d2d8e6e153811f071dac6e0611f00f3c32ed772b751ccccb31904d7dc936ec"
+      },
+      "vectors": {
+        "api-error-vectors.json": "tests/conformance/api-error-vectors.json"
+      }
+    },
     "binary": {
       "implementation": {
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
@@ -24,13 +41,13 @@
     },
     "control": {
       "implementation": {
-        "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35",
+        "src/lib.rs": "8df20b2ef53d4eee8ec4c46d8aaaa1c6d689f83aab52a336b9910e5bb7dea30c",
         "src/request_helpers.rs": "ce50095abf3bb09055af099dc7ed028691f3c6285f3bac23270776094a56d754"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "b6d251e090355f692953bf080f9cb5dbcc3ba1e0d790c51ce316a40882b6fd20",
+        "src/control.rs": "6edead33bd1738c091e832360ae7b1f2085068451af7b221ae784f4f12f405e2",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
         "src/native_auth.rs": "c5e1d05fa71c4ae3ae37e1225deaa8157d504ebb54d4558b7e9f9fecfafda02f"
       }
@@ -52,7 +69,7 @@
     },
     "identity": {
       "implementation": {
-        "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35",
+        "src/lib.rs": "8df20b2ef53d4eee8ec4c46d8aaaa1c6d689f83aab52a336b9910e5bb7dea30c",
         "src/protocols.rs": "a42115fd0de0dc49c4cee86872130f5ee3ab510ebc4b10d33adff4dcbd978905"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
@@ -108,7 +125,7 @@
     },
     "refusal": {
       "implementation": {
-        "src/errors.rs": "abe21639be16b02f7a0ec75fb2604e42b9ec927681146775f3908571fe29ba80",
+        "src/errors.rs": "9ac598c119a3ac59bcec3b3c482f5f8aab2ca51ab79eef09c31ab0dd38638511",
         "src/transport.rs": "a4ac5fb449bc5bacb3d8f967c7be748a650a765716d0f60731290b9127d675d1"
       },
       "reason": "refusal_belongs_to_ask() and failure_error() live in src/refusal.rs with their vector suite colocated, as this SDK's private unit suites are, so the module is recorded as test evidence beside the errors and transport it rests on; collect_ask_reply() in client.rs applies the rule with the transport's count of asks, queries and fire-and-forget utterances inside the shared grace window -- recorded once connected and immediately before the publish, and kept when the publish errors, since emit_bus over HTTP can fail after the hub holds the frame. ThalovantError gains Unanswered and PolicyDenied.quota, boxed so the enum every Result carries stays inside clippy's result_large_err limit.",
@@ -125,7 +142,7 @@
     "runtime": {
       "implementation": {
         "src/events.rs": "ef22ff72a0a945887a7a312d80dfd8c5d73f7b527ab82211f212399e1588ac78",
-        "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35",
+        "src/lib.rs": "8df20b2ef53d4eee8ec4c46d8aaaa1c6d689f83aab52a336b9910e5bb7dea30c",
         "src/transport.rs": "a4ac5fb449bc5bacb3d8f967c7be748a650a765716d0f60731290b9127d675d1"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs.",
@@ -143,7 +160,7 @@
     },
     "session": {
       "implementation": {
-        "src/lib.rs": "ff872955330b09a9edc6e44cc323bb4335c8a3db626905eb547743f2b911ca35"
+        "src/lib.rs": "8df20b2ef53d4eee8ec4c46d8aaaa1c6d689f83aab52a336b9910e5bb7dea30c"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. The connected-client factory owns failed connection cleanup; Python performs that dial internally and retains failed retirement before replacement. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "status": "required",
@@ -162,7 +179,8 @@
     "6f5f697b07eb86da6877faf8aa27138430f886495ac965d08a28fba780e411cd",
     "2377330566e575bb3fda77998d943667bf0795940f9d569a5b8bc7f4f0e5e486",
     "76bc1eb9957da5a6fdf03e89f3905f8d37d3ef2fe7c841ba751718105ca30a45",
-    "34a21f2ad875b220a571613e25b6a6e5f3d8de1a776f4949a7ab63ba93e07b16"
+    "34a21f2ad875b220a571613e25b6a6e5f3d8de1a776f4949a7ab63ba93e07b16",
+    "f79d99e9acd2fe299e3b313102541e47b366751defe5fa0dcfa44053aa7f007d"
   ],
   "schema_version": 1
 }

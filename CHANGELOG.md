@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.12.0 — 2026-09-26
+
+- `ThalovantError::ApiResponse` carries what the API said, not only the line built from it. Its new `problem` field is the whole error body parsed, when it is a JSON object, as an `ApiProblem`: `code()` is its machine-readable code, `detail()` its sentence whole, exactly as sent, and it derefs to the `serde_json::Map`, so every structured field is reachable. `ThalovantError::api_problem()`, `api_code()` and `api_detail()` read them from any error. The display line was the only place any of this reached a caller, and it is cut at 200 characters: a `platform_image_required` refusal names every image each refused key may be instead, which is longer than that, so the list a caller needed was the part cut off -- and `refused_images`, `allowed_images` and `allowed_repositories` never reached anybody at all. The same held for every structured refusal, `plan_limit`'s `resource`, `limit` and `used` included. The display line itself is unchanged, and still never repeats a value the body echoed back from the request.
+- `code()` and `detail()` are also read from inside a `detail` that is itself an object -- FastAPI's own envelope, which the API's Problem+JSON handler normally lifts.
+- `ApiProblem`'s `Debug` redacts secret-named keys, so `{:?}` and an `unwrap()` panic never print a password a validation error echoed back. The map itself holds the body as sent. The field is boxed so the enum every `Result` carries stays inside clippy's `result_large_err` limit.
+- An error body is decoded as UTF-8 whatever its Content-Type says; the API sends `application/problem+json` with no charset.
+- **Breaking:** `ThalovantError::ApiResponse` gained a `problem` field, so constructing it by literal or matching it without `..` no longer compiles; add `problem: None`. Hence 0.12.0 rather than a patch.
+- Declares the parity contract's new `api-errors` capability, run against the Python reference's `api-error-vectors.json`: thirteen responses, from the image and plan refusals the API sends to a body that is HTML, empty, or JSON that is not an object, each served by a loopback HTTP peer and read back through `get_hub`, with what it produced recorded in `contracts/conformance-results.json`.
+
 ## 0.11.0 — 2026-09-18
 
 - A refusal ends an ask at once instead of letting it run to the deadline. The hub sends `hive.policy.denied` the instant it refuses, with no request id, and the request-id gate dropped it: the ask waited out its whole budget while a caller told somebody their hub "did not answer in time" about a question it had refused and explained. A denial with no request id is taken when it names the type this ask sent and this ask is the only utterance the client has out; a second ask, a query, or a fire-and-forget utterance still inside the shared grace window makes it ambiguous, so neither takes it.
