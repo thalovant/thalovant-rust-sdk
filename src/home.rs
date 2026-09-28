@@ -5,7 +5,8 @@
 //! Assistant's conversation agent and answers with [`HOME_RESPONSE`]. The
 //! rules every SDK keeps (`home-link-vectors.json`):
 //!
-//! - every request gets exactly one answer, within the hub's 10 seconds;
+//! - every request gets at most one answer, and never after the hub's 10
+//!   seconds, counted from its arrival;
 //! - the answer is a reply (OVOS-MSG-1 §5.2), so it goes back the way the
 //!   request came;
 //! - `speech` is plain text, never markup;
@@ -18,11 +19,8 @@
 //! [`answer_home_requests`] answers every request a [`HubSession`] receives;
 //! [`answer_home_request`] answers one, for a caller running its own loop.
 
-mod entities;
-
 use std::{future::Future, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
-use futures_util::FutureExt;
 use serde_json::Value;
 
 use crate::{
@@ -175,29 +173,62 @@ impl HomeAnswer {
     }
 }
 
-/// Speech a device can say as it is: markup removed ([`strip_ssml`]),
-/// character references decoded, whitespace collapsed to single spaces and
-/// trimmed.
-///
-/// Decoded as Python's `html.unescape` decodes: every numeric reference, and
-/// the named references of HTML 4, `&apos;`, and the upper-case spellings HTML
-/// keeps for a few of them, with or without the semicolon where HTML allows
-/// it. Any other HTML5 name is left as written. `&nbsp;` decodes to U+00A0,
-/// which then counts as whitespace, as every Unicode space does.
+/// Speech a device can say as it is, made in this order: markup removed
+/// ([`strip_ssml`]), character references decoded ([`decode_references`]),
+/// and every run of Unicode White_Space collapsed to one space, the ends
+/// trimmed. In that order, so `&lt;b&gt;` stays the text `<b>`.
 pub fn plain_speech(text: &str) -> String {
     let stripped = strip_ssml(text);
-    let decoded = entities::unescape(&stripped);
+    let decoded = decode_references(&stripped);
     decoded
-        .split(is_space)
+        .split(char::is_whitespace)
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Whitespace as Python's `str.isspace` sees it: Unicode's, plus the four
-/// ASCII separators U+001C to U+001F.
-fn is_space(character: char) -> bool {
-    character.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&character)
+/// The one set of character references every SDK decodes, once, left to
+/// right: numeric ones (`&#72;`, `&#x48;`, `&#X48;`), the five XML entities
+/// (`&amp;` `&lt;` `&gt;` `&quot;` `&apos;`) and `&nbsp;`.
+///
+/// Nothing else: `&eacute;` and `&copy;` stay as written, because HTML's list
+/// of named references differs between the libraries SDKs use. A reference
+/// needs its `;`, and a numeric one to no character -- 0, a surrogate, or
+/// anything above U+10FFFF -- stays as written too.
+pub fn decode_references(text: &str) -> String {
+    static REFERENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let reference = REFERENCE.get_or_init(|| {
+        regex::Regex::new(r"&(?:#([0-9]{1,7})|#[xX]([0-9A-Fa-f]{1,6})|(amp|lt|gt|quot|apos|nbsp));")
+            .expect("the reference pattern is valid")
+    });
+    reference
+        .replace_all(text, |found: &regex::Captures<'_>| {
+            let whole = found[0].to_string();
+            if let Some(name) = found.get(3) {
+                return match name.as_str() {
+                    "amp" => "&",
+                    "lt" => "<",
+                    "gt" => ">",
+                    "quot" => "\"",
+                    "apos" => "'",
+                    _ => "\u{a0}",
+                }
+                .to_string();
+            }
+            let value = match (found.get(1), found.get(2)) {
+                (Some(decimal), _) => decimal.as_str().parse::<u32>().ok(),
+                (_, Some(hex)) => u32::from_str_radix(hex.as_str(), 16).ok(),
+                _ => None,
+            };
+            // 0 and the surrogates are no character, and char::from_u32
+            // refuses anything above U+10FFFF as well: left as written.
+            value
+                .filter(|value| *value != 0)
+                .and_then(char::from_u32)
+                .map(String::from)
+                .unwrap_or(whole)
+        })
+        .into_owned()
 }
 
 /// The [`HOME_RESPONSE`] payload for `answer`, held to the contract.
@@ -279,62 +310,104 @@ impl Replier for HubSession {
     }
 }
 
-/// Answer one request: run `handler`, then reply whatever happened.
+/// Answer one request: run `handler`, then reply whatever happened, within
+/// the hub's [`HOME_REQUEST_TIMEOUT`].
 ///
-/// The handler is bounded by `timeout` ([`DEFAULT_HOME_HANDLER_TIMEOUT`]).
-/// Whatever it does, exactly one [`HOME_RESPONSE`] goes out, as a reply to
-/// `event`:
-///
-/// - its answer, held to the contract by [`home_response`];
-/// - `failed_to_handle` when it returns an error or panics;
-/// - `timeout` when it has not answered within `timeout`.
-///
-/// The reply gets what is left of the hub's [`HOME_REQUEST_TIMEOUT`] after
-/// the handler (or of `timeout`, when that is longer): an answer delivered
-/// after the hub has given up is only noise. A reply still unsent then is
-/// [`ThalovantError::Timeout`](crate::ThalovantError::Timeout).
-///
-/// Returns the payload sent, or the error sending it.
+/// [`answer_home_request_within`] with the hub's own bound; see there.
 pub async fn answer_home_request<R, H, Fut, E>(
     replier: &R,
     event: &Event,
     handler: H,
     timeout: Duration,
-) -> Result<Data>
+) -> Result<Option<Data>>
 where
     R: Replier,
     H: FnOnce(HomeRequest) -> Fut,
-    Fut: Future<Output = std::result::Result<HomeAnswer, E>>,
+    Fut: Future<Output = std::result::Result<HomeAnswer, E>> + Send + 'static,
+    E: Send + 'static,
 {
-    let reply_by = tokio::time::Instant::now() + HOME_REQUEST_TIMEOUT.max(timeout);
-    let request = HomeRequest::from_event(event);
-    let answer = handle(handler, request.clone(), timeout).await;
-    let payload = home_response(&request, answer);
-    tokio::time::timeout_at(
-        reply_by,
-        replier.reply(event, HOME_RESPONSE, payload.clone()),
-    )
-    .await
-    .map_err(|_| {
-        crate::ThalovantError::Timeout(
-            "the home response could not be sent before the hub's deadline".into(),
-        )
-    })??;
-    Ok(payload)
+    answer_home_request_within(replier, event, handler, timeout, HOME_REQUEST_TIMEOUT).await
 }
 
-/// Run a handler to an answer, whatever it does.
-async fn handle<H, Fut, E>(handler: H, request: HomeRequest, timeout: Duration) -> HomeAnswer
+/// Answer one request: run `handler`, then reply whatever happened, all
+/// within `hub_timeout` counted from this call.
+///
+/// The hub gives up on a request after its bound ([`HOME_REQUEST_TIMEOUT`]),
+/// and an answer it has given up on only confuses the next one, so:
+///
+/// - the handler runs on a task of its own and gets `timeout`
+///   ([`DEFAULT_HOME_HANDLER_TIMEOUT`]) or what is left of the bound,
+///   whichever is less. When that runs out the answer is `timeout` and goes
+///   out at once; the handler task is left to finish on its own, and its
+///   late result is dropped;
+/// - a handler that returns an error or panics is answered
+///   `failed_to_handle`; any other answer is held to the contract by
+///   [`home_response`];
+/// - the reply gets what the handler left of the bound. It is never started
+///   after the bound, and one still being sent when the bound passes is
+///   withdrawn.
+///
+/// Returns the payload sent, `None` when there was no time left to send it,
+/// or the error sending it.
+pub async fn answer_home_request_within<R, H, Fut, E>(
+    replier: &R,
+    event: &Event,
+    handler: H,
+    timeout: Duration,
+    hub_timeout: Duration,
+) -> Result<Option<Data>>
+where
+    R: Replier,
+    H: FnOnce(HomeRequest) -> Fut,
+    Fut: Future<Output = std::result::Result<HomeAnswer, E>> + Send + 'static,
+    E: Send + 'static,
+{
+    let started = tokio::time::Instant::now();
+    let far = |span: Duration| {
+        started
+            .checked_add(span)
+            .unwrap_or_else(|| started + Duration::from_secs(86_400 * 365))
+    };
+    let bound = far(hub_timeout);
+    let request = HomeRequest::from_event(event);
+    let answer = handle(handler, request.clone(), far(timeout.min(hub_timeout))).await;
+    let payload = home_response(&request, answer);
+    if tokio::time::Instant::now() >= bound {
+        // No time left: the hub has given up on this request already.
+        return Ok(None);
+    }
+    match tokio::time::timeout_at(bound, replier.reply(event, HOME_RESPONSE, payload.clone())).await
+    {
+        Ok(sent) => sent.map(|()| Some(payload)),
+        // Withdrawn: it could only have arrived after the hub gave up.
+        Err(_) => Ok(None),
+    }
+}
+
+/// Run a handler to an answer by `deadline`, whatever it does.
+///
+/// The handler runs on a task of its own, so an answer is ready at the
+/// deadline even when the handler ignores it: racing the handler in place
+/// would wait for it to give up.
+async fn handle<H, Fut, E>(
+    handler: H,
+    request: HomeRequest,
+    deadline: tokio::time::Instant,
+) -> HomeAnswer
 where
     H: FnOnce(HomeRequest) -> Fut,
-    Fut: Future<Output = std::result::Result<HomeAnswer, E>>,
+    Fut: Future<Output = std::result::Result<HomeAnswer, E>> + Send + 'static,
+    E: Send + 'static,
 {
     let failed = || HomeAnswer::error("failed_to_handle");
     let Ok(running) = std::panic::catch_unwind(AssertUnwindSafe(|| handler(request))) else {
         return failed();
     };
-    match tokio::time::timeout(timeout, AssertUnwindSafe(running).catch_unwind()).await {
+    // Dropping the JoinHandle on the deadline detaches the task: it finishes,
+    // or not, on its own.
+    match tokio::time::timeout_at(deadline, tokio::spawn(running)).await {
         Ok(Ok(Ok(answer))) => answer,
+        // The handler's error, or its panic.
         Ok(Ok(Err(_))) | Ok(Err(_)) => failed(),
         Err(_) => HomeAnswer::error("timeout"),
     }
@@ -448,12 +521,94 @@ mod tests {
             Duration::from_millis(50),
         )
         .await;
-        assert!(matches!(outcome, Err(crate::ThalovantError::Timeout(_))));
+        // Withdrawn at the hub's bound, and nothing sent late.
+        assert!(matches!(outcome, Ok(None)), "{outcome:?}");
         assert_eq!(started.elapsed(), HOME_REQUEST_TIMEOUT);
     }
 
+    /// A replier that records what it sends.
+    #[derive(Default)]
+    struct Recording(std::sync::Mutex<Vec<Data>>);
+
+    impl Replier for Recording {
+        fn reply(
+            &self,
+            _event: &Event,
+            _msg_type: &str,
+            data: Data,
+        ) -> impl Future<Output = Result<()>> + Send {
+            self.0.lock().unwrap().push(data);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_answer_goes_out_at_the_deadline_while_the_handler_carries_on() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = finished.clone();
+        let replies = Recording::default();
+        let event = Event::new(HOME_REQUEST, Data::new(), crate::Context::new(), None);
+        let started = std::time::Instant::now();
+        let sent = answer_home_request(
+            &replies,
+            &event,
+            move |_| async move {
+                // Not a cancellation point the answer could wait on: the
+                // handler runs on its own task and finishes later.
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<_, ()>(HomeAnswer::action_done("too late"))
+            },
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap()
+        .expect("answered in time");
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(sent["error_code"], "timeout");
+        assert_eq!(replies.0.lock().unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the handler was left to finish, not aborted"
+        );
+        assert_eq!(
+            replies.0.lock().unwrap().len(),
+            1,
+            "its late result is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_panics_is_answered_failed_to_handle() {
+        let replies = Recording::default();
+        let event = Event::new(HOME_REQUEST, Data::new(), crate::Context::new(), None);
+        for boom in [true, false] {
+            let sent = answer_home_request(
+                &replies,
+                &event,
+                move |_| {
+                    if boom {
+                        panic!("the handler itself panicked");
+                    }
+                    async move {
+                        if !boom {
+                            panic!("its future panicked");
+                        }
+                        Ok::<_, ()>(HomeAnswer::default())
+                    }
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(sent["error_code"], "failed_to_handle");
+        }
+    }
+
     #[test]
-    fn speech_decodes_what_html_unescape_decodes() {
+    fn references_decode_the_portable_set_and_nothing_else() {
         for (text, expected) in [
             ("a &amp; b", "a & b"),
             ("&lt;b&gt;", "<b>"),
@@ -462,33 +617,29 @@ mod tests {
                 "it's 'quoted' \"twice\"",
             ),
             ("&#x41;&#X42;&#67;", "ABC"),
-            ("&#65&#x42 c", "AB c"),
-            ("caf&eacute; na&iuml;ve &euro;5", "café naïve €5"),
-            ("&amp &copy 2026", "& © 2026"),
-            ("&notit; &ampere;", "¬it; &ere;"),
-            ("&AMP; &COPY;", "& ©"),
-            ("&unknown; & &; &#; &#x;", "&unknown; & &; &#; &#x;"),
-            ("&#128; &#150; &#129;", "€ – \u{81}"),
+            ("&#65&#x42 c", "&#65&#x42 c"),
             (
-                "&#0; &#xd800; &#1114112; &#99999999999999999999;",
-                "\u{fffd} \u{fffd} \u{fffd} \u{fffd}",
+                "caf&eacute; &euro;5 &AMP; &copy",
+                "caf&eacute; &euro;5 &AMP; &copy",
             ),
-            ("a&#1;b&#xfffe;c&#x7f;d", "abcd"),
-            ("&#13;", ""),
+            ("&unknown; & &; &#; &#x;", "&unknown; & &; &#; &#x;"),
+            ("&#0; &#xd800; &#1114112;", "&#0; &#xd800; &#1114112;"),
+            ("&#12345678; &#x1234567;", "&#12345678; &#x1234567;"),
+            ("&#1114111;", "\u{10ffff}"),
+            ("&amp;lt;", "&lt;"),
         ] {
-            assert_eq!(plain_speech(text), expected, "{text}");
+            assert_eq!(decode_references(text), expected, "{text}");
         }
-        // The one place this differs from html.unescape, as documented: an
-        // HTML5 name outside HTML 4 is left as written.
-        assert_eq!(plain_speech("&rightarrow;"), "&rightarrow;");
     }
 
     #[test]
-    fn every_unicode_space_collapses_as_python_sees_it() {
+    fn every_unicode_white_space_collapses() {
         assert_eq!(
-            plain_speech("\u{3000} a\u{a0}\u{2003}b\u{1f}c\u{85}\n\td \u{200b}"),
+            plain_speech("\u{3000} a\u{a0}\u{2003}b\u{85}c\u{2029}\n\td \u{200b}"),
             "a b c d \u{200b}"
         );
+        // The information separators are not White_Space.
+        assert_eq!(plain_speech("a\u{1f}b"), "a\u{1f}b");
         assert_eq!(plain_speech("   "), "");
         assert_eq!(plain_speech("<speak>  </speak>"), "");
     }

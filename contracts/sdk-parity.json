@@ -2,9 +2,9 @@
   "capabilities": {
     "api-errors": {
       "implementation": {
-        "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
-        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
+        "src/control.rs": "0cad929022df585f2a85cd31da4bb875f974e2a3e6eddfb88612967b52f734f9",
+        "src/errors.rs": "0f9213bb1fd9f0a06ac072975959c8d6858a34881af28b41dc8f866c37e8ec0e",
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e"
       },
       "reason": "ApiProblem and ThalovantError's api_problem/api_code/api_detail live in src/errors.rs; api_response_error() in src/control.rs parses every failure body once and fills ApiResponse.problem, leaving the bounded, redacted display line as it was, and ApiProblem's hand-written Debug redacts secret-named keys so {:?} and an unwrap() panic cannot print an echoed password. tests/api_errors.rs serves each shared vector from a loopback HTTP peer, reads it back through ControlPlane::get_hub and records what it produced through tests/common/mod.rs, which is hashed beside it because it controls canonicalisation.",
       "status": "required",
@@ -19,9 +19,9 @@
     },
     "binary": {
       "implementation": {
-        "src/events.rs": "81ddd83fe8c04c0f59539b40e32d4616da6099badc4fe37b1519648a6a390a99",
+        "src/events.rs": "d1d0325c7e1284345f4e5472502a57924ed03d157932851159c5d79c38f0317f",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
-        "src/transport.rs": "8c388f87d6b4d532337dab38781caa6cc78bbd9b643a91af515323d6607a96ee",
+        "src/transport.rs": "2c2ab7697a1e08efc99cec70338e1ca89b9413c2936c6494abdc83a97e71112f",
         "src/wire.rs": "495c1987d4f90269abc5385800eb45e8972cdd5c394320966ebf15637705c13e"
       },
       "reason": "decode_hive_binary_frame branches on BINARY: four bits of payload type, then the clip itself, never parsed or inflated. subscribe_binary delivers it. Run against the shared binary vectors and against binary-frames.json, which is hivemind-bus-client's own encoder output rather than frames this SDK built for itself.",
@@ -41,16 +41,16 @@
     },
     "connection-admission": {
       "implementation": {
-        "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
-        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
+        "src/control.rs": "0cad929022df585f2a85cd31da4bb875f974e2a3e6eddfb88612967b52f734f9",
+        "src/errors.rs": "0f9213bb1fd9f0a06ac072975959c8d6858a34881af28b41dc8f866c37e8ec0e",
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e"
       },
-      "reason": "wait_for_admission in src/control.rs polls GET /v1/operations/{id} (the OperationResource id, else the id at the end of links.self): ready, no operation and 404 are admitted, failed and timed_out are ThalovantError::AdmissionFailed with the operation's error_code, requested/committed/applied keep polling, a 5xx is ridden out, another API refusal is AdmissionFailed with its status and problem, and the deadline (each GET bounded by it) is ThalovantError::AdmissionTimeout, for which is_timeout() and is_connection_error() in src/errors.rs are both true -- the runner asserts both. An absolute links.self on another origin than the API's is ThalovantError::Api and never fetched. A 429 is ridden out too, waiting the problem's retry_after_seconds (top level or inside a detail object) or the poll interval when that is longer, and a 429 asking for longer than is left is AdmissionTimeout at once; an unreachable API passes through unchanged. Every duration in the vectors is whole milliseconds, so the recorder keeps its strict whole-number rule. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
+      "reason": "wait_for_admission in src/control.rs polls GET /v1/operations/{id} (the OperationResource id, else the id at the end of links.self), every read bounded by the deadline: ready, no operation and 404 are admitted; failed and timed_out are ThalovantError::AdmissionFailed with the operation's error_code and no status; a 401 or 403 is returned as the ApiResponse it is (api_refusal says Auth); any other refusal of the wait is AdmissionFailed with no error_code, keeping status and problem; a 5xx is ridden out; a 429 waits the problem's retry_after_seconds (top level or inside a detail object), else the Retry-After header, else RateLimit-Reset (read from the response by get_with_retry_after, since ApiResponse keeps no headers), or the poll interval when longer, and one asking for longer than is left is AdmissionTimeout at once; the deadline is AdmissionTimeout, whose message ends 'it may still admit it later', for which is_timeout() and is_connection_error() in src/errors.rs are both true. An API out of reach is ApiUnreachable, returned as it is. An absolute links.self on another origin (scheme, host, port with default ports) than the API's is ThalovantError::Api and never fetched. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer with the case's headers, fills {api_host}/{api_port}, points 'unreachable' cases at a closed port, checks every request, requires every exchange to be used, and records through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
       "status": "required",
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
-        "tests/conformance/connection-admission-vectors.json": "07c362b5de849d5f85a20b3b4f961271b7b7fe13a13a58ee1d195e6da8a6cbbf",
-        "tests/home_link.rs": "dc851dabec5fb7fe18f67cf80c442a3b121ab8b2c1f8c43ee3129f8f166c261d"
+        "tests/conformance/connection-admission-vectors.json": "41eb4a83835bd50390d000fa7396b7067dafa24f3023b34985e6b254cf5fc259",
+        "tests/home_link.rs": "4df8ae0716d08fa047ffd544df78ccb80966b08acb393dc9ffb774dbd89d1b4c"
       },
       "vectors": {
         "connection-admission-vectors.json": "tests/conformance/connection-admission-vectors.json"
@@ -58,16 +58,16 @@
     },
     "connection-kinds": {
       "implementation": {
-        "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
-        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
+        "src/control.rs": "0cad929022df585f2a85cd31da4bb875f974e2a3e6eddfb88612967b52f734f9",
+        "src/errors.rs": "0f9213bb1fd9f0a06ac072975959c8d6858a34881af28b41dc8f866c37e8ec0e",
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e"
       },
       "reason": "create_client_identity_of_type sends spec.connection_type and spec.version, deletes a client whose answer does not echo the kind (DELETE with If-Match: the answer's etag) and fails with ThalovantError::UnsupportedConnectionType, as it does for a 422 naming connection_type in its detail or code or in a validation error's loc or msg (under errors, or under detail when that is a list), never in the rest of the body, which echoes the request; get_client and delete_client (etag read first when none is given, one retry on 412, 404 is deleted) live in src/control.rs. Refusals are not retyped: an existing call still returns ThalovantError::ApiResponse, and ThalovantError::api_refusal() in src/errors.rs classifies Auth (401, 423, 403 Insufficient scopes), Plan (402, 403 plan_limit) and AlreadyLinked (409 home_assistant_already_linked, with linked_client_id() read from client_id/existing_client_id/connection_id, top level then nested detail). The runner asserts every refusal it classifies is still ApiResponse. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
       "status": "required",
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/connection-kinds-vectors.json": "2baef508194472279ff2446105a1408e381b2f9e4bfc03e5f96d9c6529ddf604",
-        "tests/home_link.rs": "dc851dabec5fb7fe18f67cf80c442a3b121ab8b2c1f8c43ee3129f8f166c261d"
+        "tests/home_link.rs": "4df8ae0716d08fa047ffd544df78ccb80966b08acb393dc9ffb774dbd89d1b4c"
       },
       "vectors": {
         "connection-kinds-vectors.json": "tests/conformance/connection-kinds-vectors.json"
@@ -75,13 +75,13 @@
     },
     "control": {
       "implementation": {
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c",
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e",
         "src/request_helpers.rs": "ce50095abf3bb09055af099dc7ed028691f3c6285f3bac23270776094a56d754"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
+        "src/control.rs": "0cad929022df585f2a85cd31da4bb875f974e2a3e6eddfb88612967b52f734f9",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
         "src/native_auth.rs": "c5e1d05fa71c4ae3ae37e1225deaa8157d504ebb54d4558b7e9f9fecfafda02f"
       }
@@ -89,7 +89,7 @@
     "conversation": {
       "implementation": {
         "src/client.rs": "79eff1608275422d761db1661908ca9ed233247c19c8b328ed1cbb012ff85029",
-        "src/events.rs": "81ddd83fe8c04c0f59539b40e32d4616da6099badc4fe37b1519648a6a390a99"
+        "src/events.rs": "d1d0325c7e1284345f4e5472502a57924ed03d157932851159c5d79c38f0317f"
       },
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
       "status": "required",
@@ -103,16 +103,16 @@
     },
     "device-login": {
       "implementation": {
-        "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
-        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
+        "src/control.rs": "0cad929022df585f2a85cd31da4bb875f974e2a3e6eddfb88612967b52f734f9",
+        "src/errors.rs": "0f9213bb1fd9f0a06ac072975959c8d6858a34881af28b41dc8f866c37e8ec0e",
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e"
       },
-      "reason": "begin_device_login, poll_device_login (one POST /v1/auth/device/token, returning the ApiToken or ThalovantError::DeviceLoginPending with the interval -- lengthened by five seconds for good per device code, kept in the control plane's private device_intervals -- DeviceLoginExpired or DeviceLoginDenied, each with the status and boxed problem) and revoke_api_token live in src/control.rs; revoking the token in use treats the API's 401 as revoked and forgets it, revoking again sends nothing until the next sign-in (a private flag every sign-in clears), and every sign-in sets token_id from its own answer; the variants and their status_code/api_problem answers in src/errors.rs. A 2xx without an access_token is ThalovantError::Api; any other failure goes through api_response_error(), which also fixes login_with_browser's poll dropping the status and body. Verification URLs go through browser_command's http(s)/host/no-credentials check, and every error is checked against message_excludes in Display and both Debug forms. HOME_ASSISTANT_SCOPES is asserted equal to the vector file's list. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
+      "reason": "begin_device_login (an empty scope list left out), poll_device_login (one POST /v1/auth/device/token, returning the ApiToken or ThalovantError::DeviceLoginPending with the interval -- lengthened by five seconds for good per device code, kept in the control plane's private device_intervals -- DeviceLoginExpired or DeviceLoginDenied, each with the status and boxed problem) and revoke_api_token live in src/control.rs; revoking the token in use treats the API's 401 as revoked and forgets it, revoking again sends nothing until the next sign-in (a private flag every sign-in clears), and every sign-in sets token_id from its own answer; the variants and their status_code/api_problem answers in src/errors.rs. A 2xx without an access_token is ThalovantError::Api; any other failure goes through api_response_error(), which also fixes login_with_browser's poll dropping the status and body. Verification URLs go through browser_command's http(s)/host/no-credentials check, and every error is checked against message_excludes in Display and both Debug forms. HOME_ASSISTANT_SCOPES is asserted equal to the vector file's list. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
       "status": "required",
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
-        "tests/conformance/device-login-vectors.json": "8bcc6a3a1f2513ab2f9d134f861f1592f60dcb354ceeca826804de8ac0ba7210",
-        "tests/home_link.rs": "dc851dabec5fb7fe18f67cf80c442a3b121ab8b2c1f8c43ee3129f8f166c261d"
+        "tests/conformance/device-login-vectors.json": "8a2257cd80b5d2dfa9553420b51617c697b1ad4e6af60ba83e980e1731fa7854",
+        "tests/home_link.rs": "4df8ae0716d08fa047ffd544df78ccb80966b08acb393dc9ffb774dbd89d1b4c"
       },
       "vectors": {
         "device-login-vectors.json": "tests/conformance/device-login-vectors.json"
@@ -121,28 +121,33 @@
     "home-link": {
       "implementation": {
         "src/client.rs": "79eff1608275422d761db1661908ca9ed233247c19c8b328ed1cbb012ff85029",
-        "src/events.rs": "81ddd83fe8c04c0f59539b40e32d4616da6099badc4fe37b1519648a6a390a99",
-        "src/home.rs": "c39febb9e2ea950dcda2dbe770ac15ebeb40cb5e1b0fbd89c637f33f5798bb85",
-        "src/home/entities.rs": "ad717945af2bda9a9b7115ec515abe9fbd9e00dc65f7819c420537b45b604b08",
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c",
-        "src/session.rs": "15b62d971b3afb6909705e1966958bf113a9314e64da70a60ea64edf75e76973",
-        "src/transport.rs": "8c388f87d6b4d532337dab38781caa6cc78bbd9b643a91af515323d6607a96ee"
+        "src/events.rs": "d1d0325c7e1284345f4e5472502a57924ed03d157932851159c5d79c38f0317f",
+        "src/home.rs": "eb9221cadbf80a4ee78b451ad14c85cb065f13140f2815ffd86d529f20853750",
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e",
+        "src/noise.rs": "875e0f096d46b0b62b0ea87a1251a15c84bdcf2b8dc6a4272a404e9b9e771b50",
+        "src/noise_store.rs": "dbd9eb1428fc0e994a17556b0982c15112f20a1b21d31d596c4324c63363c6d2",
+        "src/rich.rs": "d441e77895b4f39932dba8f91ff643e0e53df886e4c40287da2e70d5c7574438",
+        "src/session.rs": "3840649f0fd518a37c26ad72c3ba526609ee6c807ece03c3eb2178700f70ab32",
+        "src/transport.rs": "2c2ab7697a1e08efc99cec70338e1ca89b9413c2936c6494abdc83a97e71112f"
       },
-      "reason": "src/home.rs holds HOME_REQUEST/HOME_RESPONSE, HOME_REQUEST_TIMEOUT, RESPONSE_TYPES and ERROR_CODES (asserted equal to the vector file's lists), HomeRequest, HomeAnswer, home_response, plain_speech (strip_ssml, then character references decoded as html.unescape does -- every numeric reference, and HTML 4's named ones, &apos; and the upper-case spellings, in src/home/entities.rs, generated from Python's html.entities; any other HTML5 name is left as written -- then Unicode whitespace collapsed as str.isspace sees it), answer_home_request (handler bounded by tokio::time::timeout; an error or panic is failed_to_handle, elapsed is timeout, outside the lists is unknown, exactly one reply) and answer_home_requests. reply_context is in src/events.rs, Client::reply in src/client.rs, which replies from Event::context, the context exactly as the hub sent it. src/session.rs adds per-type handlers bound on every client the session builds, a state callback, connect() with the 0.75 s settle window, run() with the ladder, drop detection and the 600 s refusal grace, and for_identity; src/transport.rs remembers whether the last WSS close was a refusal (no status, 1000, 1005, 1008, or a 401/403 upgrade) and wakes waiters when a link stops. Session tests are colocated in src/session.rs, as this SDK's unit suites are, so that file is implementation here; src/transport_noise_tests.rs runs the refusal close codes, the settle window and a home request answered back along its route over a real WSS Noise link. tests/home_link.rs runs every home-link case through answer_home_request with a replier that records what it is asked to send, asserts exactly one thalovant.home.response, and records the payload (or the reply_context) through tests/common/mod.rs before asserting.",
+      "reason": "src/home.rs holds HOME_REQUEST/HOME_RESPONSE, HOME_REQUEST_TIMEOUT, RESPONSE_TYPES and ERROR_CODES (asserted equal to the vector file's lists), HomeRequest, HomeAnswer, home_response, plain_speech (src/rich.rs strip_ssml removes only real tags, comments and processing instructions; decode_references decodes numeric references, the five XML entities and &nbsp; and nothing else; Unicode White_Space collapses), and answer_home_request/answer_home_request_within: everything within the hub's 10 s counted from the call, the handler on a spawned task given min(timeout, what is left) and answered timeout at the deadline while it is left to finish, the reply given what the handler left, never started after the bound and withdrawn when it passes (None when there was no time). reply_context is in src/events.rs (a destination with no source gives no destination), Client::reply in src/client.rs, replying from Event::context as the hub sent it. src/transport.rs holds close_refuses (1000/1005/1008 during the handshake or within 750 ms after it, a code learnt up to 250 ms late) and the typed handshake verdicts: a message that fails to authenticate and a refusal close are HubRefused, a pin mismatch HubKeyChanged, and a failed KK is followed at once by one XX in the same connect; src/noise.rs and src/noise_store.rs carry the pattern selection and the pin it checks. src/session.rs holds LinkSupervisor, a pure function run() asks after every attempt (hold, dial again at once after a drop, the 10 s to 120 s ladder, 600 s of refusals, stop at once on a key change), per-type handlers and the settle window; its own unit tests are colocated, as this SDK's are, so it is implementation here. tests/home_link.rs runs every home-link case (reply_context, speech, answer, deadline with a transport that takes send_ms); tests/link_keeping.rs runs the close and supervise cases and the policy; src/transport_noise_tests.rs runs the handshake cases against a loopback Noise hub that records the patterns it sees, a real close right after the handshake, and run() stopping at once on a changed key. All record through tests/common/mod.rs before asserting.",
       "status": "required",
       "tests": {
-        "src/transport_noise_tests.rs": "72ae11739425164c176921cf08b95b7a4c4256826c5e634731453db4f7301057",
+        "src/transport_noise_tests.rs": "2e329bd0fffd1063a4b94eeef744286d16b644efedf90c480fab8693a91ea624",
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
-        "tests/conformance/home-link-vectors.json": "e3fb5129970190fba82061db41109c20096e8f2999b2eeac8c742cceb38ddb64",
-        "tests/home_link.rs": "dc851dabec5fb7fe18f67cf80c442a3b121ab8b2c1f8c43ee3129f8f166c261d"
+        "tests/conformance/home-link-vectors.json": "3dc3d38020f3d1b7a2df61d0048fb13685a5361d2dff82710c1e1833cccc576f",
+        "tests/conformance/link-keeping-vectors.json": "b3be27131c051c527d7b917dd6d7d24692920a0f59694b1031f009724e3de4bc",
+        "tests/home_link.rs": "4df8ae0716d08fa047ffd544df78ccb80966b08acb393dc9ffb774dbd89d1b4c",
+        "tests/link_keeping.rs": "6fa0ef14c8bc29b4451db174ab7bbc2b2ecda0688fa81164b10cac3ecaa78a18"
       },
       "vectors": {
-        "home-link-vectors.json": "tests/conformance/home-link-vectors.json"
+        "home-link-vectors.json": "tests/conformance/home-link-vectors.json",
+        "link-keeping-vectors.json": "tests/conformance/link-keeping-vectors.json"
       }
     },
     "identity": {
       "implementation": {
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c",
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e",
         "src/protocols.rs": "a42115fd0de0dc49c4cee86872130f5ee3ab510ebc4b10d33adff4dcbd978905"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
@@ -182,9 +187,9 @@
     },
     "mesh": {
       "implementation": {
-        "src/events.rs": "81ddd83fe8c04c0f59539b40e32d4616da6099badc4fe37b1519648a6a390a99",
+        "src/events.rs": "d1d0325c7e1284345f4e5472502a57924ed03d157932851159c5d79c38f0317f",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
-        "src/transport.rs": "8c388f87d6b4d532337dab38781caa6cc78bbd9b643a91af515323d6607a96ee"
+        "src/transport.rs": "2c2ab7697a1e08efc99cec70338e1ca89b9413c2936c6494abdc83a97e71112f"
       },
       "reason": "subscribe_hive over the five hive kinds, and propagate/escalate/broadcast. The kinds used to fall off the end of dispatch_noise_message with no arm and no log line. Run against the shared mesh vectors.",
       "status": "required",
@@ -198,8 +203,8 @@
     },
     "refusal": {
       "implementation": {
-        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
-        "src/transport.rs": "8c388f87d6b4d532337dab38781caa6cc78bbd9b643a91af515323d6607a96ee"
+        "src/errors.rs": "0f9213bb1fd9f0a06ac072975959c8d6858a34881af28b41dc8f866c37e8ec0e",
+        "src/transport.rs": "2c2ab7697a1e08efc99cec70338e1ca89b9413c2936c6494abdc83a97e71112f"
       },
       "reason": "refusal_belongs_to_ask() and failure_error() live in src/refusal.rs with their vector suite colocated, as this SDK's private unit suites are, so the module is recorded as test evidence beside the errors and transport it rests on; collect_ask_reply() in client.rs applies the rule with the transport's count of asks, queries and fire-and-forget utterances inside the shared grace window -- recorded once connected and immediately before the publish, and kept when the publish errors, since emit_bus over HTTP can fail after the hub holds the frame. ThalovantError gains Unanswered and PolicyDenied.quota, boxed so the enum every Result carries stays inside clippy's result_large_err limit.",
       "status": "required",
@@ -214,15 +219,15 @@
     },
     "runtime": {
       "implementation": {
-        "src/events.rs": "81ddd83fe8c04c0f59539b40e32d4616da6099badc4fe37b1519648a6a390a99",
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c",
-        "src/transport.rs": "8c388f87d6b4d532337dab38781caa6cc78bbd9b643a91af515323d6607a96ee"
+        "src/events.rs": "d1d0325c7e1284345f4e5472502a57924ed03d157932851159c5d79c38f0317f",
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e",
+        "src/transport.rs": "2c2ab7697a1e08efc99cec70338e1ca89b9413c2936c6494abdc83a97e71112f"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs.",
       "status": "required",
       "tests": {
         "src/client.rs": "79eff1608275422d761db1661908ca9ed233247c19c8b328ed1cbb012ff85029",
-        "src/transport_noise_tests.rs": "72ae11739425164c176921cf08b95b7a4c4256826c5e634731453db4f7301057",
+        "src/transport_noise_tests.rs": "2e329bd0fffd1063a4b94eeef744286d16b644efedf90c480fab8693a91ea624",
         "tests/data/reply-claim-vectors.json": "45f2731589e612d5a849376d94073c57b0fef426a92e1d065c58c48442b1ffdc",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
         "tests/reply_claims.rs": "28b12c2282adb27afbc267751ef8a4bfa989a70dc1e351d9e259e3ef7dfa0b69"
@@ -233,12 +238,12 @@
     },
     "session": {
       "implementation": {
-        "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
+        "src/lib.rs": "700e2bfa3068019c59b8306d34b85f7668df9cfdf5dcd89729090f103c84bf9e"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. The connected-client factory owns failed connection cleanup; Python performs that dial internally and retains failed retirement before replacement. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "status": "required",
       "tests": {
-        "src/session.rs": "15b62d971b3afb6909705e1966958bf113a9314e64da70a60ea64edf75e76973"
+        "src/session.rs": "3840649f0fd518a37c26ad72c3ba526609ee6c807ece03c3eb2178700f70ab32"
       }
     }
   },
@@ -254,7 +259,7 @@
     "76bc1eb9957da5a6fdf03e89f3905f8d37d3ef2fe7c841ba751718105ca30a45",
     "34a21f2ad875b220a571613e25b6a6e5f3d8de1a776f4949a7ab63ba93e07b16",
     "f79d99e9acd2fe299e3b313102541e47b366751defe5fa0dcfa44053aa7f007d",
-    "f1593522f0af94b56d35ea92909d8bd71d1ae5fc7f6596b6212a0cc4c01c0329"
+    "3cdc3e21b6f5505794d2d0988ea92febe3c4acce228429e84e87e93da07c4bab"
   ],
   "schema_version": 1
 }

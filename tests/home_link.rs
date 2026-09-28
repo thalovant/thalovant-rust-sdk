@@ -18,10 +18,10 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use thalovant::home::{ERROR_CODES, RESPONSE_TYPES};
 use thalovant::{
-    answer_home_request, reply_context, ApiRefusal, BootstrapIdentityOptions, ControlPlane, Data,
-    DeviceAuthorization, Event, HomeAnswer, OperationResource, Replier, ThalovantError,
-    DEFAULT_HOME_HANDLER_TIMEOUT, HOME_ASSISTANT_SCOPES, HOME_REQUEST, HOME_REQUEST_TIMEOUT,
-    HOME_RESPONSE,
+    answer_home_request, answer_home_request_within, plain_speech, reply_context, ApiRefusal,
+    BootstrapIdentityOptions, ControlPlane, Data, DeviceAuthorization, Event, HomeAnswer,
+    OperationResource, Replier, ThalovantError, DEFAULT_HOME_HANDLER_TIMEOUT,
+    HOME_ASSISTANT_SCOPES, HOME_REQUEST, HOME_REQUEST_TIMEOUT, HOME_RESPONSE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -229,7 +229,7 @@ async fn answer(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
             Some(exchange["response"].clone())
         }
     };
-    let (status, content_type, body) = match &response {
+    let (status, content_type, body, headers) = match &response {
         Some(response) => (
             response["status"].as_u64().expect("status") as u16,
             response["content_type"]
@@ -237,14 +237,27 @@ async fn answer(mut stream: TcpStream, script: Arc<Mutex<Script>>) {
                 .unwrap_or_default()
                 .to_string(),
             response["body"].as_str().unwrap_or_default().to_string(),
+            response["headers"].as_object().cloned().unwrap_or_default(),
         ),
-        None => (599, "application/json".to_string(), "{}".to_string()),
+        None => (
+            599,
+            "application/json".to_string(),
+            "{}".to_string(),
+            Map::new(),
+        ),
     };
     let reason = reqwest::StatusCode::from_u16(status)
         .ok()
         .and_then(|status| status.canonical_reason())
         .unwrap_or("Status");
     let mut reply = format!("HTTP/1.1 {status} {reason}\r\n");
+    // The case's own headers: a 429 carries Retry-After or RateLimit-Reset.
+    for (name, value) in &headers {
+        reply.push_str(&format!(
+            "{name}: {}\r\n",
+            value.as_str().unwrap_or_default()
+        ));
+    }
     if !body.is_empty() {
         reply.push_str(&format!("content-type: {content_type}\r\n"));
     }
@@ -517,13 +530,48 @@ async fn connection_kinds_run_their_vectors() {
 
 // -- connection admission -----------------------------------------------------
 
+/// A loopback port nothing listens on.
+fn closed_port() -> u16 {
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe");
+    probe.local_addr().expect("probe address").port()
+}
+
+/// `value` with `{api_host}` and `{api_port}` filled in.
+fn placed(value: &Value, host: &str, port: u16) -> Value {
+    match value {
+        Value::String(text) => Value::from(
+            text.replace("{api_host}", host)
+                .replace("{api_port}", &port.to_string()),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, item)| (key.clone(), placed(item, host, port)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 async fn admission_case(case: &Value) -> (Value, ScriptedApi) {
     let call = &case["call"];
     let expect = &case["expect"];
     let api = ScriptedApi::start(&case["exchanges"]).await;
-    let control = ControlPlane::new(api.url.clone(), Some("synthetic-token".to_string()));
-    let operation: Option<OperationResource> = (!call["operation"].is_null())
-        .then(|| serde_json::from_value(call["operation"].clone()).expect("an operation"));
+    let port = api
+        .url
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .expect("the loopback port");
+    let url = if call["api"] == "unreachable" {
+        format!("http://127.0.0.1:{}", closed_port())
+    } else {
+        api.url.clone()
+    };
+    let control = ControlPlane::new(url, Some("synthetic-token".to_string()));
+    let operation: Option<OperationResource> = (!call["operation"].is_null()).then(|| {
+        serde_json::from_value(placed(&call["operation"], "127.0.0.1", port)).expect("an operation")
+    });
     let started = std::time::Instant::now();
     let waited = control
         .wait_for_admission(
@@ -538,14 +586,37 @@ async fn admission_case(case: &Value) -> (Value, ScriptedApi) {
         Ok(()) => json!({"outcome": "admitted", "polls": polls}),
         Err(error @ ThalovantError::AdmissionTimeout { .. }) => {
             assert!(error.is_connection_error() && error.is_timeout());
+            assert!(
+                error.to_string().ends_with("it may still admit it later"),
+                "{error}"
+            );
             let mut produced = json!({"outcome": "timeout"});
             if expect.get("polls").is_some() {
                 produced["polls"] = json!(polls);
             }
             produced
         }
-        Err(ThalovantError::AdmissionFailed { error_code, .. }) => {
-            json!({"outcome": "failed", "error_code": error_code, "polls": polls})
+        Err(error @ ThalovantError::AdmissionFailed { .. }) => {
+            let ThalovantError::AdmissionFailed { error_code, .. } = &error else {
+                unreachable!()
+            };
+            let mut produced = Map::from_iter([
+                ("outcome".to_string(), json!("failed")),
+                ("error_code".to_string(), json!(error_code)),
+                ("status".to_string(), json!(error.status_code())),
+            ]);
+            if error.status_code().is_some() {
+                produced.insert("code".to_string(), json!(error.api_code()));
+                produced.insert("detail".to_string(), json!(error.api_detail()));
+            }
+            produced.insert("polls".to_string(), json!(polls));
+            Value::Object(produced)
+        }
+        Err(ThalovantError::ApiUnreachable(_)) => json!({"outcome": "unreachable", "polls": polls}),
+        Err(error @ ThalovantError::ApiResponse { .. })
+            if error.api_refusal() == Some(ApiRefusal::Auth) =>
+        {
+            json!({"outcome": "auth", "status": error.status_code(), "polls": polls})
         }
         Err(ThalovantError::Api(_) | ThalovantError::ApiResponse { .. }) => {
             json!({"outcome": "error", "polls": polls})
@@ -614,17 +685,54 @@ async fn run_handler(spec: Value) -> Result<HomeAnswer, String> {
 async fn home_link_runs_its_vectors() {
     let spec = vectors("home-link-vectors.json");
     for case in cases(&spec) {
-        let produced = if case["kind"] == "reply_context" {
-            let context = case["context"].as_object().expect("context");
-            Value::Object(reply_context(context))
-        } else {
-            let replies = Replies::default();
-            let event = Event::new(
+        let request_event = || {
+            Event::new(
                 HOME_REQUEST,
                 case["request"].as_object().expect("request").clone(),
                 json!({"source": "skill"}).as_object().unwrap().clone(),
                 None,
+            )
+        };
+        let produced = if case["kind"] == "reply_context" {
+            let context = case["context"].as_object().expect("context");
+            Value::Object(reply_context(context))
+        } else if case["kind"] == "speech" {
+            Value::from(plain_speech(case["text"].as_str().expect("text")))
+        } else if case["kind"] == "deadline" {
+            let replies = SlowReplies::new(millis(&case["send_ms"]));
+            let hub_timeout = millis(&case["hub_timeout_ms"]);
+            let handler = case["handler"].clone();
+            let started = std::time::Instant::now();
+            let sent = answer_home_request_within(
+                &replies,
+                &request_event(),
+                move |_request| run_handler(handler),
+                millis(&case["timeout_ms"]),
+                hub_timeout,
+            )
+            .await
+            .expect("no send failed");
+            // Never past the hub's bound, whatever the handler or the
+            // transport did.
+            assert!(
+                started.elapsed() <= hub_timeout + Duration::from_millis(100),
+                "{}: took {:?}",
+                name(case),
+                started.elapsed()
             );
+            let mut produced = json!({"replied": sent.is_some()});
+            if let Some(sent) = sent {
+                assert_eq!(
+                    replies.sent(),
+                    vec![(HOME_RESPONSE.to_string(), sent.clone())],
+                    "{}: exactly one response",
+                    name(case)
+                );
+                produced["response"] = Value::Object(sent);
+            }
+            produced
+        } else {
+            let replies = Replies::default();
             let timeout = case
                 .get("timeout_ms")
                 .map(millis)
@@ -632,12 +740,13 @@ async fn home_link_runs_its_vectors() {
             let handler = case["handler"].clone();
             let payload = answer_home_request(
                 &replies,
-                &event,
+                &request_event(),
                 move |_request| run_handler(handler),
                 timeout,
             )
             .await
-            .expect("the answer is sent");
+            .expect("no send failed")
+            .expect("the answer is sent in time");
             let sent = replies.0.into_inner().unwrap();
             assert_eq!(
                 sent,
@@ -649,6 +758,42 @@ async fn home_link_runs_its_vectors() {
         };
         common::record("home-link-vectors.json", name(case), &produced);
         assert_eq!(produced, case["expect"], "{}", name(case));
+    }
+}
+
+/// A transport that takes `send` to put a reply on the wire, and records it
+/// only once it is there: a reply withdrawn half way is never recorded.
+struct SlowReplies {
+    send: Duration,
+    sent: Arc<Mutex<Vec<(String, Data)>>>,
+}
+
+impl SlowReplies {
+    fn new(send: Duration) -> Self {
+        Self {
+            send,
+            sent: Arc::default(),
+        }
+    }
+
+    fn sent(&self) -> Vec<(String, Data)> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+impl Replier for SlowReplies {
+    fn reply(
+        &self,
+        _event: &Event,
+        msg_type: &str,
+        data: Data,
+    ) -> impl Future<Output = thalovant::Result<()>> + Send {
+        let (send, sent, msg_type) = (self.send, self.sent.clone(), msg_type.to_string());
+        async move {
+            tokio::time::sleep(send).await;
+            sent.lock().unwrap().push((msg_type, data));
+            Ok(())
+        }
     }
 }
 
@@ -916,4 +1061,21 @@ async fn a_429_without_a_wait_named_waits_the_poll_interval() {
     assert!(started.elapsed() >= Duration::from_millis(240));
     assert!(started.elapsed() < Duration::from_secs(3));
     api.finish("429");
+}
+
+#[tokio::test]
+async fn an_api_out_of_reach_is_told_apart_from_an_answer() {
+    let control = ControlPlane::new(
+        format!("http://127.0.0.1:{}", closed_port()),
+        Some("synthetic-token".to_string()),
+    );
+    let error = control.get_hub("hub-1").await.expect_err("nothing listens");
+    assert!(
+        matches!(error, ThalovantError::ApiUnreachable(_)),
+        "{error:?}"
+    );
+    assert!(error.is_connection_error());
+    assert_eq!(error.status_code(), None);
+    assert!(error.api_problem().is_none());
+    assert!(!error.to_string().contains("synthetic-token"));
 }

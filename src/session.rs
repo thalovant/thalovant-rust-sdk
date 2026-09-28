@@ -64,6 +64,111 @@ impl HubSessionPolicy {
         current.saturating_mul(2).min(self.retry_ceiling)
     }
 }
+/// What one attempt to keep a link up came to, for [`LinkSupervisor::after`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum LinkOutcome {
+    /// The link is up.
+    Up,
+    /// An established link went down.
+    Dropped,
+    /// The hub or the network could not be reached.
+    Failed,
+    /// The hub turned the credentials away ([`ThalovantError::HubRefused`]).
+    Refused,
+    /// The hub's Noise key is not the pinned one
+    /// ([`ThalovantError::HubKeyChanged`]).
+    KeyChanged,
+}
+
+/// What to do after an outcome; see [`LinkSupervisor::after`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LinkDecision {
+    /// The link is up: hold it.
+    Hold,
+    /// Try again after `wait` (zero: at once).
+    Retry {
+        /// How long to wait first.
+        wait: Duration,
+    },
+    /// Stop: retrying cannot help. `reason` is [`LinkOutcome::Refused`] or
+    /// [`LinkOutcome::KeyChanged`].
+    GiveUp {
+        /// Why.
+        reason: LinkOutcome,
+    },
+}
+
+/// How a long-lived link is kept up, as a pure function of what happened and
+/// when. [`HubSession::run`] asks it after every attempt, and every SDK
+/// follows the same rules (`link-keeping-vectors.json`):
+///
+/// - [`LinkOutcome::Up`]: hold, and start the ladder and the refusal clock
+///   afresh;
+/// - [`LinkOutcome::Dropped`]: dial again at once;
+/// - [`LinkOutcome::Failed`]: wait the ladder's step -- `policy.retry`,
+///   doubling to `policy.retry_ceiling` -- and stop counting refusals;
+/// - [`LinkOutcome::Refused`]: a new connection is refused until its hub
+///   admits it, so wait the ladder's step as for a failure, until refusals
+///   have lasted `refusal_grace` since the first of them (inclusive); then
+///   give up;
+/// - [`LinkOutcome::KeyChanged`]: give up at once.
+#[derive(Clone, Debug)]
+pub struct LinkSupervisor {
+    policy: HubSessionPolicy,
+    refusal_grace: Duration,
+    wait: Duration,
+    refused_since: Option<Duration>,
+}
+
+impl LinkSupervisor {
+    /// A supervisor with `policy`'s ladder and `refusal_grace`
+    /// ([`DEFAULT_REFUSAL_GRACE`]).
+    pub fn new(policy: HubSessionPolicy, refusal_grace: Duration) -> Self {
+        Self {
+            policy,
+            refusal_grace,
+            wait: policy.retry,
+            refused_since: None,
+        }
+    }
+
+    /// The decision after `outcome`, observed at `now` (time since any fixed
+    /// point on a monotonic clock).
+    pub fn after(&mut self, outcome: LinkOutcome, now: Duration) -> LinkDecision {
+        match outcome {
+            LinkOutcome::Up => {
+                self.wait = self.policy.retry;
+                self.refused_since = None;
+                return LinkDecision::Hold;
+            }
+            LinkOutcome::Dropped => {
+                return LinkDecision::Retry {
+                    wait: Duration::ZERO,
+                }
+            }
+            LinkOutcome::KeyChanged => {
+                return LinkDecision::GiveUp {
+                    reason: LinkOutcome::KeyChanged,
+                }
+            }
+            LinkOutcome::Refused => {
+                let since = *self.refused_since.get_or_insert(now);
+                if now.saturating_sub(since) >= self.refusal_grace {
+                    return LinkDecision::GiveUp {
+                        reason: LinkOutcome::Refused,
+                    };
+                }
+            }
+            LinkOutcome::Failed => self.refused_since = None,
+        }
+        let wait = self.wait;
+        self.wait = self.policy.next_wait(self.wait);
+        LinkDecision::Retry { wait }
+    }
+}
+
 pub async fn alive(client: &Client) -> bool {
     !matches!(
         client.connection_info().await.phase,
@@ -312,7 +417,8 @@ impl HubSession {
                     match client.connect().await {
                         Ok(()) => Ok(client),
                         Err(error) => {
-                            let refused = client.transport.closed_refused();
+                            let refused = client.transport.closed_refused()
+                                && matches!(error, ThalovantError::Connection(_));
                             let _ = client.close().await;
                             Err(if refused {
                                 ThalovantError::HubRefused(
@@ -655,14 +761,17 @@ impl HubSession {
     }
     /// Stay connected until [`HubSession::close`], by policy.
     ///
-    /// Connects with [`HubSession::connect`]. A held link is watched: a drop
-    /// is noticed as it happens, and the link is also looked at every
-    /// `policy.probe`. After a failed attempt it waits out the retry ladder
-    /// (10 s doubling to 120 s by default) before the next. A hub refusing
-    /// the credentials is retried like any other failure until the refusals
-    /// have lasted the refusal grace ([`DEFAULT_REFUSAL_GRACE`]): a new
-    /// connection is refused until its hub admits it. Then this returns
-    /// [`ThalovantError::HubRefused`].
+    /// Connects with [`HubSession::connect`] and asks a [`LinkSupervisor`]
+    /// what to do after every attempt. A held link is watched: a drop is
+    /// noticed as it happens (and the link is also looked at every
+    /// `policy.probe`), and is dialled again at once. After a failed attempt
+    /// it waits out the retry ladder (10 s doubling to 120 s by default). A
+    /// hub refusing the credentials is retried the same way until the
+    /// refusals have lasted the refusal grace ([`DEFAULT_REFUSAL_GRACE`]): a
+    /// new connection is refused until its hub admits it. Then this returns
+    /// [`ThalovantError::HubRefused`]. A hub whose key is not the pinned one
+    /// ends it at once with [`ThalovantError::HubKeyChanged`]: retrying
+    /// cannot change that.
     ///
     /// Returns `Ok(())` once the session is closed. An identity the client
     /// cannot use at all ([`ThalovantError::MissingIdentityField`],
@@ -670,7 +779,8 @@ impl HubSession {
     /// [`ThalovantError::UnsupportedProtocol`]) ends it at once with that
     /// error; everything else is retried.
     pub async fn run(&self) -> Result<()> {
-        let mut refused_since: Option<tokio::time::Instant> = None;
+        let origin = tokio::time::Instant::now();
+        let mut supervisor = LinkSupervisor::new(self.inner.policy, self.refusal_grace());
         loop {
             let woken = self.inner.wake.notified();
             tokio::pin!(woken);
@@ -681,7 +791,6 @@ impl HubSession {
             let held = self.inner.held.lock().await.client.clone();
             if let Some(client) = held {
                 if alive(&client).await {
-                    refused_since = None;
                     tokio::select! {
                         _ = client.transport.stopped() => {}
                         _ = tokio::time::sleep(self.inner.policy.probe) => {}
@@ -696,24 +805,26 @@ impl HubSession {
                             // A cleanup that fails is retried by the next
                             // attempt, which reports it.
                             let _ = self.drop_client(&mut held).await;
+                            // Dialled again at once.
+                            supervisor.after(LinkOutcome::Dropped, origin.elapsed());
                         }
                     }
                     continue;
                 }
             }
-            // The rung this attempt stands on: a failure waits it out, and
-            // moves the ladder to the next.
-            let wait = self.retry_wait();
-            match self.connect().await {
+            let decision = match self.connect().await {
                 Ok(()) => {
-                    refused_since = None;
+                    supervisor.after(LinkOutcome::Up, origin.elapsed());
                     continue;
                 }
+                Err(error @ ThalovantError::HubKeyChanged(_)) => {
+                    supervisor.after(LinkOutcome::KeyChanged, origin.elapsed());
+                    return Err(error);
+                }
                 Err(error @ ThalovantError::HubRefused(_)) => {
-                    let now = tokio::time::Instant::now();
-                    let since = *refused_since.get_or_insert(now);
-                    if now.duration_since(since) >= self.refusal_grace() {
-                        return Err(error);
+                    match supervisor.after(LinkOutcome::Refused, origin.elapsed()) {
+                        LinkDecision::GiveUp { .. } => return Err(error),
+                        decision => decision,
                     }
                 }
                 Err(
@@ -721,11 +832,15 @@ impl HubSession {
                     | ThalovantError::InvalidIdentity(_)
                     | ThalovantError::UnsupportedProtocol(_)),
                 ) => return Err(error),
-                Err(_) => refused_since = None,
-            }
+                Err(_) => supervisor.after(LinkOutcome::Failed, origin.elapsed()),
+            };
             if self.inner.closed.load(Ordering::Acquire) {
                 return Ok(());
             }
+            let wait = match decision {
+                LinkDecision::Retry { wait } => wait,
+                _ => Duration::ZERO,
+            };
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 _ = &mut woken => {}

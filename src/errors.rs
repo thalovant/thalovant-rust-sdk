@@ -352,11 +352,17 @@ pub enum ThalovantError {
     /// The operation that admits a new connection failed or timed out on the
     /// platform, or the API refused the wait itself.
     ///
-    /// A connection error ([`ThalovantError::is_connection_error`]).
+    /// For a platform failure `error_code` is the operation's own code and
+    /// `status_code` is `None`. For a refusal of the wait `error_code` is
+    /// `None` and the refusal is `status_code` and `problem`, read as any API
+    /// answer is ([`ThalovantError::api_code`], [`ThalovantError::api_detail`]).
+    /// A 401 or 403 is never this: it is returned as the
+    /// [`ThalovantError::ApiResponse`] it is. A connection error
+    /// ([`ThalovantError::is_connection_error`]).
     #[error("admission failed: {reason}")]
     AdmissionFailed {
-        /// The operation's own code, such as `gitops_push_rejected`, or the
-        /// API's code when it refused the wait.
+        /// The operation's own code, such as `gitops_push_rejected`; `None`
+        /// when the API refused the wait instead.
         error_code: Option<String>,
         /// What happened, for display.
         reason: String,
@@ -368,13 +374,34 @@ pub enum ThalovantError {
     },
     /// A hub turned this connection's credentials away.
     ///
-    /// A hub closes the socket right after the handshake, without a status
-    /// or with 1000, 1005 or 1008, when it does not know the connection's key
-    /// -- or does not know it yet: a connection just created is refused until
-    /// its hub has admitted it. A connection error
-    /// ([`ThalovantError::is_connection_error`]).
+    /// A hub closes the socket during the handshake or within 750 ms after
+    /// it, without a status or with 1000, 1005 or 1008, when it does not know
+    /// the connection's key -- or does not know it yet: a connection just
+    /// created is refused until its hub has admitted it. A handshake message
+    /// that does not authenticate under the key the password derives (a wrong
+    /// password), and a WebSocket upgrade answered 401 or 403, are refusals
+    /// too; see [`close_refuses`](crate::transport::close_refuses). A
+    /// connection error ([`ThalovantError::is_connection_error`]).
     #[error("hub refused: {0}")]
     HubRefused(String),
+    /// The hub's Noise static key is not the one pinned for it.
+    ///
+    /// The hub was reinstalled or replaced -- or another machine is answering
+    /// at its address. Retrying cannot change that, so
+    /// [`HubSession::run`](crate::HubSession::run) stops at once. The SDK
+    /// never replaces a pin itself: if the hub really was replaced, drop the
+    /// stale pin with [`forget_noise_pin`](crate::forget_noise_pin) and
+    /// connect again. A connection error
+    /// ([`ThalovantError::is_connection_error`]), not a refusal.
+    #[error("hub key changed: {0}")]
+    HubKeyChanged(String),
+    /// The control-plane API could not be reached at all: DNS, the
+    /// connection, TLS, a proxy, or the request's own timeout. The API never
+    /// answered, so there is no status and no problem. A connection error
+    /// ([`ThalovantError::is_connection_error`]): trying again later can
+    /// work, which is not true of an answer from the API.
+    #[error("api error: could not reach the Thalovant API: {0}")]
+    ApiUnreachable(String),
     #[error("unsupported protocol: {0}")]
     UnsupportedProtocol(String),
     #[error("crypto error: {0}")]
@@ -515,13 +542,16 @@ impl ThalovantError {
     }
 
     /// Whether this is a connection error: [`ThalovantError::Connection`],
-    /// [`ThalovantError::HubRefused`], [`ThalovantError::AdmissionTimeout`] or
-    /// [`ThalovantError::AdmissionFailed`].
+    /// [`ThalovantError::HubRefused`], [`ThalovantError::HubKeyChanged`],
+    /// [`ThalovantError::ApiUnreachable`], [`ThalovantError::AdmissionTimeout`]
+    /// or [`ThalovantError::AdmissionFailed`].
     pub fn is_connection_error(&self) -> bool {
         matches!(
             self,
             Self::Connection(_)
                 | Self::HubRefused(_)
+                | Self::HubKeyChanged(_)
+                | Self::ApiUnreachable(_)
                 | Self::AdmissionTimeout { .. }
                 | Self::AdmissionFailed { .. }
         )

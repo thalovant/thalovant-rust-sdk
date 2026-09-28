@@ -1890,21 +1890,29 @@ impl ControlPlane {
     /// - `ready` returns; so does no operation at all, and one the API no
     ///   longer tracks (HTTP 404), at once;
     /// - `failed` and `timed_out` fail with [`ThalovantError::AdmissionFailed`]
-    ///   carrying the operation's `error_code`, and so does any other refusal
-    ///   of the wait, carrying what the API said; a 5xx is ridden out;
-    /// - a 429 is ridden out too: the next poll waits the problem's
-    ///   `retry_after_seconds` (at its top, or inside a `detail` object), or
-    ///   `poll_interval` when that is longer, and a 429 asking for longer than
-    ///   is left is [`ThalovantError::AdmissionTimeout`] at once;
-    /// - when `timeout` passes first, [`ThalovantError::AdmissionTimeout`],
-    ///   which is both a connection error and a timeout: the connection may
-    ///   still be admitted later.
+    ///   carrying the operation's `error_code` and no status;
+    /// - a 401 or 403 is the token, not the connection: it is returned as the
+    ///   [`ThalovantError::ApiResponse`] it is ([`ThalovantError::api_refusal`]
+    ///   says `Auth`), never a failed admission;
+    /// - any other refusal of the wait itself is
+    ///   [`ThalovantError::AdmissionFailed`] with no `error_code`, keeping its
+    ///   status and problem ([`ThalovantError::api_code`],
+    ///   [`ThalovantError::api_detail`]);
+    /// - a 5xx is ridden out, and so is a 429: the next poll waits the
+    ///   problem's `retry_after_seconds` (at its top, or inside a `detail`
+    ///   object), else the `Retry-After` header, else `RateLimit-Reset`, or
+    ///   `poll_interval` when that is longer; a 429 asking for longer than is
+    ///   left is [`ThalovantError::AdmissionTimeout`] at once;
+    /// - when `timeout` passes first -- every read is bounded by it --
+    ///   [`ThalovantError::AdmissionTimeout`], which is both a connection
+    ///   error and a timeout: the hub may still admit the connection later.
     ///
     /// An operation whose `links.self` is an absolute URL on another origin
-    /// than this control plane's fails with [`ThalovantError::Api`] and is
-    /// never fetched, because the token goes nowhere else. Anything that is
-    /// not an answer from the API -- no token, the API unreachable -- is
-    /// returned as it is.
+    /// than this control plane's -- scheme, host and port, with default ports
+    /// spelled out -- fails with [`ThalovantError::Api`] and is never
+    /// fetched, because the token goes nowhere else. An API out of reach is
+    /// [`ThalovantError::ApiUnreachable`], returned as it is, and so is any
+    /// other error that is not an answer from the API, such as no token.
     pub async fn wait_for_admission(
         &self,
         operation: Option<&OperationResource>,
@@ -1950,8 +1958,10 @@ impl ControlPlane {
         let timed_out = || ThalovantError::AdmissionTimeout { timeout };
         loop {
             let mut wait = poll_interval;
-            let polled =
-                tokio::time::timeout_at(deadline, self.request("GET", &path, None, None, true))
+            // Every read is bounded by what is left of the wait: a read the
+            // API is slow to answer must not carry the wait past it.
+            let (polled, asked) =
+                tokio::time::timeout_at(deadline, self.get_with_retry_after(&path))
                     .await
                     .map_err(|_| timed_out())?;
             match polled {
@@ -1984,15 +1994,14 @@ impl ControlPlane {
                 },
                 Err(error) => match error.status_code() {
                     Some(404) => return Ok(()),
+                    // The token, not the connection: signing in again fixes
+                    // it, so it is the API's own answer, unchanged.
+                    Some(401 | 403) => return Err(error),
                     Some(429) => {
                         // A Free plan allows 60 requests a minute, and a wait
                         // must not end over one of them: wait what the API
                         // asks, never less than the poll interval.
-                        let asked = error
-                            .api_problem()
-                            .and_then(retry_after)
-                            .unwrap_or_default();
-                        wait = poll_interval.max(asked);
+                        wait = poll_interval.max(asked.unwrap_or_default());
                         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                         if wait > left {
                             // Waiting it out would only end in the same
@@ -2003,7 +2012,7 @@ impl ControlPlane {
                     Some(status) if status >= 500 => {}
                     Some(status) => {
                         return Err(ThalovantError::AdmissionFailed {
-                            error_code: error.api_code().map(str::to_string),
+                            error_code: None,
                             reason: format!(
                                 "the API refused the wait for the connection's admission (HTTP {status})"
                             ),
@@ -2011,6 +2020,8 @@ impl ControlPlane {
                             problem: error.api_problem().cloned().map(Box::new),
                         })
                     }
+                    // Not an answer from the API -- it is out of reach, or no
+                    // request could be made: as it is, never a failed admission.
                     None => return Err(error),
                 },
             }
@@ -2050,17 +2061,34 @@ impl ControlPlane {
         auth: bool,
     ) -> Result<Value> {
         let (status, body) = self.send_request(method, path, body, headers, auth).await?;
-        if !status.is_success() {
-            return Err(api_response_error(status, &body));
+        answer_value(status, &body)
+    }
+
+    /// An authenticated GET, and how long a refusal of it asked the caller to
+    /// wait: the problem's `retry_after_seconds` (at its top or inside a
+    /// `detail` object), else the `Retry-After` header, else
+    /// `RateLimit-Reset`. The API's own rate limiter answers a 429 in plain
+    /// text with only the `RateLimit-*` headers, so the headers are the only
+    /// place that says it.
+    async fn get_with_retry_after(&self, path: &str) -> (Result<Value>, Option<Duration>) {
+        match self.send_request_with_wait(path).await {
+            Err(error) => (Err(error), None),
+            Ok((status, body, header_wait)) => {
+                let answer = answer_value(status, &body);
+                let wait = answer
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.api_problem().and_then(retry_after).or(header_wait));
+                (answer, wait)
+            }
         }
-        if body.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_str::<Value>(&body).map_err(|_| ThalovantError::ApiResponse {
-            status_code: status.as_u16(),
-            detail: "invalid JSON response".into(),
-            problem: None,
-        })
+    }
+
+    async fn send_request_with_wait(
+        &self,
+        path: &str,
+    ) -> Result<(reqwest::StatusCode, String, Option<Duration>)> {
+        self.send_request_full("GET", path, None, None, true).await
     }
 
     async fn send_request(
@@ -2071,6 +2099,19 @@ impl ControlPlane {
         headers: Option<HeaderMap>,
         auth: bool,
     ) -> Result<(reqwest::StatusCode, String)> {
+        self.send_request_full(method, path, body, headers, auth)
+            .await
+            .map(|(status, body, _)| (status, body))
+    }
+
+    async fn send_request_full(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: Option<HeaderMap>,
+        auth: bool,
+    ) -> Result<(reqwest::StatusCode, String, Option<Duration>)> {
         let url = format!("{}{}", self.api_url, path.trim_start_matches('/'));
         let url = validate_control_request_url(&url, auth || body.is_some())?;
         let mut request_headers = HeaderMap::new();
@@ -2107,11 +2148,9 @@ impl ControlPlane {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|err| ThalovantError::Api(err.without_url().to_string()))?;
+        let response = request.send().await.map_err(unreachable)?;
         let status = response.status();
+        let header_wait = header_retry_after(response.headers());
         if status.is_redirection() {
             return Err(ThalovantError::ApiResponse {
                 status_code: status.as_u16(),
@@ -2120,10 +2159,7 @@ impl ControlPlane {
             });
         }
         let body = if status.is_success() {
-            response
-                .text()
-                .await
-                .map_err(|err| ThalovantError::Api(err.without_url().to_string()))?
+            response.text().await.map_err(unreachable)?
         } else {
             // UTF-8 whatever the Content-Type says: the API sends
             // `application/problem+json` with no charset, and every SDK has
@@ -2132,8 +2168,52 @@ impl ControlPlane {
             let text = String::from_utf8_lossy(&bytes);
             text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()
         };
-        Ok((status, body))
+        Ok((status, body, header_wait))
     }
+}
+
+/// The error for a request the API never answered: [`ThalovantError::ApiUnreachable`],
+/// with the request URL stripped, since an error chain can carry it. A
+/// request that could not even be formed stays [`ThalovantError::Api`]:
+/// trying again will not help it.
+fn unreachable(error: reqwest::Error) -> ThalovantError {
+    let builder = error.is_builder();
+    let message = error.without_url().to_string();
+    if builder {
+        ThalovantError::Api(message)
+    } else {
+        ThalovantError::ApiUnreachable(message)
+    }
+}
+
+/// A successful answer's body as JSON (`Null` when empty), or the error an
+/// unsuccessful one is.
+fn answer_value(status: reqwest::StatusCode, body: &str) -> Result<Value> {
+    if !status.is_success() {
+        return Err(api_response_error(status, body));
+    }
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str::<Value>(body).map_err(|_| ThalovantError::ApiResponse {
+        status_code: status.as_u16(),
+        detail: "invalid JSON response".into(),
+        problem: None,
+    })
+}
+
+/// `Retry-After` in whole seconds, else `RateLimit-Reset` (seconds until the
+/// window resets). An HTTP-date `Retry-After` is not read.
+fn header_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    ["retry-after", "ratelimit-reset"]
+        .into_iter()
+        .find_map(|name| {
+            let value = headers.get(name)?.to_str().ok()?.trim();
+            (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+                .map(Duration::from_secs)
+        })
 }
 
 fn validate_control_request_url(raw: &str, sensitive: bool) -> Result<url::Url> {

@@ -49,9 +49,9 @@ pub use events::{
 // `ERROR_CODES` and `RESPONSE_TYPES` stay in `home`: at the crate root they
 // would read as API error codes, which they are not.
 pub use home::{
-    answer_home_request, answer_home_requests, home_response, plain_speech, HomeAnswer,
-    HomeRequest, HomeRequestSubscription, Replier, DEFAULT_HOME_HANDLER_TIMEOUT, HOME_REQUEST,
-    HOME_REQUEST_TIMEOUT, HOME_RESPONSE,
+    answer_home_request, answer_home_request_within, answer_home_requests, decode_references,
+    home_response, plain_speech, HomeAnswer, HomeRequest, HomeRequestSubscription, Replier,
+    DEFAULT_HOME_HANDLER_TIMEOUT, HOME_REQUEST, HOME_REQUEST_TIMEOUT, HOME_RESPONSE,
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use intents::{
@@ -76,8 +76,9 @@ pub use protocols::{
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
 pub use stream::{EventPredicate, EventStream, ListenOptions};
 pub use transport::{
-    mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport, RuntimeTransport,
-    TransportConnectionInfo, TransportConnectionPhase, TransportHealth, WssTransport,
+    close_refuses, mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport,
+    RuntimeTransport, TransportConnectionInfo, TransportConnectionPhase, TransportHealth,
+    WssTransport, CLOSE_CODE_GRACE, REFUSAL_CLOSE_CODES, REFUSAL_SETTLE,
 };
 pub use wire::{decode_hive_binary_frame, encode_hive_binary_frame};
 
@@ -96,6 +97,7 @@ pub use inventory::{
 };
 pub mod session;
 pub use session::{
-    hub_hostname, HandlerId, HubSession, HubSessionEvent, HubSessionPolicy, OriginAttempt,
-    OriginPreference, DEFAULT_REFUSAL_GRACE, DEFAULT_SETTLE_WINDOW,
+    hub_hostname, HandlerId, HubSession, HubSessionEvent, HubSessionPolicy, LinkDecision,
+    LinkOutcome, LinkSupervisor, OriginAttempt, OriginPreference, DEFAULT_REFUSAL_GRACE,
+    DEFAULT_SETTLE_WINDOW,
 };

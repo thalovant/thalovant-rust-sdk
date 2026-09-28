@@ -997,12 +997,17 @@ control
     .await?;
 ```
 
-`ThalovantError::AdmissionFailed` carries the operation's `error_code`.
+`ThalovantError::AdmissionFailed` carries the operation's `error_code` when
+the platform gave up on it, and the status, code and detail when the API
+refused the wait itself. A 401 or 403 is the token, not the connection: it
+comes back as the `ApiResponse` it is, and `api_refusal()` says `Auth`.
 `ThalovantError::AdmissionTimeout` is both `is_timeout()` and
 `is_connection_error()`: the connection exists and may still be admitted, so
 connecting later can work. A 5xx is ridden out, and so is a 429: the wait
-pauses for the `retry_after_seconds` the API names, and ends as a timeout at
-once when that is longer than the time left. The wait follows the operation's
+pauses for what the API asks (`retry_after_seconds` in the body, else the
+`Retry-After` or `RateLimit-Reset` header), and ends as a timeout at once when
+that is longer than the time left. An API out of reach is
+`ThalovantError::ApiUnreachable`. The wait follows the operation's
 `links.self` only on the API's own origin.
 
 ### 4. Answer the hub's requests
@@ -1028,27 +1033,39 @@ let answering = answer_home_requests(
 session.run().await?; // until session.close()
 ```
 
-Every request gets exactly one response, sent as a reply: the request's
-context with `source` and `destination` turned round, so it goes back the way
-it came. `speech` is sent as plain text, with markup removed and character
-references decoded. When the handler cannot answer, the SDK answers for it
-with empty speech and a code, and the hub speaks its own sentence in the
-device's language: `failed_to_handle` when the handler returns an error or
-panics, `timeout` when it takes longer than the timeout (nine seconds, inside
-the hub's ten), and `unknown` when it answers with a type or code outside
-`home::RESPONSE_TYPES` and `home::ERROR_CODES`. A request's `conversation_id` is echoed
-when the answer sets none. Drop `answering`, or call `answering.stop()`, to
-stop.
+Every request gets one response, sent as a reply: the request's context with
+`source` and `destination` turned round, so it goes back the way it came.
+The hub gives up after ten seconds, so everything happens inside them, counted
+from the request's arrival. The handler runs on a task of its own and gets
+nine seconds, or what is left of the ten when that is less; when it runs out
+the SDK answers `timeout` at once and leaves the handler to finish on its own.
+The reply gets what is left after that, and one that would arrive after the
+hub gave up is not sent. `speech` is sent as plain text: tags, comments and
+processing instructions removed (a `<` that does not open a tag stays, so
+"5 < 6" survives), numeric references, the five XML entities and `&nbsp;`
+decoded, and white space collapsed. When the handler cannot answer, the SDK
+answers for it with empty speech and a code, and the hub speaks its own
+sentence in the device's language: `failed_to_handle` when the handler returns
+an error or panics, `timeout` when it is too slow, and `unknown` when it
+answers with a type or code outside `home::RESPONSE_TYPES` and
+`home::ERROR_CODES`. A request's `conversation_id` is echoed when the answer
+sets none. Drop `answering`, or call `answering.stop()`, to stop.
 
 `run()` keeps the link until `close()`. It notices a drop as it happens and
-reconnects on the retry ladder (10 seconds, doubling to 120). A new link only
-counts once it has stayed up for 0.75 seconds, because a hub that does not
-know the connection's key says so only by closing right after the handshake.
-Such a refusal is expected while a new connection waits to be admitted, so
-`run()` keeps trying for ten minutes before it returns
-`ThalovantError::HubRefused`. `session.on(event_type, handler)` handles any
-other message type the same way, on every client the session builds, and
-`session.reply(&event, msg_type, data)` answers one yourself.
+dials again at once; after a failed attempt it waits the retry ladder (10
+seconds, doubling to 120). A hub that does not know the connection's key says
+so by closing during the handshake or right after it, with no status, 1000 or
+1008, and a wrong password shows as a handshake message that does not
+authenticate: both are `ThalovantError::HubRefused`, and a new link only counts
+once it has stayed up for 0.75 seconds. Such a refusal is expected while a new
+connection waits to be admitted, so `run()` keeps trying for ten minutes
+before it returns it. A hub whose Noise key is not the one pinned for it is
+`ThalovantError::HubKeyChanged`, and `run()` stops at once: if the hub really
+was replaced, drop the stale pin with `forget_noise_pin` and connect again.
+`LinkSupervisor` holds these rules as a pure function, for an application that
+runs its own loop. `session.on(event_type, handler)` handles any other message
+type on every client the session builds, and `session.reply(&event, msg_type,
+data)` answers one yourself.
 
 ## API Shape
 
@@ -1119,7 +1136,8 @@ other message type the same way, on every client the session builds, and
 - `error.api_refusal()` (`ApiRefusal`), `error.linked_client_id()`, `error.is_timeout()`, `error.is_connection_error()`
 - `client.reply(&event, msg_type, data)`, `reply_context(&context)`
 - `HubSession::for_identity(identity, policy)`, `session.connect()`, `session.run()`, `session.on(event_type, handler)`, `session.off(id)`, `session.on_state_change(callback)`, `session.reply(&event, msg_type, data)`
-- `answer_home_requests(&session, handler, timeout)`, `answer_home_request(&replier, &event, handler, timeout)`, `home_response(&request, answer)`, `plain_speech(text)`; see [Home Assistant Link](#home-assistant-link)
+- `answer_home_requests(&session, handler, timeout)`, `answer_home_request(&replier, &event, handler, timeout)`, `answer_home_request_within(&replier, &event, handler, timeout, hub_timeout)`, `home_response(&request, answer)`, `plain_speech(text)`, `decode_references(text)`; see [Home Assistant Link](#home-assistant-link)
+- `LinkSupervisor::new(policy, refusal_grace)`, `supervisor.after(outcome, now)` (`LinkOutcome`, `LinkDecision`); `close_refuses(code, closed_after_handshake, code_late)`
 
 ## Development
 

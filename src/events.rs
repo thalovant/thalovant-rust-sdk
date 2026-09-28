@@ -161,8 +161,9 @@ pub fn merge_context(base: Option<&Context>, extra: Option<&Context>) -> Context
 /// everything else it said, with the routing turned round: the reply goes to
 /// whoever sent the request (`destination` becomes the old `source`) and
 /// comes from whoever it was sent to (`source` becomes the old `destination`,
-/// its first entry when that is a list). A key that is absent, or `null`,
-/// stays as it was. A hub uses this to route the answer back to the peer
+/// its first entry when that is a list). A context with a destination and no
+/// source gives a reply with no destination at all. A key that is absent, or
+/// `null`, stays as it was otherwise. A hub uses this to route the answer back to the peer
 /// that asked, across bridges.
 ///
 /// Build it from the context as the hub sent it: [`Event::context`] is that
@@ -180,6 +181,12 @@ pub fn reply_context(context: &Context) -> Context {
     }
     if let Some(source) = source {
         swapped.insert("destination".to_string(), source.clone());
+    } else if destination.is_some() {
+        // Nobody to send it back to: the request said who it was for but not
+        // who sent it. Keeping the old destination would address the reply
+        // to its own sender, so it carries none, and the hub routes it as it
+        // routes any message without one.
+        swapped.remove("destination");
     }
     swapped
 }
