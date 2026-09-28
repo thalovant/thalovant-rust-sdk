@@ -733,6 +733,12 @@ impl ControlPlane {
     /// answer (404 for one it does not know, 401) is returned as usual.
     /// Without a `token_id` and with no token of its own to revoke, fails
     /// with [`ThalovantError::Api`].
+    ///
+    /// It takes `&mut self`, as every sign-in does, so no sign-in on this
+    /// control plane can run while the revoke is in flight: the token it
+    /// forgets is always the one it revoked, never one a sign-in stored
+    /// meanwhile. Share a control plane between tasks behind a lock, or give
+    /// each task a clone, which holds its own token.
     pub async fn revoke_api_token(&mut self, token_id: Option<&str>) -> Result<()> {
         let target = token_id
             .filter(|id| !id.is_empty())
@@ -1910,9 +1916,11 @@ impl ControlPlane {
     /// An operation whose `links.self` is an absolute URL on another origin
     /// than this control plane's -- scheme, host and port, with default ports
     /// spelled out -- fails with [`ThalovantError::Api`] and is never
-    /// fetched, because the token goes nowhere else. An API out of reach is
-    /// [`ThalovantError::ApiUnreachable`], returned as it is, and so is any
-    /// other error that is not an answer from the API, such as no token.
+    /// fetched, because the token goes nowhere else. An API out of reach
+    /// (the [`ThalovantError::Api`] that
+    /// [`ThalovantError::is_api_unreachable`] is true for) is returned as it
+    /// is, and so is any other error that is not an answer from the API,
+    /// such as no token.
     pub async fn wait_for_admission(
         &self,
         operation: Option<&OperationResource>,
@@ -2172,17 +2180,18 @@ impl ControlPlane {
     }
 }
 
-/// The error for a request the API never answered: [`ThalovantError::ApiUnreachable`],
-/// with the request URL stripped, since an error chain can carry it. A
-/// request that could not even be formed stays [`ThalovantError::Api`]:
-/// trying again will not help it.
+/// The error for a request the API never answered: an
+/// [`ThalovantError::Api`] that [`ThalovantError::is_api_unreachable`] is
+/// true for, with the request URL stripped, since an error chain can carry
+/// it. A request that could not even be formed is a plain
+/// [`ThalovantError::Api`]: trying again will not help it.
 fn unreachable(error: reqwest::Error) -> ThalovantError {
     let builder = error.is_builder();
     let message = error.without_url().to_string();
     if builder {
         ThalovantError::Api(message)
     } else {
-        ThalovantError::ApiUnreachable(message)
+        ThalovantError::api_unreachable(message)
     }
 }
 

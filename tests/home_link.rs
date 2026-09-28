@@ -632,7 +632,9 @@ async fn admission_case(case: &Value) -> (Value, ScriptedApi) {
             produced.insert("polls".to_string(), json!(polls));
             Value::Object(produced)
         }
-        Err(ThalovantError::ApiUnreachable(_)) => json!({"outcome": "unreachable", "polls": polls}),
+        Err(error) if error.is_api_unreachable() => {
+            json!({"outcome": "unreachable", "polls": polls})
+        }
         Err(error @ ThalovantError::ApiResponse { .. })
             if error.api_refusal() == Some(ApiRefusal::Auth) =>
         {
@@ -1090,12 +1092,46 @@ async fn an_api_out_of_reach_is_told_apart_from_an_answer() {
         Some("synthetic-token".to_string()),
     );
     let error = control.get_hub("hub-1").await.expect_err("nothing listens");
+    // Still the Api error it has always been, so an old match catches it.
     assert!(
-        matches!(error, ThalovantError::ApiUnreachable(_)),
+        matches!(error, ThalovantError::Api(_)) && error.is_api_unreachable(),
         "{error:?}"
     );
     assert!(error.is_connection_error());
     assert_eq!(error.status_code(), None);
     assert!(error.api_problem().is_none());
     assert!(!error.to_string().contains("synthetic-token"));
+}
+
+#[tokio::test]
+async fn a_device_token_answer_that_is_no_object_carries_no_status() {
+    // A 2xx is not a refusal: an answer that is not the token object is an
+    // error of its own, with no status or problem to read as the API's.
+    for body in ["[1, 2]", "\"token\"", "not json"] {
+        let api = ScriptedApi::start(&json!([exchange(
+            "POST",
+            "/v1/auth/device/token",
+            200,
+            body
+        )]))
+        .await;
+        let mut control = ControlPlane::new(api.url.clone(), None);
+        let grant = DeviceAuthorization {
+            device_code: "dc".to_string(),
+            user_code: String::new(),
+            verification_uri: "https://x".to_string(),
+            verification_uri_complete: None,
+            expires_in: None,
+            interval: Some(5),
+            raw: Map::new(),
+        };
+        let error = control
+            .poll_device_login(&grant)
+            .await
+            .expect_err("not a token");
+        assert_eq!(error.status_code(), None, "{body}: {error:?}");
+        assert!(error.api_problem().is_none(), "{body}: {error:?}");
+        assert!(control.access_token.is_none() && control.token_id().is_none());
+        api.finish(body);
+    }
 }

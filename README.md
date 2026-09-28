@@ -1006,9 +1006,9 @@ comes back as the `ApiResponse` it is, and `api_refusal()` says `Auth`.
 connecting later can work. A 5xx is ridden out, and so is a 429: the wait
 pauses for what the API asks (`retry_after_seconds` in the body, else the
 `Retry-After` or `RateLimit-Reset` header), and ends as a timeout at once when
-that is longer than the time left. An API out of reach is
-`ThalovantError::ApiUnreachable`. The wait follows the operation's
-`links.self` only on the API's own origin.
+that is longer than the time left. An API out of reach is returned as it is,
+a `ThalovantError::Api` that `is_api_unreachable()` says so for. The wait
+follows the operation's `links.self` only on the API's own origin.
 
 ### 4. Answer the hub's requests
 
@@ -1056,12 +1056,14 @@ dials again at once; after a failed attempt it waits the retry ladder (10
 seconds, doubling to 120). A hub that does not know the connection's key says
 so by closing during the handshake or right after it, with no status, 1000 or
 1008, and a wrong password shows as a handshake message that does not
-authenticate: both are `ThalovantError::HubRefused`, and a new link only counts
-once it has stayed up for 0.75 seconds. Such a refusal is expected while a new
-connection waits to be admitted, so `run()` keeps trying for ten minutes
-before it returns it. A hub whose Noise key is not the one pinned for it is
-`ThalovantError::HubKeyChanged`, and `run()` stops at once: if the hub really
-was replaced, drop the stale pin with `forget_noise_pin` and connect again.
+authenticate: both are a `ThalovantError::Connection` that `is_hub_refused()`
+is true for, and a new link only counts once it has stayed up for 0.75
+seconds. Such a refusal is expected while a new connection waits to be
+admitted, so `run()` keeps trying for ten minutes before it returns it. A hub
+whose Noise key is not the one pinned for it is a `Connection` error that
+`is_hub_key_changed()` is true for, and `run()` stops at once: if the hub
+really was replaced, drop the stale pin with `forget_noise_pin` and connect
+again.
 `LinkSupervisor` holds these rules as a pure function, for an application that
 runs its own loop. `session.on(event_type, handler)` handles any other message
 type on every client the session builds, and `session.reply(&event, msg_type,

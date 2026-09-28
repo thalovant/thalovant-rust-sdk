@@ -372,36 +372,6 @@ pub enum ThalovantError {
         /// The body of that refusal, when it was a JSON object.
         problem: Option<Box<ApiProblem>>,
     },
-    /// A hub turned this connection's credentials away.
-    ///
-    /// A hub closes the socket during the handshake or within 750 ms after
-    /// it, without a status or with 1000, 1005 or 1008, when it does not know
-    /// the connection's key -- or does not know it yet: a connection just
-    /// created is refused until its hub has admitted it. A handshake message
-    /// that does not authenticate under the key the password derives (a wrong
-    /// password), and a WebSocket upgrade answered 401 or 403, are refusals
-    /// too; see [`close_refuses`](crate::transport::close_refuses). A
-    /// connection error ([`ThalovantError::is_connection_error`]).
-    #[error("hub refused: {0}")]
-    HubRefused(String),
-    /// The hub's Noise static key is not the one pinned for it.
-    ///
-    /// The hub was reinstalled or replaced -- or another machine is answering
-    /// at its address. Retrying cannot change that, so
-    /// [`HubSession::run`](crate::HubSession::run) stops at once. The SDK
-    /// never replaces a pin itself: if the hub really was replaced, drop the
-    /// stale pin with [`forget_noise_pin`](crate::forget_noise_pin) and
-    /// connect again. A connection error
-    /// ([`ThalovantError::is_connection_error`]), not a refusal.
-    #[error("hub key changed: {0}")]
-    HubKeyChanged(String),
-    /// The control-plane API could not be reached at all: DNS, the
-    /// connection, TLS, a proxy, or the request's own timeout. The API never
-    /// answered, so there is no status and no problem. A connection error
-    /// ([`ThalovantError::is_connection_error`]): trying again later can
-    /// work, which is not true of an answer from the API.
-    #[error("api error: could not reach the Thalovant API: {0}")]
-    ApiUnreachable(String),
     #[error("unsupported protocol: {0}")]
     UnsupportedProtocol(String),
     #[error("crypto error: {0}")]
@@ -430,6 +400,19 @@ impl From<reqwest::Error> for ThalovantError {
         ThalovantError::Http(error.without_url())
     }
 }
+
+/// How a [`ThalovantError::Connection`] that is a refusal of the credentials
+/// begins. The finer kinds of connection and API failure ride in the message
+/// of the variant they have always been reported as, rather than in variants
+/// of their own, so that a caller matching `Connection(_)` or `Api(_)` keeps
+/// catching them; the `is_*` methods read them back. Every one is built by
+/// the constructors below, and nothing else in the crate begins a message
+/// with these words.
+const HUB_REFUSED: &str = "the hub refused this connection's credentials";
+/// How a [`ThalovantError::Connection`] for a changed hub key begins.
+const HUB_KEY_CHANGED: &str = "the hub's Noise key is not the one pinned for it";
+/// How a [`ThalovantError::Api`] for an API out of reach begins.
+const API_UNREACHABLE: &str = "could not reach the Thalovant API";
 
 impl ThalovantError {
     /// The HTTP status of an error the API answered with.
@@ -541,20 +524,90 @@ impl ThalovantError {
         matches!(self, Self::Timeout(_) | Self::AdmissionTimeout { .. })
     }
 
-    /// Whether this is a connection error: [`ThalovantError::Connection`],
-    /// [`ThalovantError::HubRefused`], [`ThalovantError::HubKeyChanged`],
-    /// [`ThalovantError::ApiUnreachable`], [`ThalovantError::AdmissionTimeout`]
-    /// or [`ThalovantError::AdmissionFailed`].
+    /// Whether this is a connection error: [`ThalovantError::Connection`]
+    /// (a hub that refused the credentials or whose key changed among them),
+    /// a control-plane API out of reach ([`ThalovantError::is_api_unreachable`]),
+    /// [`ThalovantError::AdmissionTimeout`] or
+    /// [`ThalovantError::AdmissionFailed`].
     pub fn is_connection_error(&self) -> bool {
         matches!(
             self,
-            Self::Connection(_)
-                | Self::HubRefused(_)
-                | Self::HubKeyChanged(_)
-                | Self::ApiUnreachable(_)
-                | Self::AdmissionTimeout { .. }
-                | Self::AdmissionFailed { .. }
-        )
+            Self::Connection(_) | Self::AdmissionTimeout { .. } | Self::AdmissionFailed { .. }
+        ) || self.is_api_unreachable()
+    }
+
+    /// Whether a hub turned this connection's credentials away.
+    ///
+    /// A hub closes the socket during the handshake or within 750 ms after
+    /// it, without a status or with 1000, 1005 or 1008, when it does not know
+    /// the connection's key -- or does not know it yet: a connection just
+    /// created is refused until its hub has admitted it. A handshake message
+    /// that does not authenticate under the key the password derives (a wrong
+    /// password), and a WebSocket upgrade or an HTTP request answered 401 or
+    /// 403, are refusals too; see
+    /// [`close_refuses`](crate::transport::close_refuses).
+    ///
+    /// The error is the [`ThalovantError::Connection`] a failed connect has
+    /// always been, so a match on that variant still catches it; this says
+    /// which kind of connection error it is.
+    pub fn is_hub_refused(&self) -> bool {
+        matches!(self, Self::Connection(message) if message.starts_with(HUB_REFUSED))
+    }
+
+    /// Whether the hub's Noise static key is not the one pinned for it.
+    ///
+    /// The hub was reinstalled or replaced -- or another machine is answering
+    /// at its address. Retrying cannot change that, so
+    /// [`HubSession::run`](crate::HubSession::run) stops at once. The SDK
+    /// never replaces a pin itself: if the hub really was replaced, drop the
+    /// stale pin with [`forget_noise_pin`](crate::forget_noise_pin) and
+    /// connect again. Not a refusal.
+    ///
+    /// Like [`ThalovantError::is_hub_refused`], the error is the
+    /// [`ThalovantError::Connection`] it has always been.
+    pub fn is_hub_key_changed(&self) -> bool {
+        matches!(self, Self::Connection(message) if message.starts_with(HUB_KEY_CHANGED))
+    }
+
+    /// Whether a control-plane request never got an answer: DNS, the
+    /// connection, TLS, a proxy, or the request's own timeout. There is no
+    /// status and no problem, and trying again later can work, which is not
+    /// true of an answer from the API.
+    ///
+    /// The error is the [`ThalovantError::Api`] such a failure has always
+    /// been, so a match on that variant still catches it.
+    pub fn is_api_unreachable(&self) -> bool {
+        matches!(self, Self::Api(message) if message.starts_with(API_UNREACHABLE))
+    }
+
+    /// A refusal of the credentials by the hub: a
+    /// [`ThalovantError::Connection`] that
+    /// [`ThalovantError::is_hub_refused`] answers true for.
+    pub(crate) fn hub_refused(detail: impl fmt::Display) -> Self {
+        Self::Connection(format!("{HUB_REFUSED}: {detail}"))
+    }
+
+    /// A hub whose key is not the pinned one: a
+    /// [`ThalovantError::Connection`] that
+    /// [`ThalovantError::is_hub_key_changed`] answers true for.
+    pub(crate) fn hub_key_changed(detail: impl fmt::Display) -> Self {
+        Self::Connection(format!("{HUB_KEY_CHANGED}: {detail}"))
+    }
+
+    /// The message of a [`ThalovantError::Connection`], for a verdict kept
+    /// to rebuild the same error later.
+    pub(crate) fn into_connection_message(self) -> String {
+        match self {
+            Self::Connection(message) => message,
+            other => other.to_string(),
+        }
+    }
+
+    /// A control-plane request that never got an answer: a
+    /// [`ThalovantError::Api`] that [`ThalovantError::is_api_unreachable`]
+    /// answers true for.
+    pub(crate) fn api_unreachable(detail: impl fmt::Display) -> Self {
+        Self::Api(format!("{API_UNREACHABLE}: {detail}"))
     }
 
     /// The API's machine-readable code, such as `platform_image_required` or

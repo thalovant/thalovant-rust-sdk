@@ -153,8 +153,12 @@ impl ConnectionControl {
     /// was a KK attempt that did not authenticate.
     fn note_failure(&self, error: &ThalovantError, channel: Option<&NoiseChannel>) {
         let verdict = match error {
-            ThalovantError::HubRefused(message) => HandshakeVerdict::Refused(message.clone()),
-            ThalovantError::HubKeyChanged(message) => HandshakeVerdict::KeyChanged(message.clone()),
+            ThalovantError::Connection(message) if error.is_hub_refused() => {
+                HandshakeVerdict::Refused(message.clone())
+            }
+            ThalovantError::Connection(message) if error.is_hub_key_changed() => {
+                HandshakeVerdict::KeyChanged(message.clone())
+            }
             _ => return,
         };
         *self
@@ -174,7 +178,10 @@ impl ConnectionControl {
             .verdict
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HandshakeVerdict::Refused(
-            format!("the hub closed the link during the handshake (code {code}): it does not accept these credentials, or not yet"),
+            ThalovantError::hub_refused(format!(
+                "the hub closed the link during the handshake (code {code}): it does not accept these credentials, or not yet"
+            ))
+            .into_connection_message(),
         ));
         if kk_pending {
             self.kk_failed.store(true, Ordering::Release);
@@ -190,8 +197,11 @@ impl ConnectionControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
         {
-            Some(HandshakeVerdict::Refused(message)) => ThalovantError::HubRefused(message),
-            Some(HandshakeVerdict::KeyChanged(message)) => ThalovantError::HubKeyChanged(message),
+            // Each message is a whole refusal or changed-key message, so the
+            // error is the Connection it was when the verdict was kept.
+            Some(HandshakeVerdict::Refused(message) | HandshakeVerdict::KeyChanged(message)) => {
+                ThalovantError::Connection(message)
+            }
             None => fallback,
         }
     }
@@ -952,6 +962,22 @@ impl HttpTransport {
         let _poll = self.state.poll.lock().await;
         let result = self.poll_inner().await;
         if let Err(error) = &result {
+            // A request the hub answered 401 or 403 while a KK handshake was
+            // under way: the connect follows it with one XX attempt.
+            if error.is_hub_refused()
+                && self
+                    .state
+                    .noise
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(NoiseChannel::kk_pending)
+            {
+                self.state
+                    .lifecycle
+                    .kk_failed
+                    .store(true, Ordering::Release);
+            }
             self.mark_connection_error(error).await;
         }
         result
@@ -1128,6 +1154,15 @@ impl HttpTransport {
             .send()
             .await
             .map_err(|err| ThalovantError::Connection(err.without_url().to_string()))?;
+        if matches!(response.status().as_u16(), 401 | 403) {
+            // The hub turned the credentials away, as a WebSocket upgrade
+            // answered so does; during a KK exchange the connect follows it
+            // with XX.
+            return Err(ThalovantError::hub_refused(format!(
+                "HTTP {path} status {}",
+                response.status()
+            )));
+        }
         if !response.status().is_success() {
             return Err(ThalovantError::Connection(format!(
                 "HTTP {path} status {}",
@@ -1351,7 +1386,7 @@ impl WssTransport {
                 if matches!(status, 401 | 403) {
                     // The upgrade itself refused: the credentials, not the hub.
                     self.state.closed_refused.store(true, Ordering::Release);
-                    return ThalovantError::HubRefused(format!(
+                    return ThalovantError::hub_refused(format!(
                         "the hub refused the WebSocket upgrade (HTTP {status})"
                     ));
                 }
@@ -2484,8 +2519,8 @@ impl NoiseChannel {
             // password derives: the hub turned the credentials away (or the
             // negotiation was tampered with, which retrying will not fix
             // either). A refusal, like the hub closing on an unknown key.
-            return Err(ThalovantError::HubRefused(
-                "the hub's Noise handshake did not authenticate under this password (wrong password, or a tampered negotiation)".into(),
+            return Err(ThalovantError::hub_refused(
+                "the hub's Noise handshake did not authenticate under this password (wrong password, or a tampered negotiation)",
             ));
         }
         let mut writes = vec![];
@@ -2506,8 +2541,8 @@ impl NoiseChannel {
             .is_some_and(|pinned| !pinned.eq_ignore_ascii_case(remote))
         {
             // Never replaced here: that is the owner's decision.
-            return Err(ThalovantError::HubKeyChanged(
-                "the hub's Noise static key is not the one pinned for it. If the hub was not reinstalled or replaced, another machine may be answering at this address. If it was, drop the stale pin with forget_noise_pin and connect again".into(),
+            return Err(ThalovantError::hub_key_changed(
+                "if the hub was not reinstalled or replaced, another machine may be answering at this address. If it was, drop the stale pin with forget_noise_pin and connect again",
             ));
         }
         pin_hub_key(self.state_dir.as_deref(), &self.node_id, remote)?;

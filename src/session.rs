@@ -74,10 +74,10 @@ pub enum LinkOutcome {
     Dropped,
     /// The hub or the network could not be reached.
     Failed,
-    /// The hub turned the credentials away ([`ThalovantError::HubRefused`]).
+    /// The hub turned the credentials away ([`ThalovantError::is_hub_refused`]).
     Refused,
     /// The hub's Noise key is not the pinned one
-    /// ([`ThalovantError::HubKeyChanged`]).
+    /// ([`ThalovantError::is_hub_key_changed`]).
     KeyChanged,
 }
 
@@ -407,7 +407,7 @@ impl HubSession {
     /// A hub that closes the link while the connection is being set up, the
     /// way it refuses credentials (see
     /// [`WssTransport::closed_refused`](crate::WssTransport::closed_refused)),
-    /// is reported as [`ThalovantError::HubRefused`].
+    /// is reported as a refusal ([`ThalovantError::is_hub_refused`]).
     pub fn for_identity(identity: Identity, policy: HubSessionPolicy) -> Result<Self> {
         Self::new(
             move || {
@@ -418,11 +418,13 @@ impl HubSession {
                         Ok(()) => Ok(client),
                         Err(error) => {
                             let refused = client.transport.closed_refused()
-                                && matches!(error, ThalovantError::Connection(_));
+                                && matches!(error, ThalovantError::Connection(_))
+                                && !error.is_hub_refused()
+                                && !error.is_hub_key_changed();
                             let _ = client.close().await;
                             Err(if refused {
-                                ThalovantError::HubRefused(
-                                    "the hub closed the link during the handshake: it does not accept these credentials, or not yet".into(),
+                                ThalovantError::hub_refused(
+                                    "the hub closed the link during the handshake: it does not accept these credentials, or not yet",
                                 )
                             } else {
                                 error
@@ -746,7 +748,7 @@ impl HubSession {
     /// has stayed up for the settle window ([`DEFAULT_SETTLE_WINDOW`]): a hub
     /// that closes it before then without a status, or with 1000, 1005 or
     /// 1008, has refused the connection's credentials, which is
-    /// [`ThalovantError::HubRefused`]; any other early close is a
+    /// a refusal ([`ThalovantError::is_hub_refused`]); any other early close is a
     /// [`ThalovantError::Connection`] drop. A failed attempt moves the retry
     /// ladder on.
     pub async fn connect(&self) -> Result<()> {
@@ -769,8 +771,8 @@ impl HubSession {
     /// hub refusing the credentials is retried the same way until the
     /// refusals have lasted the refusal grace ([`DEFAULT_REFUSAL_GRACE`]): a
     /// new connection is refused until its hub admits it. Then this returns
-    /// [`ThalovantError::HubRefused`]. A hub whose key is not the pinned one
-    /// ends it at once with [`ThalovantError::HubKeyChanged`]: retrying
+    /// a refusal ([`ThalovantError::is_hub_refused`]). A hub whose key is not the pinned one
+    /// ends it at once ([`ThalovantError::is_hub_key_changed`]): retrying
     /// cannot change that.
     ///
     /// Returns `Ok(())` once the session is closed. An identity the client
@@ -817,11 +819,11 @@ impl HubSession {
                     supervisor.after(LinkOutcome::Up, origin.elapsed());
                     continue;
                 }
-                Err(error @ ThalovantError::HubKeyChanged(_)) => {
+                Err(error) if error.is_hub_key_changed() => {
                     supervisor.after(LinkOutcome::KeyChanged, origin.elapsed());
                     return Err(error);
                 }
-                Err(error @ ThalovantError::HubRefused(_)) => {
+                Err(error) if error.is_hub_refused() => {
                     match supervisor.after(LinkOutcome::Refused, origin.elapsed()) {
                         LinkDecision::GiveUp { .. } => return Err(error),
                         decision => decision,
@@ -886,8 +888,8 @@ async fn settled(client: &Client, window: Duration) -> Result<()> {
         return Ok(());
     }
     Err(if client.transport.closed_refused() {
-        ThalovantError::HubRefused(
-            "the hub closed the link right after the handshake: it does not accept these credentials, or not yet".into(),
+        ThalovantError::hub_refused(
+            "the hub closed the link right after the handshake: it does not accept these credentials, or not yet",
         )
     } else {
         ThalovantError::Connection("the hub closed the link right after the handshake".into())
@@ -1354,7 +1356,7 @@ mod tests {
             let result = session.connect().await;
             match close {
                 Some(true) => assert!(
-                    matches!(result, Err(ThalovantError::HubRefused(_))),
+                    result.as_ref().is_err_and(ThalovantError::is_hub_refused),
                     "{result:?}"
                 ),
                 Some(false) => assert!(
@@ -1386,7 +1388,7 @@ mod tests {
         let session = session.with_refusal_grace(Duration::from_secs(30)).unwrap();
         let started = tokio::time::Instant::now();
         let error = session.run().await.unwrap_err();
-        assert!(matches!(error, ThalovantError::HubRefused(_)), "{error:?}");
+        assert!(error.is_hub_refused(), "{error:?}");
         assert!(error.is_connection_error());
         assert_eq!(built.lock().unwrap().len(), 3);
         assert!(started.elapsed() >= Duration::from_secs(30));
@@ -1397,10 +1399,10 @@ mod tests {
         let (session, built) = building(vec![Some(true), Some(false), Some(true)]);
         let session = session.with_refusal_grace(Duration::from_secs(25)).unwrap();
         let started = tokio::time::Instant::now();
-        assert!(matches!(
-            session.run().await,
-            Err(ThalovantError::HubRefused(_))
-        ));
+        assert!(session
+            .run()
+            .await
+            .is_err_and(|error| error.is_hub_refused()));
         assert_eq!(built.lock().unwrap().len(), 4);
         assert!(started.elapsed() >= Duration::from_secs(70));
         session.close().await.unwrap();
