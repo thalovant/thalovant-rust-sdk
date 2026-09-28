@@ -3151,6 +3151,58 @@ async fn a_reply_withdrawn_mid_write_is_finished_and_keeps_the_link() {
     transport.disconnect().await.unwrap();
 }
 
+// A write stalled on a hub that stopped reading holds the writer; a
+// disconnect must not wait behind it for the whole send timeout.
+#[tokio::test]
+async fn a_disconnect_stops_a_write_that_stalled_mid_message() {
+    let hub = FakeHub::start().await;
+    let state = FixtureDir::new();
+    let identity = wss_identity(&hub.endpoint);
+    let transport = WssTransport::new(identity.clone());
+    transport.set_noise_state_dir(Some(state.0.clone())).await;
+    timeout(Duration::from_secs(30), transport.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let client = crate::Client {
+        identity,
+        transport: RuntimeTransport::Wss(transport.clone()),
+        conversations: Default::default(),
+        conversation_sequence: Default::default(),
+    };
+    // Paused after its first frame and never let go: a hub that stopped
+    // reading.
+    let (entered, _resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *transport.state.write_pause.lock().unwrap() = Some((entered.clone(), _resume.clone()));
+    let sending = tokio::spawn({
+        let client = client.clone();
+        async move {
+            // Long enough to go out in several Noise frames.
+            let data = json!({"blob": "stalled ".repeat(40_000)})
+                .as_object()
+                .unwrap()
+                .clone();
+            client.emit("a.large.message", data, Map::new()).await
+        }
+    });
+    timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the first frame went out");
+    let started = Instant::now();
+    timeout(Duration::from_secs(3), client.transport.disconnect())
+        .await
+        .expect("the disconnect ends")
+        .expect("inside its cleanup budget, not behind the stalled write");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let sent = timeout(Duration::from_secs(5), sending)
+        .await
+        .expect("the send ends with the link")
+        .unwrap();
+    assert!(sent.is_err(), "{sent:?}");
+    // Half a message went out: the session is spoilt, as it is torn down.
+    assert!(!transport.state.session_valid.load(Ordering::Acquire));
+}
+
 // -- link-carrier-vectors.json: KK then XX over HTTPS polling and MQTT ------
 
 /// A TLS MQTT broker in front of one hub [`Responder`], serving one

@@ -22,7 +22,7 @@
       "implementation": {
         "src/events.rs": "d1d0325c7e1284345f4e5472502a57924ed03d157932851159c5d79c38f0317f",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
-        "src/transport.rs": "27ec02b3428c38542db191543738298608c51d3d730fd347021e0c302590c1aa",
+        "src/transport.rs": "23060bb8ca5e99b5a75aedf8f8fed4dd3b4510318b375a07ed7dad1a00bb8c92",
         "src/wire.rs": "c18fd8b24d5034ce3f2d324d232227373e85622251478e1d4c65352e78da43e0"
       },
       "reason": "decode_hive_binary_frame branches on BINARY: four bits of payload type, then the clip itself, never parsed or inflated. A compressed part of any other frame inflates through ZlibDecoder::take(MAX_INFLATED + 1) in src/wire.rs: past 32 MiB the frame is refused, and a truncated stream is refused as flate2's UnexpectedEof, with unit tests beside it. subscribe_binary delivers it. Run against the shared binary vectors and against binary-frames.json, which is hivemind-bus-client's own encoder output rather than frames this SDK built for itself.",
@@ -129,12 +129,12 @@
         "src/noise_store.rs": "8ea026f0cd57d6f22435831df26b243399b25b9234f9a31a059338663e43ff08",
         "src/rich.rs": "d441e77895b4f39932dba8f91ff643e0e53df886e4c40287da2e70d5c7574438",
         "src/session.rs": "1d23d717a24c5dd84e443a2d6f71045748b3ff17cf3a290d81b6fd6a4b15c735",
-        "src/transport.rs": "27ec02b3428c38542db191543738298608c51d3d730fd347021e0c302590c1aa"
+        "src/transport.rs": "23060bb8ca5e99b5a75aedf8f8fed4dd3b4510318b375a07ed7dad1a00bb8c92"
       },
       "reason": "src/home.rs holds HOME_REQUEST/HOME_RESPONSE, HOME_REQUEST_TIMEOUT, RESPONSE_TYPES and ERROR_CODES (asserted equal to the vector file's lists), HomeRequest, HomeAnswer, home_response, plain_speech (src/rich.rs strip_ssml removes only real tags, comments and processing instructions; decode_references decodes numeric references, the five XML entities and &nbsp; and nothing else; Unicode White_Space collapses), and answer_home_request/answer_home_request_within: everything within the hub's 10 s counted from the call, the handler on a spawned task given min(timeout, what is left) and answered timeout at the deadline while it is left to finish, the reply given what the handler left, never started after the bound and withdrawn when it passes (None when there was no time). reply_context is in src/events.rs (a destination with no source gives no destination), Client::reply in src/client.rs, replying from Event::context as the hub sent it. src/transport.rs holds close_refuses and close_refuses_after (1000/1005/1008 during the handshake or within 750 ms after it, a code learnt up to 250 ms late, and never once a frame from the hub decrypted: the WSS read loop and every carrier's receive set that flag for any frame, JSON, WIRE-1, a chunk or the encrypted HELLO), a refusal right as an XX handshake ends with nothing from the hub turned into client_key_rejected naming both key folders (plain refusal after KK), and the typed handshake verdicts: a message that fails to authenticate and a refusal close are HubRefused, a pin mismatch HubKeyChanged, and a failed KK is followed at once by one XX in the same connect; src/noise.rs and src/noise_store.rs carry the pattern selection and the pin it checks. src/session.rs holds LinkSupervisor, a pure function run() asks after every attempt (hold, dial again at once after a drop, the 10 s to 120 s ladder, 600 s of refusals, stop at once on a key change or a rejected client key), per-type handlers and the settle window; its own unit tests are colocated, as this SDK's are, so it is implementation here. tests/home_link.rs runs every home-link case (reply_context, speech, answer, deadline with a transport that takes send_ms); tests/link_keeping.rs runs the close and supervise cases and the policy; src/transport_noise_tests.rs runs the handshake cases, each as a kept link connects (HubSession connect with the settle window), against a loopback Noise hub that records the patterns it sees and pins the client's key, closing with no status on a contradicting one before it sends anything, and the queued cases over a real link whose writer another frame holds for busy_ms (a send may be withdrawn only while it waits for the writer; once it holds it, the write runs to completion on its own task), a real close right after the handshake, and run() stopping at once on a changed key. All record through tests/common/mod.rs before asserting.",
       "status": "required",
       "tests": {
-        "src/transport_noise_tests.rs": "4caf774cdfa154f7d97eb463adda76902b47b0c0384cbc19d73a1a0d6699ec28",
+        "src/transport_noise_tests.rs": "5944db2990b5a87b72e6e4198594174934fbfc6dabe68724e74d724ea6c4ad02",
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/home-link-vectors.json": "bfaadf8f9c588ae79c02263743c8d3be0d80f8fad2db8ebce81158d0c336c547",
         "tests/conformance/link-keeping-vectors.json": "eea7f573e802cf447b6776868d513ad1fb086c1ec7300629ab5f9ec09c9c3257",
@@ -152,13 +152,13 @@
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d",
         "src/noise_store.rs": "8ea026f0cd57d6f22435831df26b243399b25b9234f9a31a059338663e43ff08",
         "src/protocols.rs": "a42115fd0de0dc49c4cee86872130f5ee3ab510ebc4b10d33adff4dcbd978905",
-        "src/transport.rs": "27ec02b3428c38542db191543738298608c51d3d730fd347021e0c302590c1aa"
+        "src/transport.rs": "23060bb8ca5e99b5a75aedf8f8fed4dd3b4510318b375a07ed7dad1a00bb8c92"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The key-folder rule: Client::from_file, from_config_file and from_config call RuntimeTransport::use_identity_file (src/transport.rs), which keeps noise_key and noise_pins.json in the identity file's own folder unless a folder is named -- the default folder is the config file's, so ~/.config/thalovant/identity.json changes nothing -- and falls back to the default for a folder it cannot write; the first handshake from that folder copies (never moves) the key and the pin file from the default folder when a pin there is filed under this hub's node id (adopt_legacy_key in src/noise_store.rs). Identity keeps its public fields. src/transport_noise_tests.rs holds the folder choice, the copy (once, only for a key that met this hub, 0600, the old folder untouched) and a real handshake that connects over KK with the copied key; the paths are platform paths, so there is no vector.",
       "status": "required",
       "tests": {
         "src/identity.rs": "7eeef6822788b239aafda4f682fac2ceae686cc3e27529385cac80d654d91f63",
-        "src/transport_noise_tests.rs": "4caf774cdfa154f7d97eb463adda76902b47b0c0384cbc19d73a1a0d6699ec28"
+        "src/transport_noise_tests.rs": "5944db2990b5a87b72e6e4198594174934fbfc6dabe68724e74d724ea6c4ad02"
       }
     },
     "inventory": {
@@ -179,12 +179,12 @@
       "implementation": {
         "src/errors.rs": "fd3e3c8f289ede61438a03f4198a6e03db0e582326a2c155d9e66239a2ec14cb",
         "src/session.rs": "1d23d717a24c5dd84e443a2d6f71045748b3ff17cf3a290d81b6fd6a4b15c735",
-        "src/transport.rs": "27ec02b3428c38542db191543738298608c51d3d730fd347021e0c302590c1aa"
+        "src/transport.rs": "23060bb8ca5e99b5a75aedf8f8fed4dd3b4510318b375a07ed7dad1a00bb8c92"
       },
       "reason": "connect_kk_then_xx in src/transport.rs runs every carrier's connect: a KK attempt that does not authenticate -- over HTTPS polling also a request answered 401 or 403 while the KK exchange is under way -- is followed at once by one XX attempt in the same connect, whose outcome is the connect's. Over HTTPS a 401 or 403 while the client sends the last frames of an XX handshake it completed (HttpTransport::receive_frame), or on a poll right after it, before any frame from the hub decrypted, is the hub refusing this client's own key: ThalovantError::client_key_rejected in src/errors.rs, still the HUB_REFUSED Connection with is_client_key_rejected() on top, and RuntimeTransport::closed_refused() now reports it for HTTP so the session's settle window (src/session.rs) sees it; after KK the same answer is a plain refusal. MQTT has no refusal to relay, so a hub that aborts there just stops answering and no rejected key is told. src/transport_noise_tests.rs runs the ten cases through the real HttpTransport over TLS against HttpFixture in carrier mode (a hub responder that pins the client key and aborts on a contradicting one, then answers every request of the aborted session 401) and the real MqttTransport against a loopback TLS broker, each as a kept link connects (HubSession connect with the 750 ms settle window), and records {outcome, patterns} through tests/common/mod.rs before asserting.",
       "status": "required",
       "tests": {
-        "src/transport_noise_tests.rs": "4caf774cdfa154f7d97eb463adda76902b47b0c0384cbc19d73a1a0d6699ec28",
+        "src/transport_noise_tests.rs": "5944db2990b5a87b72e6e4198594174934fbfc6dabe68724e74d724ea6c4ad02",
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/link-carrier-vectors.json": "dae55b50c45c69b47a1c08eec472dd2e8eb2844251d1dc2951e7c5440f87e260"
       },
@@ -211,7 +211,7 @@
       "implementation": {
         "src/events.rs": "d1d0325c7e1284345f4e5472502a57924ed03d157932851159c5d79c38f0317f",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
-        "src/transport.rs": "27ec02b3428c38542db191543738298608c51d3d730fd347021e0c302590c1aa"
+        "src/transport.rs": "23060bb8ca5e99b5a75aedf8f8fed4dd3b4510318b375a07ed7dad1a00bb8c92"
       },
       "reason": "subscribe_hive over the five hive kinds, and propagate/escalate/broadcast. The kinds used to fall off the end of dispatch_noise_message with no arm and no log line. Run against the shared mesh vectors.",
       "status": "required",
@@ -226,7 +226,7 @@
     "refusal": {
       "implementation": {
         "src/errors.rs": "fd3e3c8f289ede61438a03f4198a6e03db0e582326a2c155d9e66239a2ec14cb",
-        "src/transport.rs": "27ec02b3428c38542db191543738298608c51d3d730fd347021e0c302590c1aa"
+        "src/transport.rs": "23060bb8ca5e99b5a75aedf8f8fed4dd3b4510318b375a07ed7dad1a00bb8c92"
       },
       "reason": "refusal_belongs_to_ask() and failure_error() live in src/refusal.rs with their vector suite colocated, as this SDK's private unit suites are, so the module is recorded as test evidence beside the errors and transport it rests on; collect_ask_reply() in client.rs applies the rule with the transport's count of asks, queries and fire-and-forget utterances inside the shared grace window -- recorded once connected and immediately before the publish, and kept when the publish errors, since emit_bus over HTTP can fail after the hub holds the frame. ThalovantError gains Unanswered and PolicyDenied.quota, boxed so the enum every Result carries stays inside clippy's result_large_err limit.",
       "status": "required",
@@ -243,13 +243,13 @@
       "implementation": {
         "src/events.rs": "d1d0325c7e1284345f4e5472502a57924ed03d157932851159c5d79c38f0317f",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d",
-        "src/transport.rs": "27ec02b3428c38542db191543738298608c51d3d730fd347021e0c302590c1aa"
+        "src/transport.rs": "23060bb8ca5e99b5a75aedf8f8fed4dd3b4510318b375a07ed7dad1a00bb8c92"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs.",
       "status": "required",
       "tests": {
         "src/client.rs": "9c4301a85d3da99c81f165ec95f12042abdddb0f51e7ecfe6fdea4a73d7cfb23",
-        "src/transport_noise_tests.rs": "4caf774cdfa154f7d97eb463adda76902b47b0c0384cbc19d73a1a0d6699ec28",
+        "src/transport_noise_tests.rs": "5944db2990b5a87b72e6e4198594174934fbfc6dabe68724e74d724ea6c4ad02",
         "tests/data/reply-claim-vectors.json": "45f2731589e612d5a849376d94073c57b0fef426a92e1d065c58c48442b1ffdc",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
         "tests/reply_claims.rs": "28b12c2282adb27afbc267751ef8a4bfa989a70dc1e351d9e259e3ef7dfa0b69"

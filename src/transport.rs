@@ -836,7 +836,8 @@ impl RuntimeTransport {
 /// completion whatever becomes of the caller, because half of a frame breaks
 /// the Noise stream for good: a reply the hub's bound withdraws mid-write is
 /// finished, and the link stays as it was. The write bounds itself by the
-/// physical send timeout ([`WRITE_TIMEOUT`]).
+/// physical send timeout ([`WRITE_TIMEOUT`]), and stops when the transport
+/// is retired ([`write_unless_retired`]).
 async fn send_detached<F>(send: impl FnOnce(oneshot::Sender<Result<()>>) -> F) -> Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
@@ -856,6 +857,34 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn write_timed_out() -> ThalovantError {
     ThalovantError::Timeout("Noise message send timed out".into())
+}
+
+/// Run `write`, which holds the send path, to its end -- unless the transport
+/// is retired first.
+///
+/// A caller that stops waiting does not stop the write: half a message would
+/// spoil a link that is staying up. A `disconnect()` does, because that link
+/// is being torn down and a write stalled on a hub that stopped reading would
+/// otherwise hold the send path, and with it the disconnect and any
+/// reconnect, for the whole [`WRITE_TIMEOUT`]. The write is dropped part way
+/// then, and its guard marks the session invalid.
+async fn write_unless_retired(
+    control: &ConnectionControl,
+    write: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let retired = control.retired.notified();
+    tokio::pin!(retired);
+    retired.as_mut().enable();
+    if control.cancelled.load(Ordering::Acquire) {
+        return Err(ThalovantError::Connection(
+            "transport retired; reconnect required".into(),
+        ));
+    }
+    tokio::select! {
+        biased;
+        _ = &mut retired => Err(ThalovantError::Connection("transport closed during send".into())),
+        result = timeout(WRITE_TIMEOUT, write) => result.unwrap_or_else(|_| Err(write_timed_out())),
+    }
 }
 
 async fn send_with_deadline(
@@ -1368,15 +1397,11 @@ impl HttpTransport {
             if done.is_closed() {
                 return; // Withdrawn while it waited.
             }
-            let result = if transport.state.lifecycle.cancelled.load(Ordering::Acquire) {
-                Err(ThalovantError::Connection(
-                    "transport retired; reconnect required".into(),
-                ))
-            } else {
-                timeout(WRITE_TIMEOUT, transport.send_encrypted(message))
-                    .await
-                    .unwrap_or_else(|_| Err(write_timed_out()))
-            };
+            let result = write_unless_retired(
+                &transport.state.lifecycle,
+                transport.send_encrypted(message),
+            )
+            .await;
             if let Err(error) = &result {
                 transport.mark_connection_error(error).await;
             }
@@ -2009,9 +2034,11 @@ impl WssTransport {
             if done.is_closed() {
                 return; // Withdrawn while it waited.
             }
-            let result = timeout(WRITE_TIMEOUT, transport.write_locked(&mut writer, message))
-                .await
-                .unwrap_or_else(|_| Err(write_timed_out()));
+            let result = write_unless_retired(
+                &transport.state.lifecycle,
+                transport.write_locked(&mut writer, message),
+            )
+            .await;
             let _ = done.send(result);
         })
         .await
@@ -2503,15 +2530,11 @@ impl MqttTransport {
             if done.is_closed() {
                 return; // Withdrawn while it waited.
             }
-            let result = if transport.state.lifecycle.cancelled.load(Ordering::Acquire) {
-                Err(ThalovantError::Connection(
-                    "transport retired; reconnect required".into(),
-                ))
-            } else {
-                timeout(WRITE_TIMEOUT, transport.send_encrypted(message))
-                    .await
-                    .unwrap_or_else(|_| Err(write_timed_out()))
-            };
+            let result = write_unless_retired(
+                &transport.state.lifecycle,
+                transport.send_encrypted(message),
+            )
+            .await;
             if let Err(error) = &result {
                 transport.mark_error(error).await;
             }
