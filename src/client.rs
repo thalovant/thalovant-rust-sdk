@@ -364,6 +364,25 @@ impl Client {
             .await
     }
 
+    /// Answer a message the hub sent, back along the route it came.
+    ///
+    /// Emits `msg_type` with `data` and the reply context built from
+    /// `event.context` -- the context exactly as the hub sent it -- by
+    /// [`reply_context`](crate::reply_context): a deep copy of the request's
+    /// context, keeping its session and request id, with `source` and
+    /// `destination` turned round (OVOS-MSG-1 §5.2). A blank `msg_type`
+    /// fails with [`ThalovantError::Runtime`] before anything is sent.
+    pub async fn reply(&self, event: &Event, msg_type: &str, data: Data) -> Result<()> {
+        let msg_type = msg_type.trim();
+        if msg_type.is_empty() {
+            return Err(ThalovantError::Runtime(
+                "a reply needs a non-empty message type".to_string(),
+            ));
+        }
+        self.emit(msg_type, data, crate::events::reply_context(&event.context))
+            .await
+    }
+
     fn context_with_identity_metadata(&self, context: Context) -> Context {
         if self.identity.metadata.is_empty() {
             return context;

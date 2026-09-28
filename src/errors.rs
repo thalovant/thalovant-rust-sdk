@@ -1,5 +1,6 @@
 use std::fmt;
 use std::ops::Deref;
+use std::time::Duration;
 
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -99,6 +100,29 @@ impl fmt::Debug for ApiProblem {
             .field(&crate::redact::redact_map(&self.0))
             .finish()
     }
+}
+
+/// What kind of refusal an API answer is, for a caller that branches on it;
+/// see [`ThalovantError::api_refusal`].
+///
+/// The error itself stays what it always was -- usually
+/// [`ThalovantError::ApiResponse`] -- and this names the refusals a caller
+/// can do something specific about. `#[non_exhaustive]`: match with a
+/// wildcard arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ApiRefusal {
+    /// The token itself was refused: HTTP 401 (unknown, expired or revoked),
+    /// 423 (the account is locked), or 403 whose detail is exactly
+    /// `Insufficient scopes`. Signing in again is the way out of each.
+    Auth,
+    /// The account's plan does not allow it: HTTP 402, or 403 with code
+    /// `plan_limit`, whose problem carries `resource`, `limit` and `used`.
+    Plan,
+    /// The hub already holds the one connection of this kind it allows: HTTP
+    /// 409 `home_assistant_already_linked`.
+    /// [`ThalovantError::linked_client_id`] names the connection holding it.
+    AlreadyLinked,
 }
 
 /// The numbers behind a refusal that is a spent allowance, not a policy.
@@ -259,6 +283,95 @@ pub enum ThalovantError {
     DeviceAuthorizationDenied,
     #[error("device authorization expired: the code expired before it was approved; call login_with_browser again to request a new code")]
     DeviceAuthorizationExpired,
+    /// One [`ControlPlane::poll_device_login`](crate::ControlPlane::poll_device_login)
+    /// while nobody has approved the sign-in yet.
+    ///
+    /// Poll again after `interval`. A `slow_down` from the API has already
+    /// lengthened it by five seconds, and it stays lengthened for every later
+    /// poll of the same device code (RFC 8628 §3.5).
+    #[error("device sign-in pending: nobody has approved it yet; poll again in {interval:?}")]
+    DeviceLoginPending {
+        /// How long to wait before the next poll.
+        interval: Duration,
+        /// The HTTP status the API answered with (400).
+        status_code: u16,
+        /// The body the API answered with, when it was a JSON object.
+        problem: Option<Box<ApiProblem>>,
+    },
+    /// The device code expired before anybody approved it; begin again for a
+    /// new code. [`ControlPlane::login_with_browser`](crate::ControlPlane::login_with_browser)
+    /// reports the same outcome as [`ThalovantError::DeviceAuthorizationExpired`].
+    #[error("device sign-in expired: the code expired before it was approved; call begin_device_login again for a new code")]
+    DeviceLoginExpired {
+        /// The HTTP status the API answered with (400).
+        status_code: u16,
+        /// The body the API answered with, when it was a JSON object.
+        problem: Option<Box<ApiProblem>>,
+    },
+    /// The person declined the sign-in.
+    /// [`ControlPlane::login_with_browser`](crate::ControlPlane::login_with_browser)
+    /// reports the same outcome as [`ThalovantError::DeviceAuthorizationDenied`].
+    #[error("device sign-in denied: the sign-in request was denied in the browser")]
+    DeviceLoginDenied {
+        /// The HTTP status the API answered with (400).
+        status_code: u16,
+        /// The body the API answered with, when it was a JSON object.
+        problem: Option<Box<ApiProblem>>,
+    },
+    /// The API cannot make a connection of the kind asked for.
+    ///
+    /// Either it refused the kind (HTTP 422 naming `connection_type`, with
+    /// `status_code` and `problem` set), or it made a connection whose kind
+    /// did not come back as asked -- an ordinary connection nobody asked for,
+    /// which the SDK deletes before failing (`status_code` is `None`; `reason`
+    /// says if the delete failed and which connection is left).
+    #[error("unsupported connection type `{connection_type}`: {reason}")]
+    UnsupportedConnectionType {
+        /// The kind asked for, such as `home_assistant`.
+        connection_type: String,
+        /// What happened, for display.
+        reason: String,
+        /// The HTTP status of a refusal; `None` when the API made the wrong kind.
+        status_code: Option<u16>,
+        /// The body of a refusal, when it was a JSON object.
+        problem: Option<Box<ApiProblem>>,
+    },
+    /// A hub did not admit a new connection within the wait.
+    ///
+    /// Both a connection error and a timeout ([`ThalovantError::is_connection_error`]
+    /// and [`ThalovantError::is_timeout`] are both true): the connection
+    /// exists and may still be admitted, so waiting longer or connecting later
+    /// can succeed.
+    #[error(
+        "admission timeout: the hub did not admit the connection within {timeout:?}; it may still admit it later"
+    )]
+    AdmissionTimeout {
+        /// How long the wait was.
+        timeout: Duration,
+    },
+    /// The operation that admits a new connection failed or timed out on the
+    /// platform, or the API refused the wait itself.
+    ///
+    /// For a platform failure `error_code` is the operation's own code and
+    /// `status_code` is `None`. For a refusal of the wait `error_code` is
+    /// `None` and the refusal is `status_code` and `problem`, read as any API
+    /// answer is ([`ThalovantError::api_code`], [`ThalovantError::api_detail`]).
+    /// A 401 or 403 is never this: it is returned as the
+    /// [`ThalovantError::ApiResponse`] it is. A connection error
+    /// ([`ThalovantError::is_connection_error`]).
+    #[error("admission failed: {reason}")]
+    AdmissionFailed {
+        /// The operation's own code, such as `gitops_push_rejected`; `None`
+        /// when the API refused the wait instead.
+        error_code: Option<String>,
+        /// What happened, for display.
+        reason: String,
+        /// The HTTP status when the API refused the wait; `None` when the
+        /// operation itself failed.
+        status_code: Option<u16>,
+        /// The body of that refusal, when it was a JSON object.
+        problem: Option<Box<ApiProblem>>,
+    },
     #[error("unsupported protocol: {0}")]
     UnsupportedProtocol(String),
     #[error("crypto error: {0}")]
@@ -288,24 +401,213 @@ impl From<reqwest::Error> for ThalovantError {
     }
 }
 
+/// How a [`ThalovantError::Connection`] that is a refusal of the credentials
+/// begins. The finer kinds of connection and API failure ride in the message
+/// of the variant they have always been reported as, rather than in variants
+/// of their own, so that a caller matching `Connection(_)` or `Api(_)` keeps
+/// catching them; the `is_*` methods read them back. Every one is built by
+/// the constructors below, and nothing else in the crate begins a message
+/// with these words.
+const HUB_REFUSED: &str = "the hub refused this connection's credentials";
+/// How a [`ThalovantError::Connection`] for a changed hub key begins.
+const HUB_KEY_CHANGED: &str = "the hub's Noise key is not the one pinned for it";
+/// How a [`ThalovantError::Api`] for an API out of reach begins.
+const API_UNREACHABLE: &str = "could not reach the Thalovant API";
+
 impl ThalovantError {
+    /// The HTTP status of an error the API answered with.
     pub fn status_code(&self) -> Option<u16> {
         match self {
-            Self::ApiResponse { status_code, .. } => Some(*status_code),
             Self::Http(e) => e.status().map(|s| s.as_u16()),
+            _ => self.api_answer().map(|(status_code, _)| status_code),
+        }
+    }
+
+    /// The status and body of an error that is an answer from the API.
+    fn api_answer(&self) -> Option<(u16, Option<&ApiProblem>)> {
+        match self {
+            Self::ApiResponse {
+                status_code,
+                problem,
+                ..
+            }
+            | Self::DeviceLoginPending {
+                status_code,
+                problem,
+                ..
+            }
+            | Self::DeviceLoginExpired {
+                status_code,
+                problem,
+            }
+            | Self::DeviceLoginDenied {
+                status_code,
+                problem,
+            } => Some((*status_code, problem.as_deref())),
+            Self::UnsupportedConnectionType {
+                status_code: Some(status_code),
+                problem,
+                ..
+            }
+            | Self::AdmissionFailed {
+                status_code: Some(status_code),
+                problem,
+                ..
+            } => Some((*status_code, problem.as_deref())),
             _ => None,
         }
     }
 
     /// The error body the API sent, parsed, when it is a JSON object.
     ///
-    /// `None` for every other error, and for an API error whose body was
-    /// empty, not JSON, or JSON that is not an object.
+    /// Read from every error that is an answer from the API: `ApiResponse`,
+    /// the device-login outcomes, a refused connection type and a refused
+    /// admission wait. `None` for every other error, and for an API error
+    /// whose body was empty, not JSON, or JSON that is not an object.
     pub fn api_problem(&self) -> Option<&ApiProblem> {
-        match self {
-            Self::ApiResponse { problem, .. } => problem.as_deref(),
+        self.api_answer().and_then(|(_, problem)| problem)
+    }
+
+    /// What kind of refusal this API answer is, when it is one a caller can
+    /// act on; see [`ApiRefusal`].
+    ///
+    /// - [`ApiRefusal::Auth`]: HTTP 401, 423, or 403 whose detail is exactly
+    ///   `Insufficient scopes`;
+    /// - [`ApiRefusal::Plan`]: HTTP 402, or 403 with code `plan_limit`;
+    /// - [`ApiRefusal::AlreadyLinked`]: HTTP 409 with code
+    ///   `home_assistant_already_linked`.
+    ///
+    /// `None` for anything else. The error is unchanged: a 402 from
+    /// [`ControlPlane::get_hub`](crate::ControlPlane::get_hub) is still
+    /// [`ThalovantError::ApiResponse`], and this is how to tell it is a plan
+    /// refusal without matching the status yourself.
+    pub fn api_refusal(&self) -> Option<ApiRefusal> {
+        let (status_code, problem) = self.api_answer()?;
+        let code = problem.and_then(ApiProblem::code);
+        let detail = problem.and_then(ApiProblem::detail);
+        match status_code {
+            401 | 423 => Some(ApiRefusal::Auth),
+            403 if detail == Some("Insufficient scopes") => Some(ApiRefusal::Auth),
+            402 => Some(ApiRefusal::Plan),
+            403 if code == Some("plan_limit") => Some(ApiRefusal::Plan),
+            409 if code == Some("home_assistant_already_linked") => Some(ApiRefusal::AlreadyLinked),
             _ => None,
         }
+    }
+
+    /// The connection that already holds a hub's link, on an
+    /// [`ApiRefusal::AlreadyLinked`] refusal, when the API named it.
+    ///
+    /// Read from `client_id`, `existing_client_id` or `connection_id`, at the
+    /// top of the problem first and then inside a `detail` that is itself an
+    /// object. `None` for every other error.
+    pub fn linked_client_id(&self) -> Option<&str> {
+        if self.api_refusal() != Some(ApiRefusal::AlreadyLinked) {
+            return None;
+        }
+        let problem = self.api_problem()?;
+        let nested = problem.get("detail").and_then(Value::as_object);
+        [Some(problem.as_map()), nested]
+            .into_iter()
+            .flatten()
+            .flat_map(|source| {
+                ["client_id", "existing_client_id", "connection_id"]
+                    .into_iter()
+                    .map(move |key| source.get(key))
+            })
+            .find_map(|value| value.and_then(Value::as_str).filter(|id| !id.is_empty()))
+    }
+
+    /// Whether this is a timeout: [`ThalovantError::Timeout`], or
+    /// [`ThalovantError::AdmissionTimeout`].
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout(_) | Self::AdmissionTimeout { .. })
+    }
+
+    /// Whether this is a connection error: [`ThalovantError::Connection`]
+    /// (a hub that refused the credentials or whose key changed among them),
+    /// a control-plane API out of reach ([`ThalovantError::is_api_unreachable`]),
+    /// [`ThalovantError::AdmissionTimeout`] or
+    /// [`ThalovantError::AdmissionFailed`].
+    pub fn is_connection_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Connection(_) | Self::AdmissionTimeout { .. } | Self::AdmissionFailed { .. }
+        ) || self.is_api_unreachable()
+    }
+
+    /// Whether a hub turned this connection's credentials away.
+    ///
+    /// A hub closes the socket during the handshake or within 750 ms after
+    /// it, without a status or with 1000, 1005 or 1008, when it does not know
+    /// the connection's key -- or does not know it yet: a connection just
+    /// created is refused until its hub has admitted it. A handshake message
+    /// that does not authenticate under the key the password derives (a wrong
+    /// password), and a WebSocket upgrade or an HTTP request answered 401 or
+    /// 403, are refusals too; see
+    /// [`close_refuses`](crate::transport::close_refuses).
+    ///
+    /// The error is the [`ThalovantError::Connection`] a failed connect has
+    /// always been, so a match on that variant still catches it; this says
+    /// which kind of connection error it is.
+    pub fn is_hub_refused(&self) -> bool {
+        matches!(self, Self::Connection(message) if message.starts_with(HUB_REFUSED))
+    }
+
+    /// Whether the hub's Noise static key is not the one pinned for it.
+    ///
+    /// The hub was reinstalled or replaced -- or another machine is answering
+    /// at its address. Retrying cannot change that, so
+    /// [`HubSession::run`](crate::HubSession::run) stops at once. The SDK
+    /// never replaces a pin itself: if the hub really was replaced, drop the
+    /// stale pin with [`forget_noise_pin`](crate::forget_noise_pin) and
+    /// connect again. Not a refusal.
+    ///
+    /// Like [`ThalovantError::is_hub_refused`], the error is the
+    /// [`ThalovantError::Connection`] it has always been.
+    pub fn is_hub_key_changed(&self) -> bool {
+        matches!(self, Self::Connection(message) if message.starts_with(HUB_KEY_CHANGED))
+    }
+
+    /// Whether a control-plane request never got an answer: DNS, the
+    /// connection, TLS, a proxy, or the request's own timeout. There is no
+    /// status and no problem, and trying again later can work, which is not
+    /// true of an answer from the API.
+    ///
+    /// The error is the [`ThalovantError::Api`] such a failure has always
+    /// been, so a match on that variant still catches it.
+    pub fn is_api_unreachable(&self) -> bool {
+        matches!(self, Self::Api(message) if message.starts_with(API_UNREACHABLE))
+    }
+
+    /// A refusal of the credentials by the hub: a
+    /// [`ThalovantError::Connection`] that
+    /// [`ThalovantError::is_hub_refused`] answers true for.
+    pub(crate) fn hub_refused(detail: impl fmt::Display) -> Self {
+        Self::Connection(format!("{HUB_REFUSED}: {detail}"))
+    }
+
+    /// A hub whose key is not the pinned one: a
+    /// [`ThalovantError::Connection`] that
+    /// [`ThalovantError::is_hub_key_changed`] answers true for.
+    pub(crate) fn hub_key_changed(detail: impl fmt::Display) -> Self {
+        Self::Connection(format!("{HUB_KEY_CHANGED}: {detail}"))
+    }
+
+    /// The message of a [`ThalovantError::Connection`], for a verdict kept
+    /// to rebuild the same error later.
+    pub(crate) fn into_connection_message(self) -> String {
+        match self {
+            Self::Connection(message) => message,
+            other => other.to_string(),
+        }
+    }
+
+    /// A control-plane request that never got an answer: a
+    /// [`ThalovantError::Api`] that [`ThalovantError::is_api_unreachable`]
+    /// answers true for.
+    pub(crate) fn api_unreachable(detail: impl fmt::Display) -> Self {
+        Self::Api(format!("{API_UNREACHABLE}: {detail}"))
     }
 
     /// The API's machine-readable code, such as `platform_image_required` or

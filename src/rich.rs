@@ -12,18 +12,34 @@ pub struct DisplayItem {
     pub silent: bool,
 }
 
+/// What the reference's `\s` matches inside a tag: Unicode white space and
+/// the four information separators U+001C to U+001F.
+const MARKUP_SPACE: &str = r"[\t\n\x{0B}\x{0C}\r \x{1C}-\x{1F}\x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]";
+
+/// One markup construct: a comment, a processing instruction, or a tag --
+/// `<` or `</` immediately followed by a name that starts with an ASCII
+/// letter, then attributes, whose quoted values may hold `>`, then `>` or
+/// `/>`. Any other `<` is text.
+fn markup() -> &'static regex::Regex {
+    static MARKUP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    MARKUP.get_or_init(|| {
+        let tag = format!(
+            r#"</?[A-Za-z][A-Za-z0-9._:-]*(?:{MARKUP_SPACE}+(?:[^<>"']|"[^"]*"|'[^']*')*)?{MARKUP_SPACE}*/?>"#
+        );
+        regex::Regex::new(&format!(r"(?s)<!--.*?-->|<\?.*?\?>|{tag}"))
+            .expect("the markup pattern is valid")
+    })
+}
+
+/// Remove SSML and XML markup from display text: tags, comments and
+/// processing instructions.
+///
+/// Only real markup goes: a tag is `<` or `</` immediately followed by an
+/// ASCII letter, so "5 < 6 and 7 > 3" survives whole, and an unclosed `<b`
+/// is text. Entities are left as they are; [`plain_speech`](crate::plain_speech)
+/// decodes the portable set.
 pub fn strip_ssml(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_tag = false;
-    for ch in text.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out
+    markup().replace_all(text, "").into_owned()
 }
 
 pub fn rich_media_from_data(data: &Data) -> Map<String, Value> {

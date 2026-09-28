@@ -129,6 +129,118 @@ struct ConnectionControl {
     cancelled: AtomicBool,
     active_attempt: AtomicBool,
     retired: Notify,
+    /// Woken whenever the link goes down (closed by either side, or failed);
+    /// see [`RuntimeTransport::stopped`].
+    stopped: Notify,
+    /// What a failed handshake said about the credentials, kept typed across
+    /// the task that read it: a refusal, or a changed hub key.
+    verdict: std::sync::Mutex<Option<HandshakeVerdict>>,
+    /// The attempt just made was KK and did not authenticate: the next one,
+    /// made at once, uses XX.
+    kk_failed: AtomicBool,
+    /// This attempt uses XX whatever is pinned.
+    force_xx: AtomicBool,
+}
+
+/// What a failed handshake said about the credentials.
+enum HandshakeVerdict {
+    Refused(String),
+    KeyChanged(String),
+}
+
+impl ConnectionControl {
+    /// Keep what a failed receive said: its typed verdict, and whether it
+    /// was a KK attempt that did not authenticate.
+    fn note_failure(&self, error: &ThalovantError, channel: Option<&NoiseChannel>) {
+        let verdict = match error {
+            ThalovantError::Connection(message) if error.is_hub_refused() => {
+                HandshakeVerdict::Refused(message.clone())
+            }
+            ThalovantError::Connection(message) if error.is_hub_key_changed() => {
+                HandshakeVerdict::KeyChanged(message.clone())
+            }
+            _ => return,
+        };
+        *self
+            .verdict
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(verdict);
+        if channel.is_some_and(|channel| channel.kk_failed) {
+            self.kk_failed.store(true, Ordering::Release);
+        }
+    }
+
+    /// The hub closed with a refusal code during the handshake. After a KK
+    /// first message that is what a hub does when it cannot authenticate it:
+    /// the password changed, or its own key did. Only XX tells which.
+    fn note_refusal_close(&self, code: u16, kk_pending: bool) {
+        *self
+            .verdict
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(HandshakeVerdict::Refused(
+            ThalovantError::hub_refused(format!(
+                "the hub closed the link during the handshake (code {code}): it does not accept these credentials, or not yet"
+            ))
+            .into_connection_message(),
+        ));
+        if kk_pending {
+            self.kk_failed.store(true, Ordering::Release);
+        }
+    }
+
+    /// The typed error a failed handshake is, or `fallback` when it said
+    /// nothing about the credentials.
+    fn typed(&self, fallback: ThalovantError) -> ThalovantError {
+        match self
+            .verdict
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            // Each message is a whole refusal or changed-key message, so the
+            // error is the Connection it was when the verdict was kept.
+            Some(HandshakeVerdict::Refused(message) | HandshakeVerdict::KeyChanged(message)) => {
+                ThalovantError::Connection(message)
+            }
+            None => fallback,
+        }
+    }
+}
+
+/// RFC 6455 close codes that are the hub refusing the credentials, when they
+/// come during the handshake or within [`REFUSAL_SETTLE`] after it. 1005 also
+/// stands for a close frame with no status at all, which is what a hub sends
+/// for an access key it does not know and after a Noise abort.
+pub const REFUSAL_CLOSE_CODES: [u16; 3] = [1000, 1005, 1008];
+/// How long after the handshake a refusal code still reads as a refusal.
+pub const REFUSAL_SETTLE: Duration = Duration::from_millis(750);
+/// How late a transport may learn a close's code for it still to count.
+pub const CLOSE_CODE_GRACE: Duration = Duration::from_millis(250);
+
+/// Whether a close is the hub refusing the credentials rather than a drop.
+///
+/// `code` is the RFC 6455 close code (1005 for a close frame with no status),
+/// `None` when the socket ended without a close frame. `closed_after_handshake`
+/// is when the close happened, counted from the end of the handshake, or
+/// `None` for a close during it -- any step of it. Its own time decides, not
+/// when the transport reported it. `code_late` is how long after the close
+/// the transport learnt the code.
+///
+/// A refusal is one of [`REFUSAL_CLOSE_CODES`], learnt within
+/// [`CLOSE_CODE_GRACE`], during the handshake or within [`REFUSAL_SETTLE`]
+/// after it. Everything else -- 1001, 1011, 1013, 1006, no close frame, a
+/// close after the window, a code learnt too late -- is a drop.
+pub fn close_refuses(
+    code: Option<u16>,
+    closed_after_handshake: Option<Duration>,
+    code_late: Duration,
+) -> bool {
+    let Some(code) = code else {
+        return false;
+    };
+    REFUSAL_CLOSE_CODES.contains(&code)
+        && code_late <= CLOSE_CODE_GRACE
+        && closed_after_handshake.is_none_or(|after| after <= REFUSAL_SETTLE)
 }
 
 /// Drops what is past the grace window, and any excess beyond the cap.
@@ -360,17 +472,45 @@ impl RuntimeTransport {
             tokio::select! {
             biased;
             _ = &mut retired => Err(ThalovantError::Connection("connection was closed during authentication".into())),
-            result = async { match self {
-                Self::Http(transport) => transport.connect_locked().await,
-                Self::Wss(transport) => transport.connect_locked().await,
-                Self::Mqtt(transport) => transport.connect_locked().await,
-            } } => result,
+            result = self.connect_kk_then_xx() => result,
             }
         })
         .await
         .unwrap_or_else(|_| Err(connection_timeout()));
         attempt.complete = result.is_ok();
         result
+    }
+
+    /// One connect: a KK attempt that did not authenticate -- its answer
+    /// failed here, or the hub closed on it with a refusal code -- is
+    /// followed at once by one XX attempt, whose outcome is the connect's.
+    /// Only XX tells a changed password (a refusal) from a changed hub key.
+    /// It is not a downgrade: the pin is still checked when XX completes.
+    async fn connect_kk_then_xx(&self) -> Result<()> {
+        let control = self.control();
+        control.kk_failed.store(false, Ordering::Release);
+        control.force_xx.store(false, Ordering::Release);
+        let first = self.connect_attempt().await;
+        if first.is_ok() || !control.kk_failed.swap(false, Ordering::AcqRel) {
+            return first;
+        }
+        control.force_xx.store(true, Ordering::Release);
+        let second = self.connect_attempt().await;
+        control.force_xx.store(false, Ordering::Release);
+        second
+    }
+
+    async fn connect_attempt(&self) -> Result<()> {
+        *self
+            .control()
+            .verdict
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        match self {
+            Self::Http(transport) => transport.connect_locked().await,
+            Self::Wss(transport) => transport.connect_locked().await,
+            Self::Mqtt(transport) => transport.connect_locked().await,
+        }
     }
 
     fn cleanup_budget(&self) -> Duration {
@@ -451,6 +591,71 @@ impl RuntimeTransport {
             Self::Http(transport) => transport.send_hive_message(message, encrypt).await,
             Self::Wss(transport) => transport.send_hive_message(message, encrypt).await,
             Self::Mqtt(transport) => transport.send_hive_message(message, encrypt).await,
+        }
+    }
+
+    /// Whether the hub's last close of this link read as a refusal of its
+    /// credentials; see [`WssTransport::closed_refused`]. Always `false` for
+    /// HTTP and MQTT, whose hubs do not say it this way.
+    pub fn closed_refused(&self) -> bool {
+        match self {
+            Self::Wss(transport) => transport.closed_refused(),
+            Self::Http(_) | Self::Mqtt(_) => false,
+        }
+    }
+
+    /// Hand `event` to this transport's subscribers as if the hub had sent it.
+    #[cfg(test)]
+    pub(crate) fn deliver_for_test(&self, event: Event) {
+        let _ = match self {
+            Self::Http(transport) => transport.state.bus_tx.send(event),
+            Self::Wss(transport) => transport.state.bus_tx.send(event),
+            Self::Mqtt(transport) => transport.state.bus_tx.send(event),
+        };
+    }
+
+    /// Close this link as a hub would: with a refusal of the credentials, or
+    /// as a drop.
+    #[cfg(test)]
+    pub(crate) async fn close_for_test(&self, refused: bool) {
+        match self {
+            Self::Wss(transport) => {
+                transport
+                    .state
+                    .closed_refused
+                    .store(refused, Ordering::Release);
+                transport.mark_disconnected().await;
+            }
+            Self::Http(transport) => {
+                assert!(!refused, "only a WSS link says it was refused");
+                let _ = transport.disconnect_inner().await;
+            }
+            Self::Mqtt(transport) => {
+                assert!(!refused, "only a WSS link says it was refused");
+                transport.mark_disconnected().await;
+            }
+        }
+    }
+
+    /// Resolves once the link is not up: closed by either side, or failed.
+    ///
+    /// Woken by the transport as the link goes down, so a caller hears of a
+    /// drop at once rather than at its next probe. A session a failed send
+    /// invalidated reads as down without such a wake, so a caller that must
+    /// not miss one also looks at its own cadence.
+    pub(crate) async fn stopped(&self) {
+        let control = self.control();
+        loop {
+            let woken = control.stopped.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if matches!(
+                self.connection_info().await.phase,
+                TransportConnectionPhase::Closed | TransportConnectionPhase::Error
+            ) {
+                return;
+            }
+            woken.await;
         }
     }
 }
@@ -642,7 +847,12 @@ impl HttpTransport {
             ));
         }
         let dir = self.state.noise_state_dir.lock().await.clone();
-        *self.state.noise.lock().await = Some(NoiseChannel::new(self.state.identity.clone(), dir));
+        let force_xx = self.state.lifecycle.force_xx.load(Ordering::Acquire);
+        *self.state.noise.lock().await = Some(NoiseChannel::new(
+            self.state.identity.clone(),
+            dir,
+            force_xx,
+        ));
         self.request(reqwest::Method::POST, "/connect", None)
             .await?;
         self.state.admitted.store(true, Ordering::Release);
@@ -687,6 +897,7 @@ impl HttpTransport {
             health.transport_alive = false;
             health.connection.phase = TransportConnectionPhase::Closed;
         }
+        self.state.lifecycle.stopped.notify_waiters();
         if !self.state.admitted.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -751,6 +962,22 @@ impl HttpTransport {
         let _poll = self.state.poll.lock().await;
         let result = self.poll_inner().await;
         if let Err(error) = &result {
+            // A request the hub answered 401 or 403 while a KK handshake was
+            // under way: the connect follows it with one XX attempt.
+            if error.is_hub_refused()
+                && self
+                    .state
+                    .noise
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(NoiseChannel::kk_pending)
+            {
+                self.state
+                    .lifecycle
+                    .kk_failed
+                    .store(true, Ordering::Release);
+            }
             self.mark_connection_error(error).await;
         }
         result
@@ -808,6 +1035,8 @@ impl HttpTransport {
                     health.last_error = Some(error.to_string());
                     health.connection.phase = TransportConnectionPhase::Error;
                     health.connection.last_error = Some(error.to_string());
+                    drop(health);
+                    transport.state.lifecycle.stopped.notify_waiters();
                     break;
                 }
             }
@@ -828,7 +1057,8 @@ impl HttpTransport {
 
     async fn receive_frame(&self, raw: &[u8], binary: bool) -> Result<()> {
         let mut slot = self.state.noise.lock().await;
-        let (message, writes) = receive_noise(&mut slot, raw.to_vec(), binary).await?;
+        let (message, writes) =
+            receive_noise(&self.state.lifecycle, &mut slot, raw.to_vec(), binary).await?;
         let channel = slot
             .as_mut()
             .expect("successful receive restored its channel");
@@ -924,6 +1154,15 @@ impl HttpTransport {
             .send()
             .await
             .map_err(|err| ThalovantError::Connection(err.without_url().to_string()))?;
+        if matches!(response.status().as_u16(), 401 | 403) {
+            // The hub turned the credentials away, as a WebSocket upgrade
+            // answered so does; during a KK exchange the connect follows it
+            // with XX.
+            return Err(ThalovantError::hub_refused(format!(
+                "HTTP {path} status {}",
+                response.status()
+            )));
+        }
         if !response.status().is_success() {
             return Err(ThalovantError::Connection(format!(
                 "HTTP {path} status {}",
@@ -991,6 +1230,8 @@ impl HttpTransport {
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
         health.connection.last_error = Some(error.to_string());
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 }
 
@@ -1006,6 +1247,12 @@ struct WssTransportState {
     lifecycle: ConnectionControl,
     identity: Identity,
     session_valid: AtomicBool,
+    /// Whether the hub's last close read as a refusal; see
+    /// [`WssTransport::closed_refused`].
+    closed_refused: AtomicBool,
+    /// When this link's handshake completed: a close's own time is counted
+    /// from it ([`close_refuses`]).
+    handshake_done: std::sync::Mutex<Option<Instant>>,
     user_agent: String,
     bus_tx: broadcast::Sender<Event>,
     hive_tx: broadcast::Sender<HiveMessage>,
@@ -1031,6 +1278,8 @@ impl WssTransport {
             state: Arc::new(WssTransportState {
                 lifecycle: ConnectionControl::default(),
                 session_valid: AtomicBool::new(false),
+                closed_refused: AtomicBool::new(false),
+                handshake_done: std::sync::Mutex::new(None),
                 identity,
                 user_agent: DEFAULT_USER_AGENT.to_string(),
                 bus_tx,
@@ -1073,14 +1322,38 @@ impl WssTransport {
         self.state.hive_tx.subscribe()
     }
 
+    /// Whether the hub's last close of this link read as a refusal of its
+    /// credentials rather than a drop, by [`close_refuses`]: 1000, 1005 (a
+    /// close frame with no status) or 1008, during the handshake or within
+    /// [`REFUSAL_SETTLE`] after it. A hub closes that way for an access key it
+    /// does not know -- or not yet: a connection just created is refused
+    /// until its hub admits it. An upgrade answered 401 or 403 reads the same
+    /// way. Any other close code (1001, 1011, 1013), a socket that simply
+    /// dropped, and a close after the window, is the hub's trouble or the
+    /// network's, not a verdict on the credentials. Reset by every connect.
+    pub fn closed_refused(&self) -> bool {
+        self.state.closed_refused.load(Ordering::Acquire)
+    }
+
     pub async fn connect(&self) -> Result<()> {
         RuntimeTransport::Wss(self.clone()).connect().await
     }
 
     async fn connect_locked(&self) -> Result<()> {
         self.disconnect_inner().await?;
+        self.state.closed_refused.store(false, Ordering::Release);
+        *self
+            .state
+            .handshake_done
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let dir = self.state.noise_state_dir.lock().await.clone();
-        *self.state.noise.lock().await = Some(NoiseChannel::new(self.state.identity.clone(), dir));
+        let force_xx = self.state.lifecycle.force_xx.load(Ordering::Acquire);
+        *self.state.noise.lock().await = Some(NoiseChannel::new(
+            self.state.identity.clone(),
+            dir,
+            force_xx,
+        ));
         *self.state.health.lock().await = TransportHealth::default();
         let started = Instant::now();
         self.set_connection(connecting_connection()).await;
@@ -1107,9 +1380,19 @@ impl WssTransport {
                 return Err(error);
             }
         };
-        let stream = connect_async(endpoint)
-            .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()));
+        let stream = connect_async(endpoint).await.map_err(|err| {
+            if let tokio_tungstenite::tungstenite::Error::Http(response) = &err {
+                let status = response.status().as_u16();
+                if matches!(status, 401 | 403) {
+                    // The upgrade itself refused: the credentials, not the hub.
+                    self.state.closed_refused.store(true, Ordering::Release);
+                    return ThalovantError::hub_refused(format!(
+                        "the hub refused the WebSocket upgrade (HTTP {status})"
+                    ));
+                }
+            }
+            ThalovantError::Connection(err.to_string())
+        });
         let (stream, _) = match stream {
             Ok(stream) => stream,
             Err(error) => {
@@ -1151,6 +1434,34 @@ impl WssTransport {
                         }
                     }
                     Ok(WebSocketMessage::Close(frame)) => {
+                        // Read before the disconnect wakes anyone waiting on
+                        // it, so they read the verdict with the close. A
+                        // close frame with no status is 1005.
+                        let code = frame.as_ref().map_or(1005, |frame| u16::from(frame.code));
+                        let after = transport
+                            .state
+                            .handshake_done
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .map(|done| done.elapsed());
+                        let refused = close_refuses(Some(code), after, Duration::ZERO);
+                        transport
+                            .state
+                            .closed_refused
+                            .store(refused, Ordering::Release);
+                        if refused && after.is_none() {
+                            let kk_pending = transport
+                                .state
+                                .noise
+                                .lock()
+                                .await
+                                .as_ref()
+                                .is_some_and(NoiseChannel::kk_pending);
+                            transport
+                                .state
+                                .lifecycle
+                                .note_refusal_close(code, kk_pending);
+                        }
                         transport.mark_disconnected().await;
                         // The close status explains a peer refusal without echoing
                         // arbitrary remote reason text into diagnostics.
@@ -1190,12 +1501,12 @@ impl WssTransport {
         if !self.is_handshake_complete().await {
             let cause = self.state.health.lock().await.last_error.clone();
             self.disconnect_inner().await?;
-            let error = match cause {
+            let error = self.state.lifecycle.typed(match cause {
                 Some(reason) => ThalovantError::Connection(format!(
                     "v3 Noise handshake did not complete: {reason}"
                 )),
                 None => ThalovantError::Timeout("HiveMind WSS handshake timed out".to_string()),
-            };
+            });
             self.mark_error(&error).await;
             return Err(error);
         }
@@ -1294,7 +1605,8 @@ impl WssTransport {
             valid: &self.state.session_valid,
             committed: false,
         };
-        let (message, writes) = receive_noise(&mut slot, data, binary).await?;
+        let (message, writes) =
+            receive_noise(&self.state.lifecycle, &mut slot, data, binary).await?;
         let channel = slot
             .as_mut()
             .expect("successful receive restored its channel");
@@ -1308,6 +1620,11 @@ impl WssTransport {
         drop(writer);
         dispatch_noise_message(&self.state.bus_tx, &self.state.hive_tx, message);
         if ready {
+            self.state
+                .handshake_done
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_or_insert_with(Instant::now);
             let mut health = self.state.health.lock().await;
             health.handshake_complete = true;
             health.transport_alive = true;
@@ -1383,6 +1700,8 @@ impl WssTransport {
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
         health.connection.last_error = Some(error.to_string());
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 
     async fn mark_disconnected(&self) {
@@ -1392,6 +1711,8 @@ impl WssTransport {
         health.handshake_complete = false;
         health.transport_alive = false;
         health.connection.phase = TransportConnectionPhase::Closed;
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 
     async fn set_connection(&self, connection: TransportConnectionInfo) {
@@ -1533,7 +1854,12 @@ impl MqttTransport {
             ));
         }
         let dir = self.state.noise_state_dir.lock().await.clone();
-        *self.state.noise.lock().await = Some(NoiseChannel::new(self.state.identity.clone(), dir));
+        let force_xx = self.state.lifecycle.force_xx.load(Ordering::Acquire);
+        *self.state.noise.lock().await = Some(NoiseChannel::new(
+            self.state.identity.clone(),
+            dir,
+            force_xx,
+        ));
         let started = Instant::now();
         self.set_connection(connecting_connection()).await;
         let credentials = self.state.identity.mqtt.as_ref().ok_or_else(|| {
@@ -1657,9 +1983,9 @@ impl MqttTransport {
         }
         if !self.is_handshake_complete().await {
             let cause = self.state.health.lock().await.last_error.clone();
-            return Err(ThalovantError::Connection(cause.unwrap_or_else(|| {
-                "HiveMind MQTT Noise handshake did not complete".into()
-            })));
+            return Err(self.state.lifecycle.typed(ThalovantError::Connection(
+                cause.unwrap_or_else(|| "HiveMind MQTT Noise handshake did not complete".into()),
+            )));
         }
         self.mark_connection_ready(started, opened).await;
         Ok(())
@@ -1758,7 +2084,8 @@ impl MqttTransport {
             .as_mut()
             .ok_or_else(|| ThalovantError::Connection("MQTT transport is not connected".into()))?;
         let binary = channel.ready();
-        let (message, writes) = receive_noise(&mut slot, raw, binary).await?;
+        let (message, writes) =
+            receive_noise(&self.state.lifecycle, &mut slot, raw, binary).await?;
         let channel = slot
             .as_mut()
             .expect("successful receive restored its channel");
@@ -1843,6 +2170,8 @@ impl MqttTransport {
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
         health.connection.last_error = Some(error.to_string());
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 
     async fn mark_disconnected(&self) {
@@ -1852,6 +2181,8 @@ impl MqttTransport {
         health.handshake_complete = false;
         health.transport_alive = false;
         health.connection.phase = TransportConnectionPhase::Closed;
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 
     async fn set_connection(&self, connection: TransportConnectionInfo) {
@@ -1895,6 +2226,12 @@ struct NoiseChannel {
     handshake: Option<NoiseHandshake>,
     session: Option<NoiseSession>,
     failed: bool,
+    /// Use XX whatever is pinned: the KK attempt before this one failed.
+    force_xx: bool,
+    /// The pattern this channel's handshake uses, once chosen.
+    pattern: Option<String>,
+    /// A KK handshake whose answer did not authenticate.
+    kk_failed: bool,
 }
 
 struct NoiseWrite {
@@ -1917,6 +2254,7 @@ impl Drop for NoiseChannel {
 // a Tokio worker. A cancelled receiver leaves the old channel in its blocking
 // task; its result is dropped, never installed into a replacement generation.
 async fn receive_noise(
+    control: &ConnectionControl,
     slot: &mut Option<NoiseChannel>,
     data: Vec<u8>,
     binary: bool,
@@ -1934,6 +2272,10 @@ async fn receive_noise(
     })
     .await
     .map_err(|error| ThalovantError::Connection(format!("Noise worker failed: {error}")))?;
+    if let Err(error) = &result {
+        // Kept typed for whoever waits on the handshake in another task.
+        control.note_failure(error, Some(&channel));
+    }
     *slot = Some(channel);
     result
 }
@@ -1948,7 +2290,7 @@ async fn clear_noise(slot: &Mutex<Option<NoiseChannel>>) {
 }
 
 impl NoiseChannel {
-    fn new(identity: Identity, state_dir: Option<PathBuf>) -> Self {
+    fn new(identity: Identity, state_dir: Option<PathBuf>, force_xx: bool) -> Self {
         Self {
             identity,
             state_dir,
@@ -1957,7 +2299,17 @@ impl NoiseChannel {
             handshake: None,
             session: None,
             failed: false,
+            force_xx,
+            pattern: None,
+            kk_failed: false,
         }
+    }
+
+    /// A KK handshake is under way and has not finished.
+    fn kk_pending(&self) -> bool {
+        self.session.is_none()
+            && self.handshake.is_some()
+            && self.pattern.as_deref() == Some(crate::noise::NOISE_PATTERN_KK)
     }
 
     fn ready(&self) -> bool {
@@ -2105,10 +2457,13 @@ impl NoiseChannel {
             ));
         }
         let pin = load_noise_pin(self.state_dir.as_deref(), &self.node_id)?;
+        // After a failed KK, XX whatever is pinned; the pin is still checked
+        // when XX completes.
+        let selection_pin = if self.force_xx { None } else { pin.as_deref() };
         let (pattern, suite) = select_noise_options(
             &string_list(params.get("patterns")),
             &string_list(params.get("suites")),
-            pin.as_deref(),
+            selection_pin,
         )
         .ok_or_else(|| ThalovantError::Connection("no supported Noise pattern and suite".into()))?;
         let prologue = build_prologue(
@@ -2132,6 +2487,7 @@ impl NoiseChannel {
         let preferences = canonical_json(&json!({"binarize":false,"encodings":[]}));
         let msg = handshake.write_message(preferences.as_bytes())?;
         self.handshake = Some(handshake);
+        self.pattern = Some(pattern.clone());
         Ok(vec![Self::clear(
             json!({"pattern":pattern,"suite":suite,"msg":hex::encode(msg)}),
         )?])
@@ -2148,13 +2504,24 @@ impl NoiseChannel {
         let handshake = self.handshake.as_mut().ok_or_else(|| {
             ThalovantError::Connection("Noise response before negotiation".into())
         })?;
-        if let Err(error) = handshake.read_message(&msg) {
+        if handshake.read_message(&msg).is_err() {
             // Cache entries are derived credentials, not trust decisions. A
             // rejected stale PSK can be recomputed on the next connection, but
             // an authenticated hub pin must never be discarded on failure.
             let _ = forget_cached_psk(self.state_dir.as_deref(), &self.node_id);
             self.handshake = None;
-            return Err(error);
+            if self.pattern.as_deref() == Some(crate::noise::NOISE_PATTERN_KK) {
+                // The password or the hub's key is not what was pinned; the
+                // next attempt, made at once, uses XX to tell which.
+                self.kk_failed = true;
+            }
+            // The hub's answer did not authenticate under the key this
+            // password derives: the hub turned the credentials away (or the
+            // negotiation was tampered with, which retrying will not fix
+            // either). A refusal, like the hub closing on an unknown key.
+            return Err(ThalovantError::hub_refused(
+                "the hub's Noise handshake did not authenticate under this password (wrong password, or a tampered negotiation)",
+            ));
         }
         let mut writes = vec![];
         if !handshake.is_finished() {
@@ -2170,6 +2537,14 @@ impl NoiseChannel {
         let remote = session.remote_static_key().ok_or_else(|| {
             ThalovantError::Connection("Noise peer supplied no static identity".into())
         })?;
+        if load_noise_pin(self.state_dir.as_deref(), &self.node_id)?
+            .is_some_and(|pinned| !pinned.eq_ignore_ascii_case(remote))
+        {
+            // Never replaced here: that is the owner's decision.
+            return Err(ThalovantError::hub_key_changed(
+                "if the hub was not reinstalled or replaced, another machine may be answering at this address. If it was, drop the stale pin with forget_noise_pin and connect again",
+            ));
+        }
         pin_hub_key(self.state_dir.as_deref(), &self.node_id, remote)?;
         self.session = Some(session);
         writes.extend(self.encode(&hello_hive_message(&self.identity, "thalovant-rust-"))?);

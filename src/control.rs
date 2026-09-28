@@ -30,6 +30,19 @@ pub const DEFAULT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_SKILL_SOURCE_TYPE: &str = "catalog";
 const DEFAULT_CONTROL_USER_AGENT: &str = concat!("thalovant-rust-sdk/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(900);
+/// How long a `slow_down` lengthens a device code's poll interval, for good
+/// (RFC 8628 §3.5).
+const DEVICE_SLOW_DOWN: Duration = Duration::from_secs(5);
+/// Time between two reads of an operation the caller is waiting on.
+pub const DEFAULT_OPERATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// How long [`ControlPlane::wait_for_admission`] waits by default: a hub
+/// admits a new connection in about ninety seconds.
+pub const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(180);
+/// The scopes a Home Assistant link asks for at sign-in, and all a Free plan
+/// can approve.
+pub const HOME_ASSISTANT_SCOPES: &[&str] = &["hubs:read", "clients:read", "clients:write"];
+/// `spec.connection_type` of a Home Assistant link.
+pub const CONNECTION_TYPE_HOME_ASSISTANT: &str = "home_assistant";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +81,15 @@ pub struct ControlPlane {
     pub access_token: Option<String>,
     pub user_agent: String,
     http_client: reqwest::Client,
+    /// The id of the API token in `access_token`, when a device login minted
+    /// it; what [`ControlPlane::revoke_api_token`] revokes by default.
+    token_id: Option<String>,
+    /// Each device code's poll interval, lengthened by every `slow_down`.
+    device_intervals: HashMap<String, Duration>,
+    /// Whether the token this control plane signed in with has been revoked
+    /// and forgotten, so that revoking it again is the no-op it should be.
+    /// Every sign-in clears it.
+    revoked_own: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -107,7 +129,8 @@ impl fmt::Debug for LoginOptions {
 }
 
 /// A pending device authorization grant returned by
-/// `POST /v1/auth/device/authorize`.
+/// `POST /v1/auth/device/authorize`, from [`ControlPlane::begin_device_login`]
+/// or inside [`ControlPlane::login_with_browser`].
 ///
 /// The user completes the sign-in by visiting `verification_uri` and entering
 /// `user_code` (or by opening `verification_uri_complete`, which has the code
@@ -161,6 +184,73 @@ impl DeviceAuthorization {
         self.interval
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_DEVICE_POLL_INTERVAL)
+    }
+}
+
+/// An API token the API minted: the credential and what it may do.
+///
+/// Returned by [`ControlPlane::poll_device_login`], which also keeps it on the
+/// control plane. There is no refresh token; a device-login token lives 365
+/// days. Keep `token_id` to revoke it later with
+/// [`ControlPlane::revoke_api_token`]. `Debug` never prints `access_token`.
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ApiToken {
+    /// The bearer credential. Store it as a secret.
+    pub access_token: String,
+    /// `bearer` unless the API says otherwise.
+    pub token_type: String,
+    /// What the token may do, as the API granted it.
+    pub scopes: Vec<String>,
+    /// When the token stops working: an RFC 3339 timestamp exactly as the API
+    /// sent it, or `None` when it sent none.
+    pub expires_at: Option<String>,
+    /// The token's id, for [`ControlPlane::revoke_api_token`].
+    pub token_id: Option<String>,
+}
+
+impl fmt::Debug for ApiToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApiToken")
+            .field("access_token", &crate::redact::REDACTED)
+            .field("token_type", &self.token_type)
+            .field("scopes", &self.scopes)
+            .field("expires_at", &self.expires_at)
+            .field("token_id", &self.token_id)
+            .finish()
+    }
+}
+
+impl ApiToken {
+    fn from_value(token: &Value) -> Result<Self> {
+        let access_token = access_token_value(token).ok_or_else(|| {
+            ThalovantError::Api("token response did not include a usable access_token".to_string())
+        })?;
+        let text = |key: &str| {
+            token
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        Ok(Self {
+            access_token,
+            token_type: text("token_type").unwrap_or_else(|| "bearer".to_string()),
+            scopes: token
+                .get("scopes")
+                .and_then(Value::as_array)
+                .map(|scopes| {
+                    scopes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            expires_at: text("expires_at"),
+            token_id: text("token_id"),
+        })
     }
 }
 
@@ -336,7 +426,27 @@ impl ControlPlane {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("build control-plane HTTP client"),
+            token_id: None,
+            device_intervals: HashMap::new(),
+            revoked_own: false,
         }
+    }
+
+    /// The id of the API token this control plane signed in with, which
+    /// [`ControlPlane::revoke_api_token`] revokes by default.
+    ///
+    /// Every sign-in sets it from its own answer: a device login's token has
+    /// one, and a password sign-in's session token has none, so it never
+    /// names a token signed in with before.
+    pub fn token_id(&self) -> Option<&str> {
+        self.token_id.as_deref()
+    }
+
+    /// Keep a sign-in's token and the id it came with, or none.
+    fn accept_token(&mut self, access_token: String, token_id: Option<String>) {
+        self.access_token = Some(access_token);
+        self.token_id = token_id;
+        self.revoked_own = false;
     }
 
     pub fn with_access_token(access_token: impl Into<String>) -> Self {
@@ -394,7 +504,7 @@ impl ControlPlane {
         let access_token = access_token_value(&token).ok_or_else(|| {
             ThalovantError::Api("token response did not include a usable access_token".to_string())
         })?;
-        self.access_token = Some(access_token);
+        self.accept_token(access_token, token_id_value(&token));
         Ok(token)
     }
 
@@ -437,7 +547,7 @@ impl ControlPlane {
         let access_token = access_token_value(&token).ok_or_else(|| {
             ThalovantError::Api("token response did not include a usable access_token".to_string())
         })?;
-        self.access_token = Some(access_token);
+        self.accept_token(access_token, token_id_value(&token));
         Ok(token)
     }
 
@@ -452,11 +562,17 @@ impl ControlPlane {
     /// elapses.
     ///
     /// On approval the returned `access_token` is a durable scoped API token
-    /// and is stored on `self.access_token` exactly like [`ControlPlane::login`].
+    /// and is stored on `self.access_token` exactly like [`ControlPlane::login`],
+    /// with its id on [`ControlPlane::token_id`] for
+    /// [`ControlPlane::revoke_api_token`]. [`ControlPlane::begin_device_login`]
+    /// and [`ControlPlane::poll_device_login`] are the same flow one step at a
+    /// time, for a caller that runs its own loop.
     ///
     /// Errors: [`ThalovantError::DeviceAuthorizationDenied`],
     /// [`ThalovantError::DeviceAuthorizationExpired`], and
-    /// [`ThalovantError::Timeout`] when the wait exceeds `options.timeout`.
+    /// [`ThalovantError::Timeout`] when the wait exceeds `options.timeout`. Any
+    /// other failed poll is [`ThalovantError::ApiResponse`], carrying what the
+    /// API said.
     pub async fn login_with_browser(&mut self, options: DeviceLoginOptions) -> Result<Value> {
         let DeviceLoginOptions {
             scopes,
@@ -465,15 +581,61 @@ impl ControlPlane {
             timeout,
             prompt,
         } = options;
+        let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
+        let grant = self
+            .begin_device_login(&scopes, client_name.as_deref())
+            .await?;
+        match prompt.as_ref() {
+            Some(prompt) => prompt(&grant),
+            None => println!(
+                "To sign in, visit {} and enter the code {}",
+                grant.verification_uri, grant.user_code
+            ),
+        }
+        if open_browser {
+            if let Some(uri) = grant.verification_uri_complete.as_deref() {
+                open_url_in_browser(uri);
+            }
+        }
+        let token = self
+            .poll_device_token(&grant.device_code, grant.poll_interval(), timeout)
+            .await?;
+        let access_token = access_token_value(&token).ok_or_else(|| {
+            ThalovantError::Api("token response did not include a usable access_token".to_string())
+        })?;
+        self.accept_token(access_token, token_id_value(&token));
+        Ok(token)
+    }
+
+    /// Start a device sign-in: a code for a person to approve in a browser.
+    ///
+    /// The device flow one step at a time, for a caller that runs its own
+    /// loop -- a Home Assistant config flow shows the code, then polls on its
+    /// own schedule. Show the person `verification_uri` and `user_code` (or
+    /// `verification_uri_complete`, which carries the code), then call
+    /// [`ControlPlane::poll_device_login`] every
+    /// [`DeviceAuthorization::poll_interval`].
+    ///
+    /// `scopes` are what the token will carry; empty lets the API apply its
+    /// defaults. A Home Assistant link asks for [`HOME_ASSISTANT_SCOPES`],
+    /// which is also all a Free plan can approve. A blank `client_name` is not
+    /// sent. A verification URL that is not HTTP(S), has no host, or carries
+    /// credentials fails with [`ThalovantError::Api`]: it is about to be opened
+    /// in a browser.
+    pub async fn begin_device_login(
+        &self,
+        scopes: &[&str],
+        client_name: Option<&str>,
+    ) -> Result<DeviceAuthorization> {
         let mut body = Map::new();
         if !scopes.is_empty() {
             body.insert(
                 "scopes".to_string(),
-                Value::Array(scopes.into_iter().map(Value::String).collect()),
+                Value::Array(scopes.iter().map(|scope| Value::from(*scope)).collect()),
             );
         }
         if let Some(client_name) = client_name.filter(|value| !value.trim().is_empty()) {
-            body.insert("client_name".to_string(), Value::String(client_name));
+            body.insert("client_name".to_string(), Value::from(client_name));
         }
         let grant = self
             .request(
@@ -493,26 +655,127 @@ impl ControlPlane {
         {
             return Err(ThalovantError::Api("device authorization requires HTTP(S) verification URLs without embedded credentials".into()));
         }
-        match prompt.as_ref() {
-            Some(prompt) => prompt(&grant),
-            None => println!(
-                "To sign in, visit {} and enter the code {}",
-                grant.verification_uri, grant.user_code
-            ),
-        }
-        if open_browser {
-            if let Some(uri) = grant.verification_uri_complete.as_deref() {
-                open_url_in_browser(uri);
+        Ok(grant)
+    }
+
+    /// Ask once whether a device sign-in was approved.
+    ///
+    /// Sends one `POST /v1/auth/device/token`. On approval the token is kept
+    /// on this control plane (`access_token`, and [`ControlPlane::token_id`])
+    /// and returned. Otherwise:
+    ///
+    /// - [`ThalovantError::DeviceLoginPending`]: nobody has decided yet; poll
+    ///   again after its `interval`, which a `slow_down` has already
+    ///   lengthened by five seconds -- for good, for this device code;
+    /// - [`ThalovantError::DeviceLoginExpired`]: begin again for a new code;
+    /// - [`ThalovantError::DeviceLoginDenied`]: the person said no;
+    /// - [`ThalovantError::Api`] for an answer without an `access_token`, and
+    ///   [`ThalovantError::ApiResponse`] for any other failure, carrying what
+    ///   the API said.
+    ///
+    /// Neither the device code nor the token ever appears in an error.
+    pub async fn poll_device_login(
+        &mut self,
+        authorization: &DeviceAuthorization,
+    ) -> Result<ApiToken> {
+        let device_code = authorization.device_code.as_str();
+        let interval = *self
+            .device_intervals
+            .entry(device_code.to_string())
+            .or_insert_with(|| authorization.poll_interval());
+        match self.device_token_once(device_code, interval).await {
+            Ok(token) => {
+                self.device_intervals.remove(device_code);
+                let token = ApiToken::from_value(&token)?;
+                self.accept_token(token.access_token.clone(), token.token_id.clone());
+                Ok(token)
+            }
+            Err(ThalovantError::DeviceLoginPending {
+                interval,
+                status_code,
+                problem,
+            }) => {
+                self.device_intervals
+                    .insert(device_code.to_string(), interval);
+                Err(ThalovantError::DeviceLoginPending {
+                    interval,
+                    status_code,
+                    problem,
+                })
+            }
+            Err(error) => {
+                if matches!(
+                    error,
+                    ThalovantError::DeviceLoginExpired { .. }
+                        | ThalovantError::DeviceLoginDenied { .. }
+                ) {
+                    self.device_intervals.remove(device_code);
+                }
+                Err(error)
             }
         }
-        let token = self
-            .poll_device_token(&grant.device_code, grant.poll_interval(), timeout)
-            .await?;
-        let access_token = access_token_value(&token).ok_or_else(|| {
-            ThalovantError::Api("token response did not include a usable access_token".to_string())
-        })?;
-        self.access_token = Some(access_token);
-        Ok(token)
+    }
+
+    /// Revoke an API token; by default the one this control plane signed in
+    /// with.
+    ///
+    /// Sends `DELETE /v1/auth/api-tokens/{token_id}`, authenticated with the
+    /// current token: a token may always revoke itself, whatever its scopes.
+    /// Revoking the token in use forgets it here too (`access_token` and
+    /// [`ControlPlane::token_id`] become `None`), so a later call fails
+    /// locally rather than with a 401.
+    ///
+    /// Revoking the token in use is idempotent. A token already revoked, or
+    /// expired, cannot authenticate its own revoke, so the API answers 401;
+    /// the token is dead either way, so that counts as revoked and the token
+    /// is forgotten. Revoking it again then sends nothing and succeeds, until
+    /// the next sign-in. Revoking another token by id is not: the API's own
+    /// answer (404 for one it does not know, 401) is returned as usual.
+    /// Without a `token_id` and with no token of its own to revoke, fails
+    /// with [`ThalovantError::Api`].
+    ///
+    /// It takes `&mut self`, as every sign-in does, so no sign-in on this
+    /// control plane can run while the revoke is in flight: the token it
+    /// forgets is always the one it revoked, never one a sign-in stored
+    /// meanwhile. Share a control plane between tasks behind a lock, or give
+    /// each task a clone, which holds its own token.
+    pub async fn revoke_api_token(&mut self, token_id: Option<&str>) -> Result<()> {
+        let target = token_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| self.token_id.clone());
+        let Some(target) = target else {
+            if self.revoked_own && self.access_token.is_none() {
+                // Already revoked and forgotten: revoking again changes nothing.
+                return Ok(());
+            }
+            return Err(ThalovantError::Api(
+                "no API token id to revoke: pass one, or sign in with a device login first".into(),
+            ));
+        };
+        let own = self.token_id.as_deref() == Some(target.as_str());
+        let revoked = self
+            .request(
+                "DELETE",
+                &format!("/v1/auth/api-tokens/{}", urlencoding::encode(&target)),
+                None,
+                None,
+                true,
+            )
+            .await;
+        match revoked {
+            Ok(_) => {}
+            // The token in use could not authenticate its own revoke: it is
+            // revoked or expired already, which is what was asked.
+            Err(error) if own && error.status_code() == Some(401) => {}
+            Err(error) => return Err(error),
+        }
+        if own {
+            self.access_token = None;
+            self.token_id = None;
+            self.revoked_own = true;
+        }
+        Ok(())
     }
 
     async fn poll_device_token(
@@ -547,46 +810,19 @@ impl ControlPlane {
     where
         SleepFut: Future<Output = ()>,
     {
-        let body = json!({ "device_code": device_code });
         let mut wait = interval;
         loop {
-            let (status, text) = self
-                .send_request(
-                    "POST",
-                    "/v1/auth/device/token",
-                    Some(body.clone()),
-                    None,
-                    false,
-                )
-                .await?;
-            if status.is_success() {
-                if text.trim().is_empty() {
-                    return Err(ThalovantError::Api(
-                        "device token response was empty".to_string(),
-                    ));
+            match self.device_token_once(device_code, wait).await {
+                Ok(token) => return Ok(token),
+                Err(ThalovantError::DeviceLoginPending { interval, .. }) => wait = interval,
+                // What this call has always returned for the two decisions.
+                Err(ThalovantError::DeviceLoginDenied { .. }) => {
+                    return Err(ThalovantError::DeviceAuthorizationDenied)
                 }
-                return serde_json::from_str::<Value>(&text).map_err(ThalovantError::from);
-            }
-            let parsed = serde_json::from_str::<Value>(&text).ok();
-            let error = (status == reqwest::StatusCode::BAD_REQUEST)
-                .then(|| {
-                    parsed
-                        .as_ref()
-                        .and_then(|value| value.get("error"))
-                        .and_then(Value::as_str)
-                })
-                .flatten();
-            match error {
-                Some("authorization_pending") => {}
-                Some("slow_down") => wait += Duration::from_secs(5),
-                Some("access_denied") => return Err(ThalovantError::DeviceAuthorizationDenied),
-                Some("expired_token") => return Err(ThalovantError::DeviceAuthorizationExpired),
-                _ => {
-                    return Err(ThalovantError::Api(format!(
-                        "HTTP {status}: {}",
-                        server_error_detail(&text)
-                    )))
+                Err(ThalovantError::DeviceLoginExpired { .. }) => {
+                    return Err(ThalovantError::DeviceAuthorizationExpired)
                 }
+                Err(error) => return Err(error),
             }
             let remaining = timeout.saturating_sub(elapsed());
             if remaining.is_zero() {
@@ -595,6 +831,63 @@ impl ControlPlane {
                 ));
             }
             sleep(wait.min(remaining)).await;
+        }
+    }
+
+    /// One `POST /v1/auth/device/token`: the token, or why there is none yet.
+    ///
+    /// `interval` is the device code's current poll interval; a pending
+    /// answer returns it, five seconds longer after a `slow_down`.
+    async fn device_token_once(&self, device_code: &str, interval: Duration) -> Result<Value> {
+        let body = json!({ "device_code": device_code });
+        let (status, text) = self
+            .send_request("POST", "/v1/auth/device/token", Some(body), None, false)
+            .await?;
+        if status.is_success() {
+            if text.trim().is_empty() {
+                return Err(ThalovantError::Api(
+                    "device token response was empty".to_string(),
+                ));
+            }
+            return serde_json::from_str::<Value>(&text).map_err(ThalovantError::from);
+        }
+        let parsed = serde_json::from_str::<Value>(&text).ok();
+        let error = (status == reqwest::StatusCode::BAD_REQUEST)
+            .then(|| {
+                parsed
+                    .as_ref()
+                    .and_then(|value| value.get("error"))
+                    .and_then(Value::as_str)
+            })
+            .flatten()
+            .map(str::to_string);
+        let status_code = status.as_u16();
+        let problem = match parsed {
+            Some(Value::Object(map)) => Some(Box::new(ApiProblem::from(map))),
+            _ => None,
+        };
+        match error.as_deref() {
+            Some("authorization_pending") => Err(ThalovantError::DeviceLoginPending {
+                interval,
+                status_code,
+                problem,
+            }),
+            Some("slow_down") => Err(ThalovantError::DeviceLoginPending {
+                interval: interval.saturating_add(DEVICE_SLOW_DOWN),
+                status_code,
+                problem,
+            }),
+            Some("access_denied") => Err(ThalovantError::DeviceLoginDenied {
+                status_code,
+                problem,
+            }),
+            Some("expired_token") => Err(ThalovantError::DeviceLoginExpired {
+                status_code,
+                problem,
+            }),
+            // Every other failure through the one builder, so it carries what
+            // the API said like any other call.
+            _ => Err(api_response_error(status, &text)),
         }
     }
 
@@ -1346,6 +1639,54 @@ impl ControlPlane {
         hub: Value,
         opts: BootstrapIdentityOptions,
     ) -> Result<BootstrapIdentityResult> {
+        self.provision_client_identity(hub, opts, None).await
+    }
+
+    /// [`ControlPlane::create_client_identity`] for a connection of a named
+    /// kind, such as [`CONNECTION_TYPE_HOME_ASSISTANT`].
+    ///
+    /// The kind is sent as `spec.connection_type` (over any the caller's
+    /// `opts.spec` holds) and decides what the connection may send and
+    /// receive. The API must say the connection is of that kind:
+    ///
+    /// - a 422 that names `connection_type` in its `detail` or `code`, or in a
+    ///   validation error's `loc` or `msg` -- never in the rest of the body,
+    ///   which echoes the request -- and a created connection whose
+    ///   `spec.connection_type` did not come back as asked, fail with
+    ///   [`ThalovantError::UnsupportedConnectionType`]. The second is an
+    ///   ordinary connection nobody asked for, so it is deleted first
+    ///   (`DELETE` with `If-Match:` the answer's `etag`);
+    /// - every other refusal is what it always is, usually
+    ///   [`ThalovantError::ApiResponse`]; [`ThalovantError::api_refusal`]
+    ///   tells a plan refusal, a hub already linked (with
+    ///   [`ThalovantError::linked_client_id`]) and a token to sign in again
+    ///   apart.
+    ///
+    /// [`BootstrapIdentityResult::operation`] tracks the hub admitting the
+    /// connection, about ninety seconds; [`ControlPlane::wait_for_admission`]
+    /// waits for it.
+    pub async fn create_client_identity_of_type(
+        &self,
+        hub: Value,
+        connection_type: &str,
+        opts: BootstrapIdentityOptions,
+    ) -> Result<BootstrapIdentityResult> {
+        let connection_type = connection_type.trim();
+        if connection_type.is_empty() {
+            return Err(ThalovantError::Api(
+                "connection type must not be blank".to_string(),
+            ));
+        }
+        self.provision_client_identity(hub, opts, Some(connection_type))
+            .await
+    }
+
+    async fn provision_client_identity(
+        &self,
+        hub: Value,
+        opts: BootstrapIdentityOptions,
+        connection_type: Option<&str>,
+    ) -> Result<BootstrapIdentityResult> {
         if opts.name.trim().is_empty() {
             return Err(ThalovantError::Api("client name is required".to_string()));
         }
@@ -1360,6 +1701,9 @@ impl ControlPlane {
         let mut spec = sanitize_caller_spec(&opts.spec);
         spec.entry("version".to_string())
             .or_insert_with(|| Value::String("1".to_string()));
+        if let Some(connection_type) = connection_type {
+            spec.insert("connection_type".to_string(), Value::from(connection_type));
+        }
         spec.insert("apiKey".to_string(), Value::String(api_key.clone()));
         spec.insert("password".to_string(), Value::String(password.clone()));
         spec.insert("siteId".to_string(), Value::String(site_id.clone()));
@@ -1377,9 +1721,27 @@ impl ControlPlane {
             payload.insert("owner_id".to_string(), Value::String(owner_id));
         }
 
-        let client = self
+        let created = self
             .create_client(Value::Object(payload), opts.idempotency_key)
-            .await?;
+            .await;
+        let client = match (created, connection_type) {
+            (Ok(client), _) => client,
+            (Err(error), Some(kind)) if refuses_connection_type(&error) => {
+                return Err(ThalovantError::UnsupportedConnectionType {
+                    connection_type: kind.to_string(),
+                    reason: format!(
+                        "the Thalovant API cannot create one yet (HTTP {})",
+                        error.status_code().unwrap_or(422)
+                    ),
+                    status_code: error.status_code(),
+                    problem: error.api_problem().cloned().map(Box::new),
+                });
+            }
+            (Err(error), _) => return Err(error),
+        };
+        if let Some(kind) = connection_type {
+            self.require_connection_type(&client, kind).await?;
+        }
         let protocols = HubProtocolSettings::from_value(&hub);
         let endpoints = HubDataPlaneEndpoints::from_hub(&hub);
         let preferred = if opts.preferred_protocols.is_empty() {
@@ -1423,6 +1785,262 @@ impl ControlPlane {
         })
     }
 
+    /// Delete and refuse a connection the API did not make of the kind asked.
+    async fn require_connection_type(&self, client: &Value, connection_type: &str) -> Result<()> {
+        let echoed = client
+            .get("spec")
+            .and_then(|spec| spec.get("connection_type"))
+            .and_then(Value::as_str);
+        if echoed == Some(connection_type) {
+            return Ok(());
+        }
+        let answered = echoed
+            .map(|kind| format!("a `{kind}`"))
+            .unwrap_or_else(|| "an untyped".to_string());
+        let mut reason = format!("the Thalovant API made {answered} connection instead");
+        if let Some(client_id) = client
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            let etag = client
+                .get("etag")
+                .and_then(Value::as_str)
+                .filter(|etag| !etag.is_empty());
+            if self.delete_client(client_id, etag).await.is_ok() {
+                reason.push_str(", and it was deleted");
+            } else {
+                reason.push_str(&format!(
+                    "; deleting it ({client_id}) failed, so remove it in the dashboard"
+                ));
+            }
+        }
+        Err(ThalovantError::UnsupportedConnectionType {
+            connection_type: connection_type.to_string(),
+            reason,
+            status_code: None,
+            problem: None,
+        })
+    }
+
+    /// Fetch one client (a hub connection), with the `etag` a change needs.
+    pub async fn get_client(&self, client_id: &str) -> Result<Value> {
+        self.request(
+            "GET",
+            &format!("/v1/clients/{}", urlencoding::encode(client_id)),
+            None,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Delete a client (a hub connection).
+    ///
+    /// The API wants the client's current `etag` as `If-Match`. Without one
+    /// (`None`, or blank) this reads it first with [`ControlPlane::get_client`];
+    /// when another writer changed the client in between (HTTP 412) it reads
+    /// it once more and retries, once. A client that is already gone (HTTP
+    /// 404, on the read or the delete) counts as deleted.
+    pub async fn delete_client(&self, client_id: &str, etag: Option<&str>) -> Result<()> {
+        let path = format!("/v1/clients/{}", urlencoding::encode(client_id));
+        let mut etag = etag
+            .filter(|etag| !etag.trim().is_empty())
+            .map(str::to_string);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let result = match etag.take() {
+                Some(etag) => Ok(etag),
+                None => self.get_client(client_id).await.and_then(|client| {
+                    client
+                        .get("etag")
+                        .and_then(Value::as_str)
+                        .filter(|etag| !etag.is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            ThalovantError::Api("client resource is missing etag".to_string())
+                        })
+                }),
+            };
+            let result = match result {
+                Ok(etag) => self
+                    .request(
+                        "DELETE",
+                        &path,
+                        None,
+                        Some(single_header("If-Match", &etag)?),
+                        true,
+                    )
+                    .await
+                    .map(|_| ()),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) if error.status_code() == Some(404) => return Ok(()),
+                Err(error) if error.status_code() == Some(412) && attempt < 2 => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Wait until a hub has admitted a new connection, about ninety seconds
+    /// after it was created.
+    ///
+    /// `operation` is [`BootstrapIdentityResult::operation`]. This polls
+    /// `GET /v1/operations/{id}` every `poll_interval`
+    /// ([`DEFAULT_OPERATION_POLL_INTERVAL`]) for up to `timeout`
+    /// ([`DEFAULT_ADMISSION_TIMEOUT`]):
+    ///
+    /// - `ready` returns; so does no operation at all, and one the API no
+    ///   longer tracks (HTTP 404), at once;
+    /// - `failed` and `timed_out` fail with [`ThalovantError::AdmissionFailed`]
+    ///   carrying the operation's `error_code` and no status;
+    /// - a 401 or 403 is the token, not the connection: it is returned as the
+    ///   [`ThalovantError::ApiResponse`] it is ([`ThalovantError::api_refusal`]
+    ///   says `Auth`), never a failed admission;
+    /// - any other refusal of the wait itself is
+    ///   [`ThalovantError::AdmissionFailed`] with no `error_code`, keeping its
+    ///   status and problem ([`ThalovantError::api_code`],
+    ///   [`ThalovantError::api_detail`]);
+    /// - a 5xx is ridden out, and so is a 429: the next poll waits the
+    ///   problem's `retry_after_seconds` (at its top, or inside a `detail`
+    ///   object), else the `Retry-After` header, else `RateLimit-Reset`, or
+    ///   `poll_interval` when that is longer; a 429 asking for longer than is
+    ///   left is [`ThalovantError::AdmissionTimeout`] at once;
+    /// - when `timeout` passes first -- every read is bounded by it --
+    ///   [`ThalovantError::AdmissionTimeout`], which is both a connection
+    ///   error and a timeout: the hub may still admit the connection later.
+    ///
+    /// An operation whose `links.self` is an absolute URL on another origin
+    /// than this control plane's -- scheme, host and port, with default ports
+    /// spelled out -- fails with [`ThalovantError::Api`] and is never
+    /// fetched, because the token goes nowhere else. An API out of reach
+    /// (the [`ThalovantError::Api`] that
+    /// [`ThalovantError::is_api_unreachable`] is true for) is returned as it
+    /// is, and so is any other error that is not an answer from the API,
+    /// such as no token.
+    pub async fn wait_for_admission(
+        &self,
+        operation: Option<&OperationResource>,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        let Some(operation) = operation else {
+            return Ok(());
+        };
+        if poll_interval.is_zero() {
+            return Err(ThalovantError::Api(
+                "the admission poll interval must be positive".into(),
+            ));
+        }
+        let link = operation
+            .links
+            .get("self")
+            .and_then(Option::as_deref)
+            .map(str::trim)
+            .unwrap_or_default();
+        let lowered = link.to_ascii_lowercase();
+        if lowered.starts_with("http://") || lowered.starts_with("https://") {
+            let same_origin = match (url::Url::parse(link), url::Url::parse(&self.api_url)) {
+                (Ok(link), Ok(api)) => link.origin() == api.origin(),
+                _ => false,
+            };
+            if !same_origin {
+                return Err(ThalovantError::Api(
+                    "the admission operation points outside the Thalovant API, so it was not fetched"
+                        .into(),
+                ));
+            }
+        }
+        let operation_id = Some(operation.id.trim())
+            .filter(|id| !id.is_empty())
+            .or_else(|| operation_id_from_link(link))
+            .ok_or_else(|| ThalovantError::Api("an operation needs an id to wait on".into()))?
+            .to_string();
+        let path = format!("/v1/operations/{}", urlencoding::encode(&operation_id));
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| ThalovantError::Api("the admission timeout is too large".into()))?;
+        let timed_out = || ThalovantError::AdmissionTimeout { timeout };
+        loop {
+            let mut wait = poll_interval;
+            // Every read is bounded by what is left of the wait: a read the
+            // API is slow to answer must not carry the wait past it.
+            let (polled, asked) =
+                tokio::time::timeout_at(deadline, self.get_with_retry_after(&path))
+                    .await
+                    .map_err(|_| timed_out())?;
+            match polled {
+                Ok(current) => match current.get("status").and_then(Value::as_str) {
+                    Some("ready") => return Ok(()),
+                    Some(status @ ("failed" | "timed_out")) => {
+                        let error_code = current
+                            .get("error_code")
+                            .and_then(Value::as_str)
+                            .filter(|code| !code.is_empty())
+                            .map(str::to_string);
+                        let said = current
+                            .get("error_message")
+                            .and_then(Value::as_str)
+                            .map(one_bounded_line)
+                            .filter(|message| !message.is_empty())
+                            .or_else(|| error_code.clone())
+                            .unwrap_or_else(|| "no detail".to_string());
+                        return Err(ThalovantError::AdmissionFailed {
+                            error_code,
+                            reason: format!(
+                                "the hub could not admit the connection: operation {operation_id} ended {status}: {said}"
+                            ),
+                            status_code: None,
+                            problem: None,
+                        });
+                    }
+                    // requested, committed, applied: keep polling.
+                    _ => {}
+                },
+                Err(error) => match error.status_code() {
+                    Some(404) => return Ok(()),
+                    // The token, not the connection: signing in again fixes
+                    // it, so it is the API's own answer, unchanged.
+                    Some(401 | 403) => return Err(error),
+                    Some(429) => {
+                        // A Free plan allows 60 requests a minute, and a wait
+                        // must not end over one of them: wait what the API
+                        // asks, never less than the poll interval.
+                        wait = poll_interval.max(asked.unwrap_or_default());
+                        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if wait > left {
+                            // Waiting it out would only end in the same
+                            // timeout, later.
+                            return Err(timed_out());
+                        }
+                    }
+                    Some(status) if status >= 500 => {}
+                    Some(status) => {
+                        return Err(ThalovantError::AdmissionFailed {
+                            error_code: None,
+                            reason: format!(
+                                "the API refused the wait for the connection's admission (HTTP {status})"
+                            ),
+                            status_code: Some(status),
+                            problem: error.api_problem().cloned().map(Box::new),
+                        })
+                    }
+                    // Not an answer from the API -- it is out of reach, or no
+                    // request could be made: as it is, never a failed admission.
+                    None => return Err(error),
+                },
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(timed_out());
+            }
+            tokio::time::sleep(wait.min(deadline - now)).await;
+        }
+    }
+
     pub fn require_runtime_protocol(
         &self,
         result: &BootstrapIdentityResult,
@@ -1451,17 +2069,34 @@ impl ControlPlane {
         auth: bool,
     ) -> Result<Value> {
         let (status, body) = self.send_request(method, path, body, headers, auth).await?;
-        if !status.is_success() {
-            return Err(api_response_error(status, &body));
+        answer_value(status, &body)
+    }
+
+    /// An authenticated GET, and how long a refusal of it asked the caller to
+    /// wait: the problem's `retry_after_seconds` (at its top or inside a
+    /// `detail` object), else the `Retry-After` header, else
+    /// `RateLimit-Reset`. The API's own rate limiter answers a 429 in plain
+    /// text with only the `RateLimit-*` headers, so the headers are the only
+    /// place that says it.
+    async fn get_with_retry_after(&self, path: &str) -> (Result<Value>, Option<Duration>) {
+        match self.send_request_with_wait(path).await {
+            Err(error) => (Err(error), None),
+            Ok((status, body, header_wait)) => {
+                let answer = answer_value(status, &body);
+                let wait = answer
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.api_problem().and_then(retry_after).or(header_wait));
+                (answer, wait)
+            }
         }
-        if body.trim().is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_str::<Value>(&body).map_err(|_| ThalovantError::ApiResponse {
-            status_code: status.as_u16(),
-            detail: "invalid JSON response".into(),
-            problem: None,
-        })
+    }
+
+    async fn send_request_with_wait(
+        &self,
+        path: &str,
+    ) -> Result<(reqwest::StatusCode, String, Option<Duration>)> {
+        self.send_request_full("GET", path, None, None, true).await
     }
 
     async fn send_request(
@@ -1472,6 +2107,19 @@ impl ControlPlane {
         headers: Option<HeaderMap>,
         auth: bool,
     ) -> Result<(reqwest::StatusCode, String)> {
+        self.send_request_full(method, path, body, headers, auth)
+            .await
+            .map(|(status, body, _)| (status, body))
+    }
+
+    async fn send_request_full(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: Option<HeaderMap>,
+        auth: bool,
+    ) -> Result<(reqwest::StatusCode, String, Option<Duration>)> {
         let url = format!("{}{}", self.api_url, path.trim_start_matches('/'));
         let url = validate_control_request_url(&url, auth || body.is_some())?;
         let mut request_headers = HeaderMap::new();
@@ -1508,11 +2156,9 @@ impl ControlPlane {
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|err| ThalovantError::Api(err.without_url().to_string()))?;
+        let response = request.send().await.map_err(unreachable)?;
         let status = response.status();
+        let header_wait = header_retry_after(response.headers());
         if status.is_redirection() {
             return Err(ThalovantError::ApiResponse {
                 status_code: status.as_u16(),
@@ -1521,10 +2167,7 @@ impl ControlPlane {
             });
         }
         let body = if status.is_success() {
-            response
-                .text()
-                .await
-                .map_err(|err| ThalovantError::Api(err.without_url().to_string()))?
+            response.text().await.map_err(unreachable)?
         } else {
             // UTF-8 whatever the Content-Type says: the API sends
             // `application/problem+json` with no charset, and every SDK has
@@ -1533,8 +2176,53 @@ impl ControlPlane {
             let text = String::from_utf8_lossy(&bytes);
             text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()
         };
-        Ok((status, body))
+        Ok((status, body, header_wait))
     }
+}
+
+/// The error for a request the API never answered: an
+/// [`ThalovantError::Api`] that [`ThalovantError::is_api_unreachable`] is
+/// true for, with the request URL stripped, since an error chain can carry
+/// it. A request that could not even be formed is a plain
+/// [`ThalovantError::Api`]: trying again will not help it.
+fn unreachable(error: reqwest::Error) -> ThalovantError {
+    let builder = error.is_builder();
+    let message = error.without_url().to_string();
+    if builder {
+        ThalovantError::Api(message)
+    } else {
+        ThalovantError::api_unreachable(message)
+    }
+}
+
+/// A successful answer's body as JSON (`Null` when empty), or the error an
+/// unsuccessful one is.
+fn answer_value(status: reqwest::StatusCode, body: &str) -> Result<Value> {
+    if !status.is_success() {
+        return Err(api_response_error(status, body));
+    }
+    if body.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str::<Value>(body).map_err(|_| ThalovantError::ApiResponse {
+        status_code: status.as_u16(),
+        detail: "invalid JSON response".into(),
+        problem: None,
+    })
+}
+
+/// `Retry-After` in whole seconds, else `RateLimit-Reset` (seconds until the
+/// window resets). An HTTP-date `Retry-After` is not read.
+fn header_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    ["retry-after", "ratelimit-reset"]
+        .into_iter()
+        .find_map(|name| {
+            let value = headers.get(name)?.to_str().ok()?.trim();
+            (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| value.parse::<u64>().ok())
+                .flatten()
+                .map(Duration::from_secs)
+        })
 }
 
 fn validate_control_request_url(raw: &str, sensitive: bool) -> Result<url::Url> {
@@ -1565,6 +2253,32 @@ impl Default for ControlPlane {
 impl BootstrapIdentityResult {
     pub fn selected_protocol(&self) -> Option<HubProtocol> {
         self.endpoint.as_ref().map(|endpoint| endpoint.protocol)
+    }
+
+    /// The new client's id.
+    pub fn client_id(&self) -> Option<&str> {
+        self.client
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+    }
+
+    /// The connection type the API recorded for the client
+    /// (`spec.connection_type`), such as `home_assistant`.
+    pub fn connection_type(&self) -> Option<&str> {
+        self.client
+            .get("spec")
+            .and_then(|spec| spec.get("connection_type"))
+            .and_then(Value::as_str)
+    }
+
+    /// The operation that carries the new client to its hub, when the API
+    /// returned one; [`ControlPlane::wait_for_admission`] waits for it.
+    pub fn operation(&self) -> Option<OperationResource> {
+        self.client
+            .get("operation")
+            .filter(|operation| operation.is_object())
+            .and_then(|operation| serde_json::from_value(operation.clone()).ok())
     }
 
     pub fn as_value(&self, include_secrets: bool) -> Value {
@@ -1825,6 +2539,98 @@ fn access_token_value(token: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A token response's `token_id`, when it is a non-empty string.
+fn token_id_value(token: &Value) -> Option<String> {
+    token
+        .get("token_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// A 422 whose problem is about `connection_type`.
+///
+/// Read from the problem's `detail` and `code`, and from each validation
+/// error's `loc` and `msg` (under `errors`, or under `detail` when that is a
+/// list) -- never from the rest of the body. A validation error echoes what
+/// was sent as `input`, and the request always carries
+/// `spec.connection_type`, so a 422 about any other field would otherwise
+/// read as "this kind is not supported".
+fn refuses_connection_type(error: &ThalovantError) -> bool {
+    if error.status_code() != Some(422) {
+        return false;
+    }
+    let mut said: Vec<String> = [error.api_detail(), error.api_code()]
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    if let Some(problem) = error.api_problem() {
+        let entries = ["errors", "detail"]
+            .into_iter()
+            .filter_map(|key| problem.get(key).and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_object);
+        for entry in entries {
+            match entry.get("loc") {
+                Some(Value::Array(parts)) => said.push(
+                    parts
+                        .iter()
+                        .map(|part| match part {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("."),
+                ),
+                Some(Value::String(location)) => said.push(location.clone()),
+                _ => {}
+            }
+            if let Some(message) = entry.get("msg").and_then(Value::as_str) {
+                said.push(message.to_string());
+            }
+        }
+    }
+    said.iter()
+        .any(|text| text.contains("connection_type") || text.contains("connectionType"))
+}
+
+/// The `retry_after_seconds` a 429 names: at the top of the problem, or
+/// inside a `detail` that is itself an object (FastAPI's envelope, which is
+/// how the API sends its rate limits). A non-negative number, or nothing.
+fn retry_after(problem: &ApiProblem) -> Option<Duration> {
+    let nested = problem.get("detail").and_then(Value::as_object);
+    [Some(problem.as_map()), nested]
+        .into_iter()
+        .flatten()
+        .find_map(|source| {
+            source
+                .get("retry_after_seconds")
+                .and_then(Value::as_f64)
+                .filter(|seconds| *seconds >= 0.0)
+        })
+        // Longer than a Duration holds is longer than any wait.
+        .map(|seconds| Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX))
+}
+
+/// The id at the end of an operation's `links.self`.
+fn operation_id_from_link(link: &str) -> Option<&str> {
+    let (_, tail) = link.rsplit_once("/v1/operations/")?;
+    let id = tail.split(['?', '#']).next().unwrap_or_default();
+    Some(id.trim_matches('/')).filter(|id| !id.is_empty())
+}
+
+/// Text from the API as one line, whitespace collapsed and cut at 200
+/// characters.
+fn one_bounded_line(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 200 {
+        format!("{}...", collapsed.chars().take(200).collect::<String>())
+    } else {
+        collapsed
+    }
+}
+
 fn json_string(value: &Value) -> Option<String> {
     match value {
         Value::String(raw) => {
@@ -1843,6 +2649,10 @@ fn json_string(value: &Value) -> Option<String> {
 /// are *sent* credentials that an error response may echo); whitespace is then
 /// collapsed and the result is length-bounded so a large or multi-line body
 /// never lands verbatim in `last_error`, logs, or a bug report.
+///
+/// Every failure now goes through [`api_response_error`], which builds the
+/// same line; this is the line alone, for the tests that pin it.
+#[cfg(test)]
 fn server_error_detail(body: &str) -> String {
     error_display_line(serde_json::from_str::<Value>(body).ok().as_ref())
 }

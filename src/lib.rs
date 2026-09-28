@@ -11,6 +11,7 @@ pub mod control;
 pub mod errors;
 pub mod events;
 pub mod hive;
+pub mod home;
 pub mod hubs;
 pub mod identity;
 pub mod intents;
@@ -33,16 +34,24 @@ pub use client::{
 pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
 pub use control::{
-    AnalyticsOverviewOptions, BootstrapIdentityOptions, BootstrapIdentityResult, ControlPlane,
-    DeviceAuthorization, DeviceLoginOptions, DevicePrompt, HubSkillWaitOptions, LoginOptions,
-    MarketplaceSkillsOptions, MemoryListOptions, OperationResource, OperationStatus,
-    ReleaseOptions, SkillInstallOptions, DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL,
-    DEFAULT_SKILL_SOURCE_TYPE,
+    AnalyticsOverviewOptions, ApiToken, BootstrapIdentityOptions, BootstrapIdentityResult,
+    ControlPlane, DeviceAuthorization, DeviceLoginOptions, DevicePrompt, HubSkillWaitOptions,
+    LoginOptions, MarketplaceSkillsOptions, MemoryListOptions, OperationResource, OperationStatus,
+    ReleaseOptions, SkillInstallOptions, CONNECTION_TYPE_HOME_ASSISTANT, DEFAULT_ADMISSION_TIMEOUT,
+    DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_OPERATION_POLL_INTERVAL,
+    DEFAULT_SKILL_SOURCE_TYPE, HOME_ASSISTANT_SCOPES,
 };
-pub use errors::{ApiProblem, Result, ThalovantError};
+pub use errors::{ApiProblem, ApiRefusal, Result, ThalovantError};
 pub use events::{
     context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
-    utterance_payload, Context, Data, Event, Reply,
+    reply_context, utterance_payload, Context, Data, Event, Reply,
+};
+// `ERROR_CODES` and `RESPONSE_TYPES` stay in `home`: at the crate root they
+// would read as API error codes, which they are not.
+pub use home::{
+    answer_home_request, answer_home_request_within, answer_home_requests, decode_references,
+    home_response, plain_speech, HomeAnswer, HomeRequest, HomeRequestSubscription, Replier,
+    DEFAULT_HOME_HANDLER_TIMEOUT, HOME_REQUEST, HOME_REQUEST_TIMEOUT, HOME_RESPONSE,
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use intents::{
@@ -67,8 +76,9 @@ pub use protocols::{
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
 pub use stream::{EventPredicate, EventStream, ListenOptions};
 pub use transport::{
-    mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport, RuntimeTransport,
-    TransportConnectionInfo, TransportConnectionPhase, TransportHealth, WssTransport,
+    close_refuses, mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport,
+    RuntimeTransport, TransportConnectionInfo, TransportConnectionPhase, TransportHealth,
+    WssTransport, CLOSE_CODE_GRACE, REFUSAL_CLOSE_CODES, REFUSAL_SETTLE,
 };
 pub use wire::{decode_hive_binary_frame, encode_hive_binary_frame};
 
@@ -87,5 +97,7 @@ pub use inventory::{
 };
 pub mod session;
 pub use session::{
-    hub_hostname, HubSession, HubSessionEvent, HubSessionPolicy, OriginAttempt, OriginPreference,
+    hub_hostname, HandlerId, HubSession, HubSessionEvent, HubSessionPolicy, LinkDecision,
+    LinkOutcome, LinkSupervisor, OriginAttempt, OriginPreference, DEFAULT_REFUSAL_GRACE,
+    DEFAULT_SETTLE_WINDOW,
 };
