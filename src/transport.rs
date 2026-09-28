@@ -8,8 +8,8 @@ use crate::{
         NoiseFrame, NoiseHandshake, NoiseSession,
     },
     noise_store::{
-        forget_cached_psk, load_cached_psk, load_noise_pin, load_or_create_noise_key, pin_hub_key,
-        save_cached_psk,
+        adopt_legacy_key, forget_cached_psk, load_cached_psk, load_noise_pin,
+        load_or_create_noise_key, noise_state_dir, pin_hub_key, save_cached_psk,
     },
     protocols::HubProtocol,
     tls::ensure_rustls_provider,
@@ -24,7 +24,7 @@ use rumqttc::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -33,7 +33,7 @@ use std::{
 };
 use tokio::{
     net::TcpStream,
-    sync::{broadcast, Mutex, Notify},
+    sync::{broadcast, oneshot, Mutex, Notify},
     task::JoinHandle,
     time::{sleep, timeout, timeout_at, Instant},
 };
@@ -140,6 +140,34 @@ struct ConnectionControl {
     kk_failed: AtomicBool,
     /// This attempt uses XX whatever is pinned.
     force_xx: AtomicBool,
+    /// Whether the hub has sent a frame that decrypted under this link's
+    /// session keys: then it accepted the credentials, and no close after it
+    /// is a refusal ([`close_refuses_after`]). Any frame counts -- JSON,
+    /// WIRE-1 binary, a chunk of a larger message, the hub's encrypted HELLO.
+    heard: AtomicBool,
+    /// Whether this link's handshake completed over XX.
+    completed_xx: AtomicBool,
+    /// Whether the link's refusal came right as an XX handshake ended, with
+    /// nothing from the hub in between: the hub refused this client's own
+    /// static key ([`ThalovantError::is_client_key_rejected`]).
+    key_rejected: AtomicBool,
+    /// Over HTTPS: a request of this link's session was answered 401 or 403
+    /// after its handshake completed, before any frame from the hub.
+    refused_after_handshake: AtomicBool,
+    /// Where this client's key is kept when no folder was named.
+    key_folder: std::sync::Mutex<KeyFolder>,
+}
+
+/// The key-folder rule for an identity read from a file: see
+/// [`RuntimeTransport::use_identity_file`].
+#[derive(Clone, Default)]
+struct KeyFolder {
+    /// The folder tied to the identity file.
+    identity_dir: Option<PathBuf>,
+    /// The folder a first use copies this identity's key from, when it met
+    /// this identity's hub: the SDK's previous default. `None` once a folder
+    /// is named.
+    adopt_from: Option<PathBuf>,
 }
 
 /// What a failed handshake said about the credentials.
@@ -149,6 +177,29 @@ enum HandshakeVerdict {
 }
 
 impl ConnectionControl {
+    /// Forget what the last link said about itself: a new attempt starts.
+    fn reset_link(&self) {
+        self.heard.store(false, Ordering::Release);
+        self.completed_xx.store(false, Ordering::Release);
+        self.key_rejected.store(false, Ordering::Release);
+        self.refused_after_handshake.store(false, Ordering::Release);
+    }
+
+    fn key_folder(&self) -> KeyFolder {
+        self.key_folder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A folder was named: no key is copied into it from elsewhere.
+    fn named_folder(&self) {
+        self.key_folder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .adopt_from = None;
+    }
+
     /// Keep what a failed receive said: its typed verdict, and whether it
     /// was a KK attempt that did not authenticate.
     fn note_failure(&self, error: &ThalovantError, channel: Option<&NoiseChannel>) {
@@ -230,15 +281,37 @@ pub const CLOSE_CODE_GRACE: Duration = Duration::from_millis(250);
 /// [`CLOSE_CODE_GRACE`], during the handshake or within [`REFUSAL_SETTLE`]
 /// after it. Everything else -- 1001, 1011, 1013, 1006, no close frame, a
 /// close after the window, a code learnt too late -- is a drop.
+///
+/// This is [`close_refuses_after`] for a hub that has sent nothing since the
+/// handshake.
 pub fn close_refuses(
     code: Option<u16>,
     closed_after_handshake: Option<Duration>,
     code_late: Duration,
 ) -> bool {
+    close_refuses_after(code, closed_after_handshake, code_late, false)
+}
+
+/// [`close_refuses`], knowing whether the hub had sent a frame that decrypted
+/// under the new session's keys before it closed.
+///
+/// A hub refuses a client's key before it sends anything: hivemind-core
+/// aborts right after reading the handshake's last message. So once a frame
+/// from the hub has decrypted -- any frame: JSON, WIRE-1 binary, a chunk of a
+/// larger message, the hub's own encrypted HELLO -- the hub accepted the
+/// credentials, and a close after it is a drop, as a close after the window
+/// is. A decryption that fails is not a frame from the hub.
+pub fn close_refuses_after(
+    code: Option<u16>,
+    closed_after_handshake: Option<Duration>,
+    code_late: Duration,
+    after_authenticated_frame: bool,
+) -> bool {
     let Some(code) = code else {
         return false;
     };
-    REFUSAL_CLOSE_CODES.contains(&code)
+    !after_authenticated_frame
+        && REFUSAL_CLOSE_CODES.contains(&code)
         && code_late <= CLOSE_CODE_GRACE
         && closed_after_handshake.is_none_or(|after| after <= REFUSAL_SETTLE)
 }
@@ -506,6 +579,7 @@ impl RuntimeTransport {
             .verdict
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.control().reset_link();
         match self {
             Self::Http(transport) => transport.connect_locked().await,
             Self::Wss(transport) => transport.connect_locked().await,
@@ -595,12 +669,104 @@ impl RuntimeTransport {
     }
 
     /// Whether the hub's last close of this link read as a refusal of its
-    /// credentials; see [`WssTransport::closed_refused`]. Always `false` for
-    /// HTTP and MQTT, whose hubs do not say it this way.
+    /// credentials; see [`WssTransport::closed_refused`]. Over HTTPS, whether
+    /// a request of the link's session was answered 401 or 403 after its
+    /// handshake completed and before the hub sent anything, which is how the
+    /// hub's listener refuses a session it aborted. Always `false` for MQTT,
+    /// whose hubs do not say it at all.
     pub fn closed_refused(&self) -> bool {
         match self {
             Self::Wss(transport) => transport.closed_refused(),
-            Self::Http(_) | Self::Mqtt(_) => false,
+            Self::Http(transport) => transport
+                .state
+                .lifecycle
+                .refused_after_handshake
+                .load(Ordering::Acquire),
+            Self::Mqtt(_) => false,
+        }
+    }
+
+    /// Whether that refusal came right as an XX handshake ended, with nothing
+    /// from the hub in between: the hub refusing this client's own key.
+    pub(crate) fn closed_key_rejected(&self) -> bool {
+        self.control().key_rejected.load(Ordering::Acquire)
+    }
+
+    /// The error for a hub that refused the link right after its handshake
+    /// ([`RuntimeTransport::closed_refused`]): the client's own key refused
+    /// when the handshake was XX, else a plain refusal.
+    pub(crate) async fn refusal_after_handshake(&self) -> ThalovantError {
+        if !self.closed_key_rejected() {
+            return ThalovantError::hub_refused(
+                "the hub closed the link right after the handshake: it does not accept these credentials, or not yet",
+            );
+        }
+        let (folder, other) = self.key_folders().await;
+        let text = |path: Option<PathBuf>| path.map(|path| path.to_string_lossy().into_owned());
+        ThalovantError::client_key_rejected(text(folder).as_deref(), text(other).as_deref())
+    }
+
+    /// The folder this client's key is in, and the other folder another
+    /// program reading the same identity likely keeps its own key in: the
+    /// one tied to the identity file, or else the SDK's default.
+    async fn key_folders(&self) -> (Option<PathBuf>, Option<PathBuf>) {
+        let named = match self {
+            Self::Http(transport) => transport.state.noise_state_dir.lock().await.clone(),
+            Self::Wss(transport) => transport.state.noise_state_dir.lock().await.clone(),
+            Self::Mqtt(transport) => transport.state.noise_state_dir.lock().await.clone(),
+        };
+        let default = noise_state_dir().ok();
+        let Some(used) = named.or_else(|| default.clone()) else {
+            return (None, None);
+        };
+        let other = [self.control().key_folder().identity_dir, default]
+            .into_iter()
+            .flatten()
+            .find(|candidate| !same_dir(candidate, &used));
+        (Some(used), other)
+    }
+
+    /// Apply the key-folder rule to a client whose identity was read from
+    /// `file`, when no folder was named for it.
+    ///
+    /// The hub pins one client key per connection, so every program that
+    /// uses one identity must present the same key: the key is kept in the
+    /// folder the identity file is in (its `noise_key` and `noise_pins.json`
+    /// beside it), so every program reading that file shares it. The SDK's
+    /// default folder is the config file's own, so
+    /// `~/.config/thalovant/identity.json` keeps its key exactly where it
+    /// always was. A folder that cannot be written falls back to the
+    /// default. The first time the folder is used, when it holds no key, the
+    /// key and the hub pins are copied -- never moved -- from the default
+    /// folder, if that key has met this identity's hub.
+    pub(crate) fn use_identity_file(&self, file: &Path) {
+        let Some(IdentityKeyFolder {
+            dir,
+            keep_here,
+            adopt_from,
+        }) = identity_key_folder(file, noise_state_dir().ok().as_deref())
+        else {
+            return;
+        };
+        *self
+            .control()
+            .key_folder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = KeyFolder {
+            identity_dir: Some(dir.clone()),
+            adopt_from,
+        };
+        if !keep_here {
+            return;
+        }
+        // A client just built: nothing else holds its lock yet.
+        let slot = match self {
+            Self::Http(transport) => transport.state.noise_state_dir.try_lock(),
+            Self::Wss(transport) => transport.state.noise_state_dir.try_lock(),
+            Self::Mqtt(transport) => transport.state.noise_state_dir.try_lock(),
+        };
+        if let Ok(mut slot) = slot {
+            slot.get_or_insert(dir);
         }
     }
 
@@ -660,6 +826,38 @@ impl RuntimeTransport {
     }
 }
 
+/// Send one message on a task of its own, and wait for how it went.
+///
+/// `send` waits for the transport's send path, then -- unless its `done`
+/// sender is closed by then, the caller having stopped waiting -- writes the
+/// message and reports on `done`. Only that wait may be withdrawn: a caller
+/// that stops waiting before the send path is free leaves nothing behind, and
+/// nothing is sent late. Once the send path is held the write runs to
+/// completion whatever becomes of the caller, because half of a frame breaks
+/// the Noise stream for good: a reply the hub's bound withdraws mid-write is
+/// finished, and the link stays as it was. The write bounds itself by the
+/// physical send timeout ([`WRITE_TIMEOUT`]).
+async fn send_detached<F>(send: impl FnOnce(oneshot::Sender<Result<()>>) -> F) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (done, outcome) = oneshot::channel();
+    tokio::spawn(send(done));
+    outcome.await.unwrap_or_else(|_| {
+        Err(ThalovantError::Connection(
+            "the send ended before it could say how".into(),
+        ))
+    })
+}
+
+/// How long one message may take to be written once the send path is
+/// held: the physical send timeout.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn write_timed_out() -> ThalovantError {
+    ThalovantError::Timeout("Noise message send timed out".into())
+}
+
 async fn send_with_deadline(
     control: &ConnectionControl,
     send: impl std::future::Future<Output = Result<()>>,
@@ -683,6 +881,70 @@ async fn send_with_deadline(
 
 fn connection_timeout() -> ThalovantError {
     ThalovantError::Timeout("hub connection did not complete before its deadline".into())
+}
+
+/// Whether two paths name the same folder.
+fn same_dir(left: &Path, right: &Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+/// Where the key of an identity read from a file is kept.
+#[derive(Debug, PartialEq, Eq)]
+struct IdentityKeyFolder {
+    /// The folder the identity file is in.
+    dir: PathBuf,
+    /// Whether the key is kept there: it is not the default folder, and it
+    /// can be written.
+    keep_here: bool,
+    /// Where a first use copies the key from: the default folder.
+    adopt_from: Option<PathBuf>,
+}
+
+/// The key-folder rule for `file`, given the SDK's `default` folder. `None`
+/// when the file has no folder.
+fn identity_key_folder(file: &Path, default: Option<&Path>) -> Option<IdentityKeyFolder> {
+    let dir = std::path::absolute(file).ok()?.parent()?.to_path_buf();
+    if default.is_some_and(|default| same_dir(&dir, default)) {
+        // The default already: nothing changes.
+        return Some(IdentityKeyFolder {
+            dir,
+            keep_here: false,
+            adopt_from: None,
+        });
+    }
+    let keep_here = writable_dir(&dir);
+    Some(IdentityKeyFolder {
+        dir,
+        keep_here,
+        adopt_from: default.filter(|_| keep_here).map(Path::to_path_buf),
+    })
+}
+
+/// Whether this process can create files in `dir`: it already holds a key,
+/// or a probe file can be made there (and is removed at once).
+fn writable_dir(dir: &Path) -> bool {
+    if dir.join(crate::noise_store::NOISE_KEY_FILENAME).is_file() {
+        return true;
+    }
+    let probe = dir.join(format!(
+        ".thalovant-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(file) => {
+            drop(file);
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 #[derive(Clone)]
@@ -763,6 +1025,7 @@ impl HttpTransport {
 
     /// Select a persistent directory for the client static key and hub pins.
     pub async fn set_noise_state_dir(&self, dir: Option<PathBuf>) {
+        self.state.lifecycle.named_folder();
         *self.state.noise_state_dir.lock().await = dir;
     }
 
@@ -848,11 +1111,10 @@ impl HttpTransport {
         }
         let dir = self.state.noise_state_dir.lock().await.clone();
         let force_xx = self.state.lifecycle.force_xx.load(Ordering::Acquire);
-        *self.state.noise.lock().await = Some(NoiseChannel::new(
-            self.state.identity.clone(),
-            dir,
-            force_xx,
-        ));
+        let adopt_from = self.state.lifecycle.key_folder().adopt_from;
+        *self.state.noise.lock().await = Some(
+            NoiseChannel::new(self.state.identity.clone(), dir, force_xx).adopting(adopt_from),
+        );
         self.request(reqwest::Method::POST, "/connect", None)
             .await?;
         self.state.admitted.store(true, Ordering::Release);
@@ -962,21 +1224,25 @@ impl HttpTransport {
         let _poll = self.state.poll.lock().await;
         let result = self.poll_inner().await;
         if let Err(error) = &result {
-            // A request the hub answered 401 or 403 while a KK handshake was
-            // under way: the connect follows it with one XX attempt.
-            if error.is_hub_refused()
-                && self
-                    .state
-                    .noise
-                    .lock()
-                    .await
-                    .as_ref()
-                    .is_some_and(NoiseChannel::kk_pending)
-            {
+            let (kk_pending, established) = self
+                .state
+                .noise
+                .lock()
+                .await
+                .as_ref()
+                .map_or((false, false), |channel| {
+                    (channel.kk_pending(), channel.session.is_some())
+                });
+            if error.is_hub_refused() && kk_pending {
+                // A request the hub answered 401 or 403 while a KK handshake
+                // was under way: the connect follows it with one XX attempt.
                 self.state
                     .lifecycle
                     .kk_failed
                     .store(true, Ordering::Release);
+            }
+            if error.is_hub_refused() && established {
+                self.note_refused_after_handshake();
             }
             self.mark_connection_error(error).await;
         }
@@ -1064,7 +1330,22 @@ impl HttpTransport {
             .expect("successful receive restored its channel");
         channel.failed = true;
         for write in writes {
-            self.write_frame(write).await?;
+            if let Err(error) = self.write_frame(write).await {
+                if error.is_hub_refused()
+                    && channel.session.is_some()
+                    && self.note_refused_after_handshake()
+                {
+                    // Refused while the last frames of a handshake this
+                    // client completed were going out: the hub's listener
+                    // answers the encrypted HELLO 401 once it has aborted on
+                    // the key XX just showed it. The same verdict as a close
+                    // right after.
+                    return Err(RuntimeTransport::Http(self.clone())
+                        .refusal_after_handshake()
+                        .await);
+                }
+                return Err(error);
+            }
         }
         channel.failed = false;
         let ready = channel.ready();
@@ -1081,17 +1362,27 @@ impl HttpTransport {
     }
 
     async fn send_message_inner(&self, message: HiveMessage) -> Result<()> {
-        let _lifecycle = self.state.lifecycle.lock().await;
-        if self.state.lifecycle.cancelled.load(Ordering::Acquire) {
-            return Err(ThalovantError::Connection(
-                "transport retired; reconnect required".into(),
-            ));
-        }
-        let result = self.send_encrypted(message).await;
-        if let Err(error) = &result {
-            self.mark_connection_error(error).await;
-        }
-        result
+        let transport = self.clone();
+        send_detached(move |done| async move {
+            let _lifecycle = transport.state.lifecycle.lock().await;
+            if done.is_closed() {
+                return; // Withdrawn while it waited.
+            }
+            let result = if transport.state.lifecycle.cancelled.load(Ordering::Acquire) {
+                Err(ThalovantError::Connection(
+                    "transport retired; reconnect required".into(),
+                ))
+            } else {
+                timeout(WRITE_TIMEOUT, transport.send_encrypted(message))
+                    .await
+                    .unwrap_or_else(|_| Err(write_timed_out()))
+            };
+            if let Err(error) = &result {
+                transport.mark_connection_error(error).await;
+            }
+            let _ = done.send(result);
+        })
+        .await
     }
 
     async fn send_encrypted(&self, message: HiveMessage) -> Result<()> {
@@ -1221,6 +1512,24 @@ impl HttpTransport {
         health.connection.last_error = None;
     }
 
+    /// A request of this session was answered 401 or 403 after its
+    /// handshake completed: a refusal while the hub has sent nothing that
+    /// decrypted, and the client's own key refused when that handshake was
+    /// XX. After a frame from the hub, it is the hub's trouble. Says whether
+    /// it was a refusal.
+    fn note_refused_after_handshake(&self) -> bool {
+        let lifecycle = &self.state.lifecycle;
+        let refused = !lifecycle.heard.load(Ordering::Acquire);
+        lifecycle
+            .refused_after_handshake
+            .store(refused, Ordering::Release);
+        lifecycle.key_rejected.store(
+            refused && lifecycle.completed_xx.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        refused
+    }
+
     async fn mark_connection_error(&self, error: &ThalovantError) {
         clear_noise(&self.state.noise).await;
         let mut health = self.state.health.lock().await;
@@ -1267,6 +1576,9 @@ struct WssTransportState {
     /// Shared handshake, trust and framing state. The writer lock is always
     /// acquired first and held through delivery of every generated frame.
     noise: Mutex<Option<NoiseChannel>>,
+    /// Stops the next chunked send after its first frame: entered, resume.
+    #[cfg(test)]
+    write_pause: std::sync::Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
 }
 
 impl WssTransport {
@@ -1290,6 +1602,8 @@ impl WssTransport {
                 handshake_notify: Notify::new(),
                 noise_state_dir: Mutex::new(None),
                 noise: Mutex::new(None),
+                #[cfg(test)]
+                write_pause: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -1301,6 +1615,7 @@ impl WssTransport {
     /// Put the Noise static key and pin file somewhere other than beside the
     /// SDK config file.
     pub async fn set_noise_state_dir(&self, dir: Option<PathBuf>) {
+        self.state.lifecycle.named_folder();
         *self.state.noise_state_dir.lock().await = dir;
     }
 
@@ -1329,8 +1644,10 @@ impl WssTransport {
     /// does not know -- or not yet: a connection just created is refused
     /// until its hub admits it. An upgrade answered 401 or 403 reads the same
     /// way. Any other close code (1001, 1011, 1013), a socket that simply
-    /// dropped, and a close after the window, is the hub's trouble or the
-    /// network's, not a verdict on the credentials. Reset by every connect.
+    /// dropped, a close after the window, and a close after the hub sent a
+    /// frame that decrypted ([`close_refuses_after`]), is the hub's trouble
+    /// or the network's, not a verdict on the credentials. Reset by every
+    /// connect.
     pub fn closed_refused(&self) -> bool {
         self.state.closed_refused.load(Ordering::Acquire)
     }
@@ -1349,11 +1666,10 @@ impl WssTransport {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let dir = self.state.noise_state_dir.lock().await.clone();
         let force_xx = self.state.lifecycle.force_xx.load(Ordering::Acquire);
-        *self.state.noise.lock().await = Some(NoiseChannel::new(
-            self.state.identity.clone(),
-            dir,
-            force_xx,
-        ));
+        let adopt_from = self.state.lifecycle.key_folder().adopt_from;
+        *self.state.noise.lock().await = Some(
+            NoiseChannel::new(self.state.identity.clone(), dir, force_xx).adopting(adopt_from),
+        );
         *self.state.health.lock().await = TransportHealth::default();
         let started = Instant::now();
         self.set_connection(connecting_connection()).await;
@@ -1444,11 +1760,25 @@ impl WssTransport {
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .map(|done| done.elapsed());
-                        let refused = close_refuses(Some(code), after, Duration::ZERO);
+                        let lifecycle = &transport.state.lifecycle;
+                        let refused = close_refuses_after(
+                            Some(code),
+                            after,
+                            Duration::ZERO,
+                            lifecycle.heard.load(Ordering::Acquire),
+                        );
                         transport
                             .state
                             .closed_refused
                             .store(refused, Ordering::Release);
+                        // Right as an XX handshake ended, before the hub said
+                        // anything: it refused this client's own key.
+                        lifecycle.key_rejected.store(
+                            refused
+                                && after.is_some()
+                                && lifecycle.completed_xx.load(Ordering::Acquire),
+                            Ordering::Release,
+                        );
                         if refused && after.is_none() {
                             let kk_pending = transport
                                 .state
@@ -1501,12 +1831,20 @@ impl WssTransport {
         if !self.is_handshake_complete().await {
             let cause = self.state.health.lock().await.last_error.clone();
             self.disconnect_inner().await?;
-            let error = self.state.lifecycle.typed(match cause {
-                Some(reason) => ThalovantError::Connection(format!(
-                    "v3 Noise handshake did not complete: {reason}"
-                )),
-                None => ThalovantError::Timeout("HiveMind WSS handshake timed out".to_string()),
-            });
+            let error = if self.state.lifecycle.key_rejected.load(Ordering::Acquire) {
+                // Closed as the XX handshake ended: said as what it is,
+                // whether or not connect() had counted the link yet.
+                RuntimeTransport::Wss(self.clone())
+                    .refusal_after_handshake()
+                    .await
+            } else {
+                self.state.lifecycle.typed(match cause {
+                    Some(reason) => ThalovantError::Connection(format!(
+                        "v3 Noise handshake did not complete: {reason}"
+                    )),
+                    None => ThalovantError::Timeout("HiveMind WSS handshake timed out".to_string()),
+                })
+            };
             self.mark_error(&error).await;
             return Err(error);
         }
@@ -1662,9 +2000,30 @@ impl WssTransport {
     }
 
     async fn send_message_inner(&self, message: HiveMessage) -> Result<()> {
-        // Acquire the writer before cipher advancement. Holding both locks
-        // through every chunk preserves counter order and connection ownership.
-        let mut writer = self.state.writer.lock().await;
+        let transport = self.clone();
+        send_detached(move |done| async move {
+            // Acquire the writer before cipher advancement. Holding both
+            // locks through every chunk preserves counter order and
+            // connection ownership.
+            let mut writer = transport.state.writer.lock().await;
+            if done.is_closed() {
+                return; // Withdrawn while it waited.
+            }
+            let result = timeout(WRITE_TIMEOUT, transport.write_locked(&mut writer, message))
+                .await
+                .unwrap_or_else(|_| Err(write_timed_out()));
+            let _ = done.send(result);
+        })
+        .await
+    }
+
+    /// Encrypt and write one message, holding the writer. Dropped part way,
+    /// the session is spoilt ([`NoiseSendGuard`]).
+    async fn write_locked(
+        &self,
+        writer: &mut Option<WssWriter>,
+        message: HiveMessage,
+    ) -> Result<()> {
         let mut slot = self.state.noise.lock().await;
         let channel = slot.as_mut().ok_or_else(|| {
             ThalovantError::Connection("HiveMind WSS transport is not connected".into())
@@ -1680,10 +2039,37 @@ impl WssTransport {
         };
         let writes = channel.encode(&message)?;
         channel.failed = true;
-        Self::write_noise_frames(&mut writer, writes).await?;
+        #[cfg(test)]
+        let writes = self.write_first_then_pause(writer, writes).await?;
+        Self::write_noise_frames(writer, writes).await?;
         channel.failed = false;
         guard.committed = true;
         Ok(())
+    }
+
+    /// With a pause set, write the first frame of a chunked message, say so,
+    /// and wait to be let go: a write the caller's bound lands in the middle
+    /// of.
+    #[cfg(test)]
+    async fn write_first_then_pause(
+        &self,
+        writer: &mut Option<WssWriter>,
+        mut writes: Vec<NoiseWrite>,
+    ) -> Result<Vec<NoiseWrite>> {
+        let pause = self
+            .state
+            .write_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take_if(|_| writes.len() > 1);
+        if let Some((entered, resume)) = pause {
+            let rest = writes.split_off(1);
+            Self::write_noise_frames(writer, writes).await?;
+            entered.notify_one();
+            resume.notified().await;
+            return Ok(rest);
+        }
+        Ok(writes)
     }
 
     async fn reset_noise(&self) {
@@ -1792,6 +2178,7 @@ impl MqttTransport {
 
     /// Select a persistent directory for the client static key and hub pins.
     pub async fn set_noise_state_dir(&self, dir: Option<PathBuf>) {
+        self.state.lifecycle.named_folder();
         *self.state.noise_state_dir.lock().await = dir;
     }
 
@@ -1855,11 +2242,10 @@ impl MqttTransport {
         }
         let dir = self.state.noise_state_dir.lock().await.clone();
         let force_xx = self.state.lifecycle.force_xx.load(Ordering::Acquire);
-        *self.state.noise.lock().await = Some(NoiseChannel::new(
-            self.state.identity.clone(),
-            dir,
-            force_xx,
-        ));
+        let adopt_from = self.state.lifecycle.key_folder().adopt_from;
+        *self.state.noise.lock().await = Some(
+            NoiseChannel::new(self.state.identity.clone(), dir, force_xx).adopting(adopt_from),
+        );
         let started = Instant::now();
         self.set_connection(connecting_connection()).await;
         let credentials = self.state.identity.mqtt.as_ref().ok_or_else(|| {
@@ -2111,17 +2497,27 @@ impl MqttTransport {
     }
 
     async fn send_message_inner(&self, message: HiveMessage) -> Result<()> {
-        let _lifecycle = self.state.lifecycle.lock().await;
-        if self.state.lifecycle.cancelled.load(Ordering::Acquire) {
-            return Err(ThalovantError::Connection(
-                "transport retired; reconnect required".into(),
-            ));
-        }
-        let result = self.send_encrypted(message).await;
-        if let Err(error) = &result {
-            self.mark_error(error).await;
-        }
-        result
+        let transport = self.clone();
+        send_detached(move |done| async move {
+            let _lifecycle = transport.state.lifecycle.lock().await;
+            if done.is_closed() {
+                return; // Withdrawn while it waited.
+            }
+            let result = if transport.state.lifecycle.cancelled.load(Ordering::Acquire) {
+                Err(ThalovantError::Connection(
+                    "transport retired; reconnect required".into(),
+                ))
+            } else {
+                timeout(WRITE_TIMEOUT, transport.send_encrypted(message))
+                    .await
+                    .unwrap_or_else(|_| Err(write_timed_out()))
+            };
+            if let Err(error) = &result {
+                transport.mark_error(error).await;
+            }
+            let _ = done.send(result);
+        })
+        .await
     }
 
     async fn send_encrypted(&self, message: HiveMessage) -> Result<()> {
@@ -2232,6 +2628,11 @@ struct NoiseChannel {
     pattern: Option<String>,
     /// A KK handshake whose answer did not authenticate.
     kk_failed: bool,
+    /// A frame from the hub decrypted under this channel's session.
+    heard: bool,
+    /// Where the first handshake copies this identity's key from, when the
+    /// state folder holds none; see [`adopt_legacy_key`].
+    adopt_from: Option<PathBuf>,
 }
 
 struct NoiseWrite {
@@ -2263,7 +2664,11 @@ async fn receive_noise(
         .as_mut()
         .ok_or_else(|| ThalovantError::Connection("Noise transport is not connected".into()))?;
     if channel.session.is_some() {
-        return channel.receive(&data, binary);
+        let result = channel.receive(&data, binary);
+        if channel.heard {
+            control.heard.store(true, Ordering::Release);
+        }
+        return result;
     }
     let mut owned = slot.take().expect("checked above");
     let (channel, result) = tokio::task::spawn_blocking(move || {
@@ -2275,6 +2680,13 @@ async fn receive_noise(
     if let Err(error) = &result {
         // Kept typed for whoever waits on the handshake in another task.
         control.note_failure(error, Some(&channel));
+    } else if channel.session.is_some() {
+        // The handshake just completed: remember how, for a refusal that
+        // follows it.
+        control.completed_xx.store(
+            channel.pattern.as_deref() == Some(crate::noise::NOISE_PATTERN_XX),
+            Ordering::Release,
+        );
     }
     *slot = Some(channel);
     result
@@ -2302,7 +2714,15 @@ impl NoiseChannel {
             force_xx,
             pattern: None,
             kk_failed: false,
+            heard: false,
+            adopt_from: None,
         }
+    }
+
+    /// This channel, copying a key into its folder from `from` on first use.
+    fn adopting(mut self, from: Option<PathBuf>) -> Self {
+        self.adopt_from = from;
+        self
     }
 
     /// A KK handshake is under way and has not finished.
@@ -2368,7 +2788,11 @@ impl NoiseChannel {
                     "plaintext received after Noise negotiation".into(),
                 ));
             }
-            let message = match session.decrypt_frame(data)? {
+            let frame = session.decrypt_frame(data)?;
+            // It decrypted: the hub has spoken under this session's keys,
+            // whatever the frame turns out to hold.
+            self.heard = true;
+            let message = match frame {
                 NoiseFrame::Partial => return Ok((None, vec![])),
                 NoiseFrame::Message {
                     payload,
@@ -2455,6 +2879,11 @@ impl NoiseChannel {
             return Err(ThalovantError::MissingIdentityField(
                 "password: v3 Noise requires the identity password",
             ));
+        }
+        if let (Some(target), Some(from)) = (self.state_dir.as_deref(), self.adopt_from.take()) {
+            // Best effort: a folder it cannot copy into starts afresh, as it
+            // did before.
+            let _ = adopt_legacy_key(target, &from, &self.node_id);
         }
         let pin = load_noise_pin(self.state_dir.as_deref(), &self.node_id)?;
         // After a failed KK, XX whatever is pinned; the pin is still checked

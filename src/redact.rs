@@ -62,6 +62,37 @@ fn is_identity_bundle(key: &str) -> bool {
     matches!(normalize_key(key).as_str(), "initialidentify" | "identity")
 }
 
+/// What an echoed validation `input` is printed as.
+pub(crate) const OMITTED: &str = "[omitted]";
+
+/// Clone an API error body with every validation error's `input` replaced by
+/// [`OMITTED`], in each entry of a `detail` list (FastAPI's own shape) and of
+/// a Problem+JSON `errors` list, and inside a `detail` that is itself an
+/// object.
+///
+/// A validation error's `input` is the request as it was sent, under
+/// whatever key and in whatever shape: a bare string, a list under an
+/// ordinary key. No key-name filter recognises it, so it is never printed.
+pub(crate) fn omit_echoed_inputs(map: &Map<String, Value>) -> Map<String, Value> {
+    let mut map = map.clone();
+    for key in ["detail", "errors"] {
+        match map.get_mut(key) {
+            Some(Value::Array(entries)) => {
+                for entry in entries.iter_mut().filter_map(Value::as_object_mut) {
+                    if let Some(input) = entry.get_mut("input") {
+                        *input = Value::from(OMITTED);
+                    }
+                }
+            }
+            Some(Value::Object(nested)) if key == "detail" => {
+                *nested = omit_echoed_inputs(nested);
+            }
+            _ => {}
+        }
+    }
+    map
+}
+
 /// Recursively clone `value`, replacing every secret-keyed field with
 /// [`REDACTED`]. Structure and non-secret values are preserved so the result
 /// stays useful for logs and error detail. Inside an identity bundle (e.g. a

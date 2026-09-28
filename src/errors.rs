@@ -23,8 +23,9 @@ pub type Result<T> = std::result::Result<T, ThalovantError>;
 ///
 /// The body is kept as sent, so it can hold a value it echoed back from the
 /// request (a validation error repeats what it was given). `Debug` redacts
-/// every secret-named key, so `{:?}` and an `unwrap()` panic never print one;
-/// reading the map directly gives the values as they are.
+/// every secret-named key and prints every validation error's `input` as
+/// `[omitted]`, so `{:?}` and an `unwrap()` panic never print one; reading
+/// the map directly gives the values as they are.
 #[derive(Clone, PartialEq, Eq, Default)]
 pub struct ApiProblem(Map<String, Value>);
 
@@ -97,7 +98,9 @@ impl fmt::Debug for ApiProblem {
     /// echo a password the request sent.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ApiProblem")
-            .field(&crate::redact::redact_map(&self.0))
+            .field(&crate::redact::redact_map(
+                &crate::redact::omit_echoed_inputs(&self.0),
+            ))
             .finish()
     }
 }
@@ -413,6 +416,16 @@ const HUB_REFUSED: &str = "the hub refused this connection's credentials";
 const HUB_KEY_CHANGED: &str = "the hub's Noise key is not the one pinned for it";
 /// How a [`ThalovantError::Api`] for an API out of reach begins.
 const API_UNREACHABLE: &str = "could not reach the Thalovant API";
+/// What follows [`HUB_REFUSED`] when the hub refused this client's own Noise
+/// key; see [`ThalovantError::is_client_key_rejected`].
+const CLIENT_KEY_REJECTED: &str =
+    "it pinned a different Noise key for this client when the connection first connected";
+/// Follows [`CLIENT_KEY_REJECTED`], then the folder this client's key is in,
+/// as a JSON string.
+const KEY_FOLDER: &str = ". This client's key is in ";
+/// Follows the key folder, then the other likely folder, as a JSON string.
+const OTHER_KEY_FOLDER: &str =
+    ". Another program that reads the same identity may keep its key in ";
 
 impl ThalovantError {
     /// The HTTP status of an error the API answered with.
@@ -547,11 +560,73 @@ impl ThalovantError {
     /// 403, are refusals too; see
     /// [`close_refuses`](crate::transport::close_refuses).
     ///
+    /// A close after the hub has sent anything that decrypts is a drop, not
+    /// a refusal. A refusal right as an XX handshake ends is the hub turning
+    /// this client's own key away, which
+    /// [`ThalovantError::is_client_key_rejected`] tells apart; this is true
+    /// for it too.
+    ///
     /// The error is the [`ThalovantError::Connection`] a failed connect has
     /// always been, so a match on that variant still catches it; this says
     /// which kind of connection error it is.
     pub fn is_hub_refused(&self) -> bool {
         matches!(self, Self::Connection(message) if message.starts_with(HUB_REFUSED))
+    }
+
+    /// Whether the hub refused this client's own Noise key: it pinned a
+    /// different one for this connection when it first connected.
+    ///
+    /// A hub pins the first static key a connection presents and refuses any
+    /// other for good, closing the link the moment the handshake that showed
+    /// it ends. Two programs that read the same identity but keep their keys
+    /// in different folders each present their own key, and whichever came
+    /// second is locked out. No handshake can recover from this, so
+    /// [`HubSession::run`](crate::HubSession::run) stops on it at once. The
+    /// fix is to pair again (a new connection pins afresh), or to share the
+    /// key folder: point every program that reads this identity at the folder
+    /// holding the key the hub trusts
+    /// ([`WssTransport::set_noise_state_dir`](crate::WssTransport::set_noise_state_dir)
+    /// and its siblings). [`ThalovantError::client_key_folders`] names the
+    /// folders.
+    ///
+    /// Only after an XX handshake: after KK, which the hub can only complete
+    /// with the key it pinned, the same close is a plain refusal. Over HTTPS
+    /// the same verdict is a request answered 401 or 403 while the client
+    /// sends the last frames of the XX handshake it completed, or right
+    /// after; over MQTT a hub that refuses the key just stops answering, so
+    /// it cannot be told.
+    ///
+    /// It is a refusal: [`ThalovantError::is_hub_refused`] is true for it too,
+    /// and the error is the [`ThalovantError::Connection`] it has always been.
+    pub fn is_client_key_rejected(&self) -> bool {
+        self.client_key_rejection().is_some()
+    }
+
+    /// The folder this client's Noise key is in, and the other folder another
+    /// program reading the same identity likely keeps its own key in, for an
+    /// error [`ThalovantError::is_client_key_rejected`] answers true for.
+    ///
+    /// `None` for every other error, and when the folder could not be
+    /// resolved. Paths that are not valid Unicode are given lossily.
+    pub fn client_key_folders(&self) -> Option<(String, Option<String>)> {
+        let rest = self.client_key_rejection()?.strip_prefix(KEY_FOLDER)?;
+        let (folder, rest) = leading_json_string(rest)?;
+        let other = rest
+            .strip_prefix(OTHER_KEY_FOLDER)
+            .and_then(leading_json_string)
+            .map(|(other, _)| other);
+        Some((folder, other))
+    }
+
+    /// What follows the fixed opening of a rejected-key message.
+    fn client_key_rejection(&self) -> Option<&str> {
+        let Self::Connection(message) = self else {
+            return None;
+        };
+        message
+            .strip_prefix(HUB_REFUSED)?
+            .strip_prefix(": ")?
+            .strip_prefix(CLIENT_KEY_REJECTED)
     }
 
     /// Whether the hub's Noise static key is not the one pinned for it.
@@ -585,6 +660,29 @@ impl ThalovantError {
     /// [`ThalovantError::is_hub_refused`] answers true for.
     pub(crate) fn hub_refused(detail: impl fmt::Display) -> Self {
         Self::Connection(format!("{HUB_REFUSED}: {detail}"))
+    }
+
+    /// The hub refusing this client's own key: a refusal
+    /// ([`ThalovantError::is_hub_refused`]) that
+    /// [`ThalovantError::is_client_key_rejected`] answers true for, naming
+    /// `folder`, where this client's key is, and `other`, where another
+    /// program reading the same identity may keep its own.
+    pub(crate) fn client_key_rejected(folder: Option<&str>, other: Option<&str>) -> Self {
+        let quoted = |path: &str| Value::from(path).to_string();
+        let mut message = format!("{HUB_REFUSED}: {CLIENT_KEY_REJECTED}");
+        if let Some(folder) = folder {
+            message.push_str(KEY_FOLDER);
+            message.push_str(&quoted(folder));
+            if let Some(other) = other {
+                message.push_str(OTHER_KEY_FOLDER);
+                message.push_str(&quoted(other));
+                message.push_str(", and the hub may have pinned that one");
+            }
+        }
+        message.push_str(
+            ". A new handshake cannot fix this. Re-pair, or share the key folder: point every program that uses this identity at the folder holding the key the hub trusts (set_noise_state_dir).",
+        );
+        Self::Connection(message)
     }
 
     /// A hub whose key is not the pinned one: a
@@ -623,9 +721,50 @@ impl ThalovantError {
     }
 }
 
+/// The JSON string at the start of `text`, and what follows it.
+fn leading_json_string(text: &str) -> Option<(String, &str)> {
+    let mut values = serde_json::Deserializer::from_str(text).into_iter::<String>();
+    let value = values.next()?.ok()?;
+    Some((value, &text[values.byte_offset()..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_client_key_is_a_refusal_that_names_its_folders() {
+        let folder = "/home/a \"quoted\" user/.config/thalovant";
+        let other = "/srv/voice. Another program";
+        let error = ThalovantError::client_key_rejected(Some(folder), Some(other));
+        assert!(matches!(error, ThalovantError::Connection(_)));
+        assert!(error.is_hub_refused() && error.is_client_key_rejected());
+        assert!(error.is_connection_error() && !error.is_hub_key_changed());
+        assert_eq!(
+            error.client_key_folders(),
+            Some((folder.to_string(), Some(other.to_string())))
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("Re-pair, or share the key folder"),
+            "{message}"
+        );
+
+        let alone = ThalovantError::client_key_rejected(Some(folder), None);
+        assert_eq!(alone.client_key_folders(), Some((folder.to_string(), None)));
+        let unknown = ThalovantError::client_key_rejected(None, None);
+        assert!(unknown.is_client_key_rejected());
+        assert_eq!(unknown.client_key_folders(), None);
+
+        // A plain refusal is not a rejected key, and says nothing of folders.
+        let refused = ThalovantError::hub_refused("closed");
+        assert!(refused.is_hub_refused() && !refused.is_client_key_rejected());
+        assert_eq!(refused.client_key_folders(), None);
+        // Nor is a message a caller wrote that only looks like one.
+        let forged = ThalovantError::Runtime(message);
+        assert!(!forged.is_client_key_rejected());
+        assert_eq!(forged.client_key_folders(), None);
+    }
 
     #[tokio::test]
     async fn http_error_conversion_strips_authorization_url() {

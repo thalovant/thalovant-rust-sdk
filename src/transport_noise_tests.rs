@@ -48,6 +48,11 @@ struct Responder {
     /// The patterns whose handshake answer it spoils, so that the client
     /// cannot authenticate it.
     corrupt: HashSet<String>,
+    /// Pin the first client key and abort on any other, as hivemind-core
+    /// does ("client Noise static key contradicts pinned key"): a handshake
+    /// that shows another key fails right after its last message is read,
+    /// before the hub sends anything.
+    pins_client: bool,
 }
 impl Responder {
     fn new() -> Self {
@@ -68,6 +73,7 @@ impl Responder {
             received: vec![],
             offer_kk: None,
             corrupt: HashSet::new(),
+            pins_client: false,
         }
     }
     /// The hub's record of this connection's password changed.
@@ -242,7 +248,13 @@ impl Responder {
         }
         if self.handshake.as_ref().unwrap().is_handshake_finished() {
             let handshake = self.handshake.take().unwrap();
-            self.peer = handshake.get_remote_static().map(Vec::from);
+            let client = handshake.get_remote_static().map(Vec::from);
+            if self.pins_client && self.peer.is_some() && client != self.peer {
+                return Err(ThalovantError::Connection(
+                    "client Noise static key contradicts pinned key".into(),
+                ));
+            }
+            self.peer = client;
             self.session = Some(handshake.into_transport_mode().unwrap());
         }
         Ok(replies)
@@ -284,6 +296,15 @@ struct HttpFixtureState {
     refused: Vec<String>,
     /// The status of the answer being built, when not 200.
     status_once: Option<u16>,
+    /// Behave as hivemind-http-protocol does: a message the hub cannot read
+    /// -- or a client key that contradicts its pin -- aborts the session,
+    /// the request that carried it is answered as usual, and every later
+    /// request of the session is answered 401 until the next `/connect`.
+    carrier: bool,
+    /// The session was aborted.
+    aborted: bool,
+    /// Refuse, with 401, the first binary frame after a completed handshake.
+    refuse_after_handshake: bool,
 }
 impl HttpFixtureState {
     fn enqueue(&mut self, writes: Vec<NoiseWrite>) {
@@ -312,12 +333,18 @@ impl HttpFixtureState {
         if path != "/connect" && !cookie {
             return json!({"error":"missing replica cookie"});
         }
+        if self.carrier && self.aborted && !matches!(path, "/connect" | "/disconnect") {
+            // The hub's listener refuses a session it no longer holds.
+            self.status_once = Some(401);
+            return json!({"error":"Unauthorized"});
+        }
         match path {
             "/connect" => {
                 if self.connected {
                     return json!({"status":"Connected"});
                 }
                 self.connected = true;
+                self.aborted = false;
                 self.plain.clear();
                 self.binary.clear();
                 let writes = self.responder.reset();
@@ -377,6 +404,12 @@ impl HttpFixtureState {
                             .as_str()
                             .map(str::to_string)
                     });
+                if binary && self.responder.session.is_some() && self.refuse_after_handshake {
+                    self.refuse_after_handshake = false;
+                    self.aborted = true;
+                    self.status_once = Some(401);
+                    return json!({"error":"unauthorized"});
+                }
                 if let Some(pattern) = pattern.filter(|pattern| self.refuse.contains(pattern)) {
                     self.refused.push(pattern);
                     self.status_once = Some(401);
@@ -385,6 +418,12 @@ impl HttpFixtureState {
                 match self.responder.receive(&raw, binary) {
                     Ok(writes) => {
                         self.enqueue(writes);
+                        json!({"status":"message sent"})
+                    }
+                    Err(_) if self.carrier => {
+                        self.aborted = true;
+                        self.responder.handshake = None;
+                        self.responder.session = None;
                         json!({"status":"message sent"})
                     }
                     Err(_) => json!({"error":"rejected message"}),
@@ -424,6 +463,9 @@ impl HttpFixture {
             refuse: HashSet::new(),
             refused: vec![],
             status_once: None,
+            carrier: false,
+            aborted: false,
+            refuse_after_handshake: false,
         }));
         let server_state = state.clone();
         let task = tokio::spawn(async move {
@@ -524,22 +566,30 @@ impl HttpFixture {
         }
     }
     fn transport(&self) -> HttpTransport {
-        let identity=Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":self.endpoint,"data_plane_endpoints":{"https":self.endpoint}})).unwrap();
-        HttpTransport::with_options_and_http_client_builder(
-            identity,
-            DEFAULT_USER_AGENT,
-            Duration::from_secs(3600),
-            reqwest::Client::builder()
-                .add_root_certificate(reqwest::Certificate::from_der(&self.cert).unwrap())
-                .timeout(Duration::from_secs(3)),
-        )
-        .unwrap()
+        http_transport(&self.endpoint, &self.cert)
     }
 }
 impl Drop for HttpFixture {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+fn http_identity(endpoint: &str) -> Identity {
+    Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"https":endpoint}})).unwrap()
+}
+
+/// An HTTPS polling transport that trusts the fixture's certificate.
+fn http_transport(endpoint: &str, cert: &[u8]) -> HttpTransport {
+    HttpTransport::with_options_and_http_client_builder(
+        http_identity(endpoint),
+        DEFAULT_USER_AGENT,
+        Duration::from_secs(3600),
+        reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_der(cert).unwrap())
+            .timeout(Duration::from_secs(3)),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -1371,7 +1421,7 @@ fn shared_noise_rejects_duplicate_hello_and_a_changed_pinned_peer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers() {
+async fn wss_a_send_left_mid_write_is_finished_and_only_a_failed_write_poisons() {
     // One encrypted chunk fits in the receive window on every platform, while
     // the 16 MiB message still exceeds loopback buffers after the peer stops.
     // The peer signals an actual application chunk before cancellation.
@@ -1447,13 +1497,25 @@ async fn wss_cancelled_chunked_send_poisons_session_and_fresh_reconnect_recovers
     assert!(!send.is_finished());
     send.abort();
     assert!(send.await.unwrap_err().is_cancelled());
-    assert!(!transport.healthcheck().await.handshake_complete);
+    // The caller left mid-write, but half a message would break the Noise
+    // stream: the write goes on, and the session is not spoilt by it.
+    assert!(transport.state.session_valid.load(Ordering::Acquire));
+    assert!(transport.healthcheck().await.handshake_complete);
+    // The peer goes away before reading the rest: the write fails, and that
+    // is what spoils the session.
+    release.notify_one();
+    timeout(Duration::from_secs(15), async {
+        while transport.healthcheck().await.handshake_complete {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a failed write spoils the session");
     assert!(transport.remote_static_key().await.is_none());
     assert!(transport
         .emit_bus("rejected", Map::new(), Map::new())
         .await
         .is_err());
-    release.notify_one();
     transport.connect().await.unwrap();
     let mut events = transport.subscribe();
     transport
@@ -2304,6 +2366,9 @@ struct FakeHub {
     endpoint: String,
     responder: Arc<std::sync::Mutex<Responder>>,
     upgrade_status: Arc<std::sync::atomic::AtomicU16>,
+    /// Send one encrypted frame as the handshake completes, then close with
+    /// no status: a hub that has spoken has accepted the client's key.
+    speaks_then_closes: Arc<AtomicBool>,
     attempts: Arc<std::sync::atomic::AtomicUsize>,
     server: JoinHandle<()>,
 }
@@ -2312,12 +2377,21 @@ impl FakeHub {
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-        let responder = Arc::new(std::sync::Mutex::new(Responder::new()));
+        let mut hub = Responder::new();
+        // As hivemind-core does: the first key a connection presents is the
+        // only one it accepts.
+        hub.pins_client = true;
+        let responder = Arc::new(std::sync::Mutex::new(hub));
         let upgrade_status = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let speaks_then_closes = Arc::new(AtomicBool::new(false));
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let server = tokio::spawn({
-            let (responder, upgrade_status, attempts) =
-                (responder.clone(), upgrade_status.clone(), attempts.clone());
+            let (responder, upgrade_status, speaks, attempts) = (
+                responder.clone(),
+                upgrade_status.clone(),
+                speaks_then_closes.clone(),
+                attempts.clone(),
+            );
             async move {
                 while let Ok((stream, _)) = listener.accept().await {
                     attempts.fetch_add(1, Ordering::SeqCst);
@@ -2327,7 +2401,7 @@ impl FakeHub {
                     } else {
                         // One at a time: a connect's KK and XX attempts come
                         // in that order.
-                        serve_hub_socket(stream, &responder).await;
+                        serve_hub_socket(stream, &responder, speaks.load(Ordering::SeqCst)).await;
                     }
                 }
             }
@@ -2336,6 +2410,7 @@ impl FakeHub {
             endpoint,
             responder,
             upgrade_status,
+            speaks_then_closes,
             attempts,
             server,
         }
@@ -2367,10 +2442,32 @@ async fn refuse_upgrade(mut stream: TcpStream, status: u16) {
     let _ = stream.shutdown().await;
 }
 
+/// Close with no status, as hivemind-core does after a Noise abort, then
+/// read what is still in flight until the client closes too: a socket
+/// dropped with unread data resets, and a reset can overtake the close.
+async fn close_without_status(socket: &mut WebSocketStream<TcpStream>) {
+    let _ = socket.send(WebSocketMessage::Close(None)).await;
+    let _ = timeout(Duration::from_secs(5), async {
+        while let Some(Ok(message)) = socket.next().await {
+            if matches!(message, WebSocketMessage::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
 /// One connection: HELLO and the offer, then the handshake. A handshake
-/// message the hub cannot authenticate ends it with a close frame with no
-/// status, as hivemind-core does after a Noise abort.
-async fn serve_hub_socket(stream: TcpStream, responder: &std::sync::Mutex<Responder>) {
+/// message the hub cannot authenticate -- or one that shows a client key
+/// other than the one it pinned -- ends it with a close frame with no
+/// status, before the hub sends anything. With `speaks_then_closes`, the hub
+/// sends one encrypted frame as the handshake completes, then closes the same
+/// way.
+async fn serve_hub_socket(
+    stream: TcpStream,
+    responder: &std::sync::Mutex<Responder>,
+    speaks_then_closes: bool,
+) {
     let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
         return;
     };
@@ -2388,9 +2485,24 @@ async fn serve_hub_socket(stream: TcpStream, responder: &std::sync::Mutex<Respon
             WebSocketMessage::Close(_) => break,
             _ => continue,
         };
-        let answered = responder.lock().unwrap().receive(&raw, binary);
+        let (answered, spoke) = {
+            let mut responder = responder.lock().unwrap();
+            let before = responder.session.is_some();
+            let answered = responder.receive(&raw, binary);
+            let spoke = (speaks_then_closes && !before && responder.session.is_some()).then(|| {
+                responder.encrypt(&HiveMessage {
+                    msg_type: "bus".into(),
+                    payload: json!({"type": "hub.ready", "data": {}, "context": {}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    ..Default::default()
+                })
+            });
+            (answered, spoke)
+        };
         let Ok(writes) = answered else {
-            let _ = socket.send(WebSocketMessage::Close(None)).await;
+            close_without_status(&mut socket).await;
             break;
         };
         for write in writes {
@@ -2403,44 +2515,128 @@ async fn serve_hub_socket(stream: TcpStream, responder: &std::sync::Mutex<Respon
                 return;
             }
         }
+        if let Some(frame) = spoke {
+            if socket
+                .send(WebSocketMessage::Binary(frame.payload))
+                .await
+                .is_ok()
+            {
+                close_without_status(&mut socket).await;
+            }
+            break;
+        }
     }
 }
 
-/// One connect, read as the vectors read it.
-async fn handshake_outcome(identity: &Identity, state: &std::path::Path) -> &'static str {
-    let transport = WssTransport::new(identity.clone());
-    transport
-        .set_noise_state_dir(Some(state.to_path_buf()))
-        .await;
-    let result = timeout(Duration::from_secs(60), transport.connect())
-        .await
-        .expect("a connect ends");
-    let _ = transport.disconnect().await;
+/// A session whose clients connect with `identity` over `transport`, keeping
+/// their Noise state in `state`, as [`crate::HubSession::for_identity`]
+/// connects them.
+fn kept_link(
+    build: impl Fn() -> Result<RuntimeTransport> + Send + Sync + 'static,
+    identity: &Identity,
+    state: &std::path::Path,
+) -> crate::HubSession {
+    let (identity, state) = (identity.clone(), state.to_path_buf());
+    let build = Arc::new(build);
+    crate::HubSession::new(
+        move || {
+            let (identity, state, build) = (identity.clone(), state.clone(), build.clone());
+            async move {
+                let transport = build()?;
+                match &transport {
+                    RuntimeTransport::Http(http) => http.set_noise_state_dir(Some(state)).await,
+                    RuntimeTransport::Wss(wss) => wss.set_noise_state_dir(Some(state)).await,
+                    RuntimeTransport::Mqtt(mqtt) => mqtt.set_noise_state_dir(Some(state)).await,
+                }
+                let client = crate::Client {
+                    identity,
+                    transport,
+                    conversations: Default::default(),
+                    conversation_sequence: Default::default(),
+                };
+                // The first handshake runs argon2id at 64 MiB, which a debug
+                // build on a busy runner does not finish in the default 6 s.
+                crate::session::connect_for_session(client, Duration::from_secs(20)).await
+            }
+        },
+        crate::HubSessionPolicy::default(),
+    )
+    .unwrap()
+    .with_settle_window(REFUSAL_SETTLE)
+}
+
+/// What a connect came to, as the vectors name it.
+fn outcome_name(result: &Result<()>) -> &'static str {
     match result {
         Ok(()) => "connected",
         Err(error) if error.is_hub_key_changed() => {
             assert!(!error.is_hub_refused(), "a changed key read as a refusal");
             "key_changed"
         }
+        Err(error) if error.is_client_key_rejected() => {
+            assert!(error.is_hub_refused(), "a rejected key is a refusal too");
+            assert!(
+                error.client_key_folders().is_some(),
+                "a rejected key names its folder: {error}"
+            );
+            "client_key_rejected"
+        }
         Err(error) if error.is_hub_refused() => "refused",
-        Err(error) if error.is_connection_error() => "failed",
+        Err(error) if error.is_connection_error() || error.is_timeout() => "failed",
         Err(error) => panic!("unexpected {error:?}"),
     }
+}
+
+/// One connect as a kept link makes it -- the handshake, then the settle
+/// window -- read as the vectors read it.
+async fn handshake_outcome(identity: &Identity, state: &std::path::Path) -> &'static str {
+    let wss = identity.clone();
+    let session = kept_link(
+        move || Ok(RuntimeTransport::Wss(WssTransport::new(wss.clone()))),
+        identity,
+        state,
+    );
+    let result = timeout(Duration::from_secs(60), session.connect())
+        .await
+        .expect("a connect ends");
+    let _ = session.close().await;
+    outcome_name(&result)
+}
+
+/// Give the client a new static key in the same folder, keeping its pins.
+fn replace_client_key(state: &std::path::Path) {
+    let mut key = [0_u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    std::fs::write(
+        state.join(crate::noise_store::NOISE_KEY_FILENAME),
+        hex::encode(key),
+    )
+    .unwrap();
 }
 
 async fn handshake_case(case: &Value) -> Value {
     let hub = FakeHub::start().await;
     let state = FixtureDir::new();
+    let another = FixtureDir::new();
     let mut identity = wss_identity(&hub.endpoint);
+    let mut folder = state.0.clone();
     let situation = case["situation"].as_str().expect("situation");
     if matches!(
         situation,
-        "pinned" | "password_changed_since_pinning" | "hub_key_changed"
+        "pinned"
+            | "password_changed_since_pinning"
+            | "hub_key_changed"
+            | "client_key_changed"
+            | "client_key_changed_pinned_here"
     ) {
         // First contact pins both ways.
         assert_eq!(handshake_outcome(&identity, &state.0).await, "connected");
     }
     match situation {
+        // Another program's folder, with its own key.
+        "client_key_changed" => folder = another.0.clone(),
+        "client_key_changed_pinned_here" => replace_client_key(&state.0),
+        "closed_after_first_frame" => hub.speaks_then_closes.store(true, Ordering::SeqCst),
         "wrong_password" => identity.password = uuid::Uuid::new_v4().to_string(),
         "password_changed_since_pinning" => hub
             .responder
@@ -2459,7 +2655,7 @@ async fn handshake_case(case: &Value) -> Value {
         _ => {}
     }
     let before = hub.patterns().len();
-    let outcome = handshake_outcome(&identity, &state.0).await;
+    let outcome = handshake_outcome(&identity, &folder).await;
     let patterns: Vec<String> = hub.patterns()[before..]
         .iter()
         .map(|pattern| pattern[..2].to_string())
@@ -2735,4 +2931,630 @@ async fn a_reply_withdrawn_before_it_was_sent_keeps_the_link() {
     })
     .expect("the hub got the next message");
     transport.disconnect().await.unwrap();
+}
+
+// -- home-link-vectors.json: a reply queued behind another frame -------------
+
+/// One `queued` case over a real link: another frame holds the WebSocket
+/// writer for `busy_ms`, the reply waits behind it, and the link must then
+/// carry another message as if nothing had happened.
+async fn queued_case(case: &Value) -> Value {
+    let hub = FakeHub::start().await;
+    let state = FixtureDir::new();
+    let identity = wss_identity(&hub.endpoint);
+    let transport = WssTransport::new(identity.clone());
+    transport.set_noise_state_dir(Some(state.0.clone())).await;
+    timeout(Duration::from_secs(30), transport.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let client = crate::Client {
+        identity,
+        transport: RuntimeTransport::Wss(transport.clone()),
+        conversations: Default::default(),
+        conversation_sequence: Default::default(),
+    };
+    let millis = |key: &str| Duration::from_millis(case[key].as_u64().expect("whole ms"));
+    let event = crate::Event {
+        name: crate::home::HOME_REQUEST.into(),
+        data: case["request"].as_object().expect("request").clone(),
+        context: json!({"source": "skill", "destination": "ha"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        raw: None,
+    };
+    // Another frame is being written ... for busy_ms.
+    let (held, holding) = oneshot::channel();
+    let busy = tokio::spawn({
+        let state = transport.state.clone();
+        let busy = millis("busy_ms");
+        async move {
+            let _writer = state.writer.lock().await;
+            let _ = held.send(());
+            sleep(busy).await;
+        }
+    });
+    holding.await.unwrap();
+    let handler = case["handler"].clone();
+    let sent = crate::home::answer_home_request_within(
+        &client,
+        &event,
+        move |_| async move {
+            Ok::<_, std::convert::Infallible>(crate::HomeAnswer::new(
+                handler["response_type"].as_str().unwrap_or("action_done"),
+                handler["speech"].as_str().unwrap_or_default(),
+            ))
+        },
+        crate::DEFAULT_HOME_HANDLER_TIMEOUT,
+        millis("hub_timeout_ms"),
+    )
+    .await
+    .expect("no send failed");
+    busy.await.unwrap();
+    // Time enough for a withdrawn reply to go out late, if it would.
+    sleep(Duration::from_millis(200)).await;
+    let responses: Vec<Value> = hub
+        .responder
+        .lock()
+        .unwrap()
+        .received
+        .iter()
+        .filter(|message| message.payload["type"] == crate::HOME_RESPONSE)
+        .map(|message| message.payload["data"].clone())
+        .collect();
+    let expected: Vec<Value> = sent.iter().cloned().map(Value::Object).collect();
+    assert_eq!(responses, expected, "never sent late, never twice");
+    // The same link carries another message: the hub echoes it back.
+    let mut events = transport.subscribe();
+    let kept = client
+        .emit("still.there", Map::new(), Map::new())
+        .await
+        .is_ok()
+        && timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(event) if event.name == "still.there" => break true,
+                    Ok(_) => continue,
+                    Err(_) => break false,
+                }
+            }
+        })
+        .await
+        .unwrap_or(false)
+        && hub.attempts.load(Ordering::SeqCst) == 1;
+    let _ = transport.disconnect().await;
+    let mut produced = json!({"replied": sent.is_some(), "link_kept": kept});
+    if let Some(sent) = sent {
+        produced["response"] = Value::Object(sent);
+    }
+    produced
+}
+
+#[tokio::test]
+async fn home_link_queued_replies_run_their_vectors() {
+    let raw = std::fs::read_to_string("tests/conformance/home-link-vectors.json").unwrap();
+    let spec: Value = serde_json::from_str(&raw).unwrap();
+    for case in spec["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|case| case["kind"] == "queued")
+    {
+        let name = case["name"].as_str().unwrap();
+        let produced = queued_case(case).await;
+        // Recorded before the assert: the record is what this SDK produced.
+        common::record("home-link-vectors.json", name, &produced);
+        assert_eq!(produced, case["expect"], "{name}");
+    }
+}
+
+// A reply whose bound lands while its frames are being written is finished:
+// half a message would break the Noise stream, and the link stays as it was.
+#[tokio::test]
+async fn a_reply_withdrawn_mid_write_is_finished_and_keeps_the_link() {
+    let hub = FakeHub::start().await;
+    let state = FixtureDir::new();
+    let identity = wss_identity(&hub.endpoint);
+    let transport = WssTransport::new(identity.clone());
+    transport.set_noise_state_dir(Some(state.0.clone())).await;
+    timeout(Duration::from_secs(30), transport.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let client = crate::Client {
+        identity,
+        transport: RuntimeTransport::Wss(transport.clone()),
+        conversations: Default::default(),
+        conversation_sequence: Default::default(),
+    };
+    let event = crate::Event {
+        name: crate::home::HOME_REQUEST.into(),
+        data: json!({"request_id": "r-mid", "utterance": "read me the news"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        context: json!({"source": "thalovant-skill-home", "destination": "ha-peer"})
+            .as_object()
+            .unwrap()
+            .clone(),
+        raw: None,
+    };
+    let (entered, resume) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    *transport.state.write_pause.lock().unwrap() = Some((entered.clone(), resume.clone()));
+    // Long enough to go out in several Noise frames.
+    let speech = "news ".repeat(40_000);
+    let replying = tokio::spawn({
+        let (client, event, speech) = (client.clone(), event.clone(), speech.clone());
+        async move {
+            crate::home::answer_home_request_within(
+                &client,
+                &event,
+                move |_| async move {
+                    Ok::<_, std::convert::Infallible>(crate::HomeAnswer::new(
+                        "query_answer",
+                        speech,
+                    ))
+                },
+                Duration::from_millis(100),
+                Duration::from_millis(300),
+            )
+            .await
+        }
+    });
+    timeout(Duration::from_secs(10), entered.notified())
+        .await
+        .expect("the first frame went out");
+    // The bound lands while the rest is still to be written.
+    let answered = timeout(Duration::from_secs(10), replying)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(answered, Ok(None)), "{answered:?}");
+    resume.notify_one();
+    let received = timeout(Duration::from_secs(10), async {
+        loop {
+            let received = hub.responder.lock().unwrap().received.clone();
+            if let Some(reply) = received
+                .iter()
+                .find(|message| message.payload["type"] == crate::HOME_RESPONSE)
+            {
+                break reply.payload["data"]["speech"].clone();
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the reply was finished");
+    assert_eq!(received, json!(speech.trim_end()));
+    assert!(transport.state.session_valid.load(Ordering::Acquire));
+    assert!(transport.healthcheck().await.handshake_complete);
+    client
+        .emit("after.the.reply", Map::new(), Map::new())
+        .await
+        .expect("the link is still up");
+    timeout(Duration::from_secs(10), async {
+        while !hub
+            .responder
+            .lock()
+            .unwrap()
+            .received
+            .iter()
+            .any(|message| message.payload["type"] == "after.the.reply")
+        {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hub got the next message on the same link");
+    assert_eq!(hub.attempts.load(Ordering::SeqCst), 1);
+    transport.disconnect().await.unwrap();
+}
+
+// -- link-carrier-vectors.json: KK then XX over HTTPS polling and MQTT ------
+
+/// A TLS MQTT broker in front of one hub [`Responder`], serving one
+/// connection at a time; `responder` is free between connections.
+struct CarrierBroker {
+    identity: Identity,
+    ca: Vec<u8>,
+    responder: Arc<Mutex<Responder>>,
+    task: JoinHandle<()>,
+}
+
+impl CarrierBroker {
+    async fn start() -> Self {
+        let (acceptor, _, ca) = tls_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let identity = Identity::from_value(json!({"site_id":"test-site","key":"test-access","password":test_password(),"default_master":"https://example.invalid","mqtt":{"endpoint":format!("mqtts://{}",listener.local_addr().unwrap()),"username":"broker-user","password":"broker-password","topic_prefix":"test","tls":true,"qos":1}})).unwrap();
+        let topics = mqtt_topics_for_identity(&identity).unwrap();
+        let mut hub = Responder::new();
+        hub.pins_client = true;
+        let responder = Arc::new(Mutex::new(hub));
+        let task = tokio::spawn({
+            let responder = responder.clone();
+            async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    stream.set_nodelay(true).unwrap();
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        continue;
+                    };
+                    let mut responder = responder.lock().await;
+                    // A hub that aborts just stops answering.
+                    let _ = serve_mqtt(&mut stream, &mut responder, &topics).await;
+                }
+            }
+        });
+        Self {
+            identity,
+            ca,
+            responder,
+            task,
+        }
+    }
+
+    fn transport(&self) -> impl Fn() -> Result<RuntimeTransport> + Send + Sync + 'static {
+        let (identity, ca) = (self.identity.clone(), self.ca.clone());
+        move || {
+            let transport = MqttTransport::new(identity.clone())?;
+            *transport.state.tls_config.try_lock().unwrap() =
+                Some(TlsConfiguration::SimpleNative {
+                    ca: ca.clone(),
+                    client_auth: None,
+                });
+            Ok(RuntimeTransport::Mqtt(transport))
+        }
+    }
+}
+
+impl Drop for CarrierBroker {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// One connect over `build`'s carrier as a kept link makes it.
+async fn carrier_attempt(
+    build: impl Fn() -> Result<RuntimeTransport> + Send + Sync + 'static,
+    identity: &Identity,
+    state: &std::path::Path,
+) -> &'static str {
+    let session = kept_link(build, identity, state);
+    let result = timeout(Duration::from_secs(90), session.connect())
+        .await
+        .expect("a connect ends");
+    let _ = session.close().await;
+    outcome_name(&result)
+}
+
+async fn carrier_case(case: &Value) -> Value {
+    let situation = case["situation"].as_str().expect("situation");
+    let state = FixtureDir::new();
+    let another = FixtureDir::new();
+    let mut folder = state.0.clone();
+    let pins_first = matches!(
+        situation,
+        "pinned"
+            | "password_changed_since_pinning"
+            | "hub_key_changed"
+            | "client_key_changed"
+            | "kk_answer_unauthenticated"
+    );
+    if case["carrier"] == "https" {
+        let fixture = HttpFixture::new().await;
+        {
+            let mut hub = fixture.state.lock().await;
+            hub.carrier = true;
+            hub.responder.pins_client = true;
+        }
+        let (endpoint, cert) = (fixture.endpoint.clone(), fixture.cert.clone());
+        let build = move || Ok(RuntimeTransport::Http(http_transport(&endpoint, &cert)));
+        let identity = http_identity(&fixture.endpoint);
+        if pins_first {
+            // First contact pins both ways.
+            assert_eq!(
+                carrier_attempt(build.clone(), &identity, &state.0).await,
+                "connected"
+            );
+        }
+        {
+            let mut hub = fixture.state.lock().await;
+            match situation {
+                "wrong_password" | "password_changed_since_pinning" => hub
+                    .responder
+                    .set_password(&uuid::Uuid::new_v4().to_string()),
+                "hub_key_changed" => {
+                    hub.responder.replace_key();
+                    hub.responder.offer_kk = case["hub_offers_kk"].as_bool();
+                }
+                "client_key_changed" => folder = another.0.clone(),
+                "kk_answer_unauthenticated" => {
+                    hub.responder.corrupt.insert("KKpsk0".into());
+                }
+                _ => {}
+            }
+        }
+        let before = fixture.state.lock().await.responder.patterns.len();
+        let outcome = carrier_attempt(build, &identity, &folder).await;
+        let patterns = fixture.state.lock().await.responder.patterns[before..]
+            .iter()
+            .map(|pattern| pattern[..2].to_string())
+            .collect::<Vec<_>>();
+        return json!({"outcome": outcome, "patterns": patterns});
+    }
+    let broker = CarrierBroker::start().await;
+    let identity = broker.identity.clone();
+    if pins_first {
+        assert_eq!(
+            carrier_attempt(broker.transport(), &identity, &state.0).await,
+            "connected"
+        );
+    }
+    {
+        let mut hub = broker.responder.lock().await;
+        match situation {
+            "wrong_password" | "password_changed_since_pinning" => {
+                hub.set_password(&uuid::Uuid::new_v4().to_string())
+            }
+            "hub_key_changed" => {
+                hub.replace_key();
+                hub.offer_kk = case["hub_offers_kk"].as_bool();
+            }
+            "client_key_changed" => folder = another.0.clone(),
+            "kk_answer_unauthenticated" => {
+                hub.corrupt.insert("KKpsk0".into());
+            }
+            _ => {}
+        }
+    }
+    let before = broker.responder.lock().await.patterns.len();
+    let outcome = carrier_attempt(broker.transport(), &identity, &folder).await;
+    let patterns = broker.responder.lock().await.patterns[before..]
+        .iter()
+        .map(|pattern| pattern[..2].to_string())
+        .collect::<Vec<_>>();
+    json!({"outcome": outcome, "patterns": patterns})
+}
+
+#[tokio::test]
+async fn link_carriers_run_their_vectors() {
+    let raw = std::fs::read_to_string("tests/conformance/link-carrier-vectors.json").unwrap();
+    let spec: Value = serde_json::from_str(&raw).unwrap();
+    for case in spec["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let produced = carrier_case(case).await;
+        // Recorded before the assert: the record is what this SDK produced.
+        common::record("link-carrier-vectors.json", name, &produced);
+        assert_eq!(produced, case["expect"], "{name}");
+    }
+}
+
+// A refusal after KK is a plain refusal: only XX can show the hub a key
+// other than the one it pinned.
+#[tokio::test]
+async fn an_https_refusal_right_after_kk_is_not_a_rejected_key() {
+    let fixture = HttpFixture::new().await;
+    fixture.state.lock().await.carrier = true;
+    let transport = fixture.transport();
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    transport.connect().await.unwrap();
+    transport.disconnect().await.unwrap();
+    // The hub completes KK, then refuses the encrypted HELLO.
+    fixture.state.lock().await.refuse_after_handshake = true;
+    let error = timeout(Duration::from_secs(30), transport.connect())
+        .await
+        .unwrap()
+        .expect_err("refused");
+    assert!(error.is_hub_refused(), "{error:?}");
+    assert!(!error.is_client_key_rejected(), "{error:?}");
+    let runtime = RuntimeTransport::Http(transport.clone());
+    assert!(runtime.closed_refused());
+    assert!(!runtime.closed_key_rejected());
+    assert_eq!(
+        fixture.state.lock().await.responder.patterns,
+        ["XXpsk2", "KKpsk0"]
+    );
+}
+
+// -- where the key lives ------------------------------------------------------
+
+#[test]
+fn an_identity_file_keeps_its_key_beside_it() {
+    let default = FixtureDir::new();
+    let elsewhere = FixtureDir::new();
+    let file = elsewhere.0.join("identity.json");
+    assert_eq!(
+        identity_key_folder(&file, Some(&default.0)),
+        Some(IdentityKeyFolder {
+            dir: elsewhere.0.clone(),
+            keep_here: true,
+            adopt_from: Some(default.0.clone()),
+        })
+    );
+    // The default folder's own identity file: nothing changes.
+    assert_eq!(
+        identity_key_folder(&default.0.join("identity.json"), Some(&default.0)),
+        Some(IdentityKeyFolder {
+            dir: default.0.clone(),
+            keep_here: false,
+            adopt_from: None,
+        })
+    );
+    // A folder that cannot be written keeps using the default.
+    let missing = elsewhere.0.join("gone");
+    assert_eq!(
+        identity_key_folder(&missing.join("identity.json"), Some(&default.0)),
+        Some(IdentityKeyFolder {
+            dir: missing,
+            keep_here: false,
+            adopt_from: None,
+        })
+    );
+    assert!(
+        std::fs::read_dir(&elsewhere.0).unwrap().next().is_none(),
+        "the probe is removed"
+    );
+}
+
+#[tokio::test]
+async fn a_client_read_from_a_file_uses_the_folder_it_is_in() {
+    let folder = FixtureDir::new();
+    let file = folder.0.join("identity.json");
+    std::fs::write(
+        &file,
+        json!({"site_id":"test","key":"test-access","password":"p","default_master":"https://hub.example"})
+            .to_string(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let client = crate::Client::from_file(&file).unwrap();
+    let RuntimeTransport::Http(http) = &client.transport else {
+        panic!("an https identity");
+    };
+    let named = http.state.noise_state_dir.lock().await.clone();
+    let default = noise_state_dir().ok();
+    if default
+        .as_deref()
+        .is_some_and(|default| same_dir(default, &folder.0))
+    {
+        assert_eq!(named, None);
+    } else {
+        assert_eq!(named.as_deref(), Some(folder.0.as_path()));
+        assert_eq!(http.state.lifecycle.key_folder().adopt_from, default);
+        // Naming a folder turns the copy off.
+        http.set_noise_state_dir(Some(folder.0.clone())).await;
+        assert_eq!(http.state.lifecycle.key_folder().adopt_from, None);
+    }
+}
+
+#[test]
+fn a_key_that_met_this_hub_is_copied_into_the_new_folder_never_moved() {
+    let legacy = FixtureDir::new();
+    let target = FixtureDir::new();
+    let key = load_or_create_noise_key(Some(&legacy.0)).unwrap();
+    let hub_key = "ab".repeat(32);
+    pin_hub_key(Some(&legacy.0), "test-hub", &hub_key).unwrap();
+
+    // Another hub's identity: this key never met it, so nothing is copied.
+    assert!(!adopt_legacy_key(&target.0, &legacy.0, "another-hub").unwrap());
+    assert!(!target
+        .0
+        .join(crate::noise_store::NOISE_KEY_FILENAME)
+        .exists());
+
+    assert!(adopt_legacy_key(&target.0, &legacy.0, "test-hub").unwrap());
+    assert_eq!(load_or_create_noise_key(Some(&target.0)).unwrap(), key);
+    assert_eq!(
+        load_noise_pin(Some(&target.0), "test-hub").unwrap(),
+        Some(hub_key.clone())
+    );
+    // Copied, not moved: the old folder is as it was.
+    assert_eq!(load_or_create_noise_key(Some(&legacy.0)).unwrap(), key);
+    assert_eq!(
+        load_noise_pin(Some(&legacy.0), "test-hub").unwrap(),
+        Some(hub_key)
+    );
+    // Once only: a folder that holds a key keeps it.
+    assert!(!adopt_legacy_key(&target.0, &legacy.0, "test-hub").unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(target.0.join(crate::noise_store::NOISE_KEY_FILENAME))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    // A folder with no key of its own anywhere copies nothing.
+    let empty = FixtureDir::new();
+    let fresh = FixtureDir::new();
+    assert!(!adopt_legacy_key(&fresh.0, &empty.0, "test-hub").unwrap());
+}
+
+// The first handshake from a new folder takes the key the hub already knows,
+// so a device whose identity file is not in the default folder keeps its link.
+#[tokio::test]
+async fn the_first_handshake_from_a_new_folder_takes_the_key_the_hub_pinned() {
+    let hub = FakeHub::start().await;
+    let identity = wss_identity(&hub.endpoint);
+    let legacy = FixtureDir::new();
+    // An older client kept its key in the old default and met this hub.
+    assert_eq!(handshake_outcome(&identity, &legacy.0).await, "connected");
+    let beside = FixtureDir::new();
+    let transport = WssTransport::new(identity.clone());
+    transport.set_noise_state_dir(Some(beside.0.clone())).await;
+    transport
+        .state
+        .lifecycle
+        .key_folder
+        .lock()
+        .unwrap()
+        .adopt_from = Some(legacy.0.clone());
+    timeout(Duration::from_secs(30), transport.connect())
+        .await
+        .unwrap()
+        .expect("the hub knows the copied key");
+    transport.disconnect().await.unwrap();
+    assert_eq!(
+        load_or_create_noise_key(Some(&beside.0)).unwrap(),
+        load_or_create_noise_key(Some(&legacy.0)).unwrap()
+    );
+    // KK straight away: the hub's pin came along too.
+    let patterns = hub.patterns();
+    assert_eq!(patterns[patterns.len() - 1], "KKpsk0");
+}
+
+// The rejected key says where the key is, and where the other program's is.
+#[tokio::test]
+async fn a_rejected_key_names_both_folders() {
+    let hub = FakeHub::start().await;
+    let identity = wss_identity(&hub.endpoint);
+    let first = FixtureDir::new();
+    assert_eq!(handshake_outcome(&identity, &first.0).await, "connected");
+    let second = FixtureDir::new();
+    let transport = WssTransport::new(identity.clone());
+    transport.set_noise_state_dir(Some(second.0.clone())).await;
+    transport
+        .state
+        .lifecycle
+        .key_folder
+        .lock()
+        .unwrap()
+        .identity_dir = Some(first.0.clone());
+    let client = crate::Client {
+        identity,
+        transport: RuntimeTransport::Wss(transport),
+        conversations: Default::default(),
+        conversation_sequence: Default::default(),
+    };
+    let session = crate::HubSession::new(
+        move || {
+            let client = client.clone();
+            async move { crate::session::connect_for_session(client, Duration::from_secs(20)).await }
+        },
+        crate::HubSessionPolicy::default(),
+    )
+    .unwrap();
+    let error = timeout(Duration::from_secs(60), session.run())
+        .await
+        .expect("run gives up at once")
+        .expect_err("the hub pinned the other key");
+    assert!(error.is_client_key_rejected(), "{error:?}");
+    let (folder, other) = error.client_key_folders().unwrap();
+    assert_eq!(std::path::Path::new(&folder), second.0.as_path());
+    assert_eq!(
+        other.as_deref().map(std::path::Path::new),
+        Some(first.0.as_path())
+    );
+    assert!(error
+        .to_string()
+        .contains("Re-pair, or share the key folder"));
+    // Given up at once: the pinning connect, then this one attempt.
+    assert_eq!(hub.attempts.load(Ordering::SeqCst), 2);
+    session.close().await.unwrap();
 }

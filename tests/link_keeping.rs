@@ -1,11 +1,13 @@
 //! Keeping a hub link up, against `link-keeping-vectors.json`.
 //!
 //! `close` cases hold the transport's reading of a close to the vectors
-//! through the pure rule it uses, `close_refuses`. `supervise` cases drive the
+//! through the pure rule it uses, `close_refuses_after` (`close_refuses` for a
+//! hub that has sent nothing). `supervise` cases drive the
 //! `LinkSupervisor` that `HubSession::run` asks after every attempt.
 //! `handshake` cases run a real Noise handshake against a loopback hub, so
 //! they live beside the transport's own Noise fixtures, in
-//! `src/transport_noise_tests.rs`, and record into the same file. The vector
+//! `src/transport_noise_tests.rs`, and record into the same file; each runs
+//! one connect as a kept link makes it, the handshake then the settle window. The vector
 //! file is vendored byte for byte from the Python reference, and what is
 //! recorded has exactly the shape the reference's
 //! `tests/test_link_keeping_vectors.py` records.
@@ -14,8 +16,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use thalovant::{
-    close_refuses, HubSessionPolicy, LinkDecision, LinkOutcome, LinkSupervisor, CLOSE_CODE_GRACE,
-    DEFAULT_REFUSAL_GRACE, DEFAULT_SETTLE_WINDOW, REFUSAL_CLOSE_CODES, REFUSAL_SETTLE,
+    close_refuses, close_refuses_after, HubSessionPolicy, LinkDecision, LinkOutcome,
+    LinkSupervisor, CLOSE_CODE_GRACE, DEFAULT_REFUSAL_GRACE, DEFAULT_SETTLE_WINDOW,
+    REFUSAL_CLOSE_CODES, REFUSAL_SETTLE,
 };
 
 mod common;
@@ -65,7 +68,12 @@ fn a_close_is_read_as_its_vector_says() {
         let after = (case["when"] == "after_handshake").then(|| millis(&case["after_ms"]));
         let late = case.get("code_late_ms").map(millis).unwrap_or_default();
         let code = case["code"].as_u64().map(|code| code as u16);
-        let refused = close_refuses(code, after, late);
+        let spoke = case["after_authenticated_frame"] == true;
+        let refused = close_refuses_after(code, after, late, spoke);
+        if !spoke {
+            // The old rule is the new one for a hub that has said nothing.
+            assert_eq!(close_refuses(code, after, late), refused, "{}", name(case));
+        }
         let produced = json!({"outcome": if refused { "refused" } else { "dropped" }});
         // Recorded before the assert: the record is what this SDK produced.
         common::record("link-keeping-vectors.json", name(case), &produced);
@@ -80,6 +88,7 @@ fn outcome(name: &str) -> LinkOutcome {
         "failed" => LinkOutcome::Failed,
         "refused" => LinkOutcome::Refused,
         "key_changed" => LinkOutcome::KeyChanged,
+        "client_key_rejected" => LinkOutcome::ClientKeyRejected,
         other => panic!("unknown outcome {other}"),
     }
 }
@@ -116,6 +125,7 @@ fn the_supervisor_decides_as_its_vector_says() {
                         "reason": match reason {
                             LinkOutcome::Refused => "refused",
                             LinkOutcome::KeyChanged => "key_changed",
+                            LinkOutcome::ClientKeyRejected => "client_key_rejected",
                             other => panic!("gave up for {other:?}"),
                         },
                     }),
