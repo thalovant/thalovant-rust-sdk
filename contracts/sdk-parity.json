@@ -125,7 +125,7 @@
         "src/home.rs": "c39febb9e2ea950dcda2dbe770ac15ebeb40cb5e1b0fbd89c637f33f5798bb85",
         "src/home/entities.rs": "ad717945af2bda9a9b7115ec515abe9fbd9e00dc65f7819c420537b45b604b08",
         "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c",
-        "src/session.rs": "1d64385ad4246a6f967a59492432ebf064a6397b3d26f22d34bc380f252dce9f",
+        "src/session.rs": "15b62d971b3afb6909705e1966958bf113a9314e64da70a60ea64edf75e76973",
         "src/transport.rs": "8c388f87d6b4d532337dab38781caa6cc78bbd9b643a91af515323d6607a96ee"
       },
       "reason": "src/home.rs holds HOME_REQUEST/HOME_RESPONSE, HOME_REQUEST_TIMEOUT, RESPONSE_TYPES and ERROR_CODES (asserted equal to the vector file's lists), HomeRequest, HomeAnswer, home_response, plain_speech (strip_ssml, then character references decoded as html.unescape does -- every numeric reference, and HTML 4's named ones, &apos; and the upper-case spellings, in src/home/entities.rs, generated from Python's html.entities; any other HTML5 name is left as written -- then Unicode whitespace collapsed as str.isspace sees it), answer_home_request (handler bounded by tokio::time::timeout; an error or panic is failed_to_handle, elapsed is timeout, outside the lists is unknown, exactly one reply) and answer_home_requests. reply_context is in src/events.rs, Client::reply in src/client.rs, which replies from Event::context, the context exactly as the hub sent it. src/session.rs adds per-type handlers bound on every client the session builds, a state callback, connect() with the 0.75 s settle window, run() with the ladder, drop detection and the 600 s refusal grace, and for_identity; src/transport.rs remembers whether the last WSS close was a refusal (no status, 1000, 1005, 1008, or a 401/403 upgrade) and wakes waiters when a link stops. Session tests are colocated in src/session.rs, as this SDK's unit suites are, so that file is implementation here; src/transport_noise_tests.rs runs the refusal close codes, the settle window and a home request answered back along its route over a real WSS Noise link. tests/home_link.rs runs every home-link case through answer_home_request with a replier that records what it is asked to send, asserts exactly one thalovant.home.response, and records the payload (or the reply_context) through tests/common/mod.rs before asserting.",
@@ -238,7 +238,7 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. The connected-client factory owns failed connection cleanup; Python performs that dial internally and retains failed retirement before replacement. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "status": "required",
       "tests": {
-        "src/session.rs": "1d64385ad4246a6f967a59492432ebf064a6397b3d26f22d34bc380f252dce9f"
+        "src/session.rs": "15b62d971b3afb6909705e1966958bf113a9314e64da70a60ea64edf75e76973"
       }
     }
   },

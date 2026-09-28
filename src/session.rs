@@ -83,8 +83,16 @@ pub struct HandlerId(u64);
 type ConnectFuture = Pin<Box<dyn Future<Output = Result<Client>> + Send>>;
 type EventHandler = Arc<dyn Fn(Event) -> BoxFuture<'static, ()> + Send + Sync>;
 type StateCallback = Arc<dyn Fn(bool) + Send + Sync>;
-/// The tasks one handler still has running, by task number.
-type Running = Arc<StateMutex<HashMap<u64, AbortHandle>>>;
+/// The tasks one handler still has running, by task number, and whether the
+/// handler has been removed.
+#[derive(Default)]
+struct Tasks {
+    /// Set by `off` and `close` under this lock: no task starts after it,
+    /// not even one a dispatch copied the handler for just before.
+    retired: bool,
+    running: HashMap<u64, AbortHandle>,
+}
+type Running = Arc<StateMutex<Tasks>>;
 
 /// A handler task's entry in its registration's [`Running`] map, removed when
 /// the task ends however it ends: finished, panicked, or aborted, even before
@@ -100,20 +108,47 @@ impl Drop for RunningEntry {
         self.running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .running
             .remove(&self.task);
     }
 }
 
-/// Abort every task a handler still has running. The map is drained first
-/// and its lock released before any abort, so a task's own [`RunningEntry`]
-/// can never wait on it.
-fn abort_running(running: &Running) {
-    let tasks: Vec<AbortHandle> = running
+/// Start one handler task and record it, unless the handler was removed.
+///
+/// The check and the record happen under the lock `retire` takes, so a
+/// dispatch that copied a handler just before `off` or `close` removed it
+/// cannot start a task that outlives them. The lock is also held until the
+/// task is recorded, so its entry is only ever removed after it was inserted.
+fn start_task(running: &Running, task: u64, work: BoxFuture<'static, ()>) -> bool {
+    let mut tasks = running
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .drain()
-        .map(|(_, task)| task)
-        .collect();
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if tasks.retired {
+        return false;
+    }
+    let entry = RunningEntry {
+        running: running.clone(),
+        task,
+    };
+    let handle = tokio::spawn(async move {
+        let _entry = entry;
+        work.await;
+    });
+    tasks.running.insert(task, handle.abort_handle());
+    true
+}
+
+/// Retire a removed handler: no task of it starts again, and every task it
+/// still has running is aborted. The map is drained and its lock released
+/// before any abort, so a task's own [`RunningEntry`] can never wait on it.
+fn retire(running: &Running) {
+    let tasks: Vec<AbortHandle> = {
+        let mut tasks = running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retired = true;
+        tasks.running.drain().map(|(_, task)| task).collect()
+    };
     for task in tasks {
         task.abort();
     }
@@ -189,18 +224,7 @@ impl Inner {
             else {
                 continue;
             };
-            // The lock is held until the task is recorded, so its entry can
-            // only be removed after it was inserted.
-            let mut tasks = running.lock().unwrap();
-            let entry = RunningEntry {
-                running: running.clone(),
-                task,
-            };
-            let handle = tokio::spawn(async move {
-                let _entry = entry;
-                work.await;
-            });
-            tasks.insert(task, handle.abort_handle());
+            start_task(&running, task, work);
         }
     }
 
@@ -384,7 +408,7 @@ impl HubSession {
         {
             let registration = handlers.events.remove(index);
             drop(handlers);
-            abort_running(&registration.running);
+            retire(&registration.running);
             return true;
         }
         let before = handlers.states.len();
@@ -729,7 +753,7 @@ impl HubSession {
             std::mem::take(&mut handlers.events)
         };
         for registration in registrations {
-            abort_running(&registration.running);
+            retire(&registration.running);
         }
         dropped
     }
@@ -1041,6 +1065,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn no_task_starts_for_a_handler_already_removed() {
+        // A dispatch that copied the handler just before off() or close()
+        // removed it reaches start_task after retire(): nothing may start.
+        let running = Running::default();
+        let (ran, mut running_tasks) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let first = ran.clone();
+        assert!(start_task(
+            &running,
+            1,
+            Box::pin(async move {
+                let _ = first.send(());
+            })
+        ));
+        running_tasks
+            .recv()
+            .await
+            .expect("a live handler's task runs");
+        retire(&running);
+        assert!(!start_task(
+            &running,
+            2,
+            Box::pin(async move {
+                let _ = ran.send(());
+            })
+        ));
+        assert!(
+            running_tasks.recv().await.is_none(),
+            "the retired handler's task never ran, and its sender is gone"
+        );
+        assert!(running.lock().unwrap().running.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_handler_that_panics_leaves_nothing_running_and_close_cancels_the_rest() {
         let (session, built) = building(vec![None]);
         let session = session.with_settle_window(Duration::ZERO);
@@ -1078,7 +1135,7 @@ mod tests {
                 .iter()
                 .find(|registration| registration.event_type == event_type)
                 .expect("registered");
-            let count = registration.running.lock().unwrap().len();
+            let count = registration.running.lock().unwrap().running.len();
             count
         };
         eventually("the panicked tasks are forgotten", || running("boom") == 0).await;
