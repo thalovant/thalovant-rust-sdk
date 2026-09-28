@@ -46,10 +46,12 @@ pub use events::{
     context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
     reply_context, utterance_payload, Context, Data, Event, Reply,
 };
+// `ERROR_CODES` and `RESPONSE_TYPES` stay in `home`: at the crate root they
+// would read as API error codes, which they are not.
 pub use home::{
     answer_home_request, answer_home_requests, home_response, plain_speech, HomeAnswer,
-    HomeRequest, HomeRequestSubscription, Replier, DEFAULT_HOME_HANDLER_TIMEOUT, ERROR_CODES,
-    HOME_REQUEST, HOME_REQUEST_TIMEOUT, HOME_RESPONSE, RESPONSE_TYPES,
+    HomeRequest, HomeRequestSubscription, Replier, DEFAULT_HOME_HANDLER_TIMEOUT, HOME_REQUEST,
+    HOME_REQUEST_TIMEOUT, HOME_RESPONSE,
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use intents::{

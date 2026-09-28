@@ -935,8 +935,10 @@ rest of that code's life. `DeviceLoginExpired` means begin again for a new
 code, and `DeviceLoginDenied` means the person said no. On approval the control
 plane keeps the token (`control.access_token`) and its id
 (`control.token_id()`). `control.revoke_api_token(None)` revokes that token and
-forgets it; a token may always revoke itself. Neither the device code nor the
-token appears in any error message or `{:?}`.
+forgets it; a token may always revoke itself. Revoking it twice is fine: a
+token already revoked or expired cannot authenticate its own revoke, so that
+401 counts as revoked, and a second call sends nothing. Neither the device code
+nor the token appears in any error message or `{:?}`.
 
 ### 2. Create the connection
 
@@ -969,7 +971,8 @@ let result = match control
 
 A hub takes one Home Assistant connection. The kind is sent as
 `spec.connection_type`, and the API must repeat it: an API that does not know
-the kind yet answers 422, and one that ignores it makes an ordinary connection.
+the kind yet answers 422 about that field, and one that ignores it makes an
+ordinary connection.
 Both fail with `ThalovantError::UnsupportedConnectionType`, and the SDK deletes
 a connection made of the wrong kind before it fails. Every other refusal is
 the `ThalovantError::ApiResponse` it always was; `api_refusal()` says which
@@ -997,8 +1000,10 @@ control
 `ThalovantError::AdmissionFailed` carries the operation's `error_code`.
 `ThalovantError::AdmissionTimeout` is both `is_timeout()` and
 `is_connection_error()`: the connection exists and may still be admitted, so
-connecting later can work. The wait follows the operation's `links.self` only
-on the API's own origin.
+connecting later can work. A 5xx is ridden out, and so is a 429: the wait
+pauses for the `retry_after_seconds` the API names, and ends as a timeout at
+once when that is longer than the time left. The wait follows the operation's
+`links.self` only on the API's own origin.
 
 ### 4. Answer the hub's requests
 
@@ -1031,7 +1036,7 @@ with empty speech and a code, and the hub speaks its own sentence in the
 device's language: `failed_to_handle` when the handler returns an error or
 panics, `timeout` when it takes longer than the timeout (nine seconds, inside
 the hub's ten), and `unknown` when it answers with a type or code outside
-`RESPONSE_TYPES` and `ERROR_CODES`. A request's `conversation_id` is echoed
+`home::RESPONSE_TYPES` and `home::ERROR_CODES`. A request's `conversation_id` is echoed
 when the answer sets none. Drop `answering`, or call `answering.stop()`, to
 stop.
 

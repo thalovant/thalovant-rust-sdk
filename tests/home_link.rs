@@ -16,11 +16,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
+use thalovant::home::{ERROR_CODES, RESPONSE_TYPES};
 use thalovant::{
     answer_home_request, reply_context, ApiRefusal, BootstrapIdentityOptions, ControlPlane, Data,
     DeviceAuthorization, Event, HomeAnswer, OperationResource, Replier, ThalovantError,
-    ERROR_CODES, HOME_ASSISTANT_SCOPES, HOME_REQUEST, HOME_REQUEST_TIMEOUT, HOME_RESPONSE,
-    RESPONSE_TYPES,
+    DEFAULT_HOME_HANDLER_TIMEOUT, HOME_ASSISTANT_SCOPES, HOME_REQUEST, HOME_REQUEST_TIMEOUT,
+    HOME_RESPONSE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -45,12 +46,14 @@ fn name(case: &Value) -> &str {
     case["name"].as_str().expect("name")
 }
 
-/// A duration the vectors give in seconds.
-fn seconds(value: &Value) -> Duration {
-    Duration::from_secs_f64(value.as_f64().expect("seconds"))
+/// A duration the vectors give, always in whole milliseconds (`*_ms`): only
+/// whole numbers compare equal across languages.
+fn millis(value: &Value) -> Duration {
+    Duration::from_millis(value.as_u64().expect("whole milliseconds"))
 }
 
-/// A duration as the reference records it: whole seconds as an integer.
+/// A duration the API gives in seconds (a device poll `interval`), recorded
+/// as the reference records it: whole seconds as an integer.
 fn recorded_seconds(duration: Duration) -> Value {
     if duration.subsec_nanos() == 0 {
         Value::from(duration.as_secs())
@@ -391,6 +394,11 @@ async fn device_case(case: &Value, spec: &Value) -> (Value, ScriptedApi) {
                 .expect("the token revokes itself");
             assert!(control.access_token.is_none() && control.token_id().is_none());
             produced = vec![json!({"outcome": "revoked"})];
+            // Idempotent: revoking again sends nothing and succeeds.
+            control
+                .revoke_api_token(None)
+                .await
+                .expect("revoking again changes nothing");
         }
     }
     (Value::Array(produced), api)
@@ -511,23 +519,30 @@ async fn connection_kinds_run_their_vectors() {
 
 async fn admission_case(case: &Value) -> (Value, ScriptedApi) {
     let call = &case["call"];
+    let expect = &case["expect"];
     let api = ScriptedApi::start(&case["exchanges"]).await;
     let control = ControlPlane::new(api.url.clone(), Some("synthetic-token".to_string()));
     let operation: Option<OperationResource> = (!call["operation"].is_null())
         .then(|| serde_json::from_value(call["operation"].clone()).expect("an operation"));
+    let started = std::time::Instant::now();
     let waited = control
         .wait_for_admission(
             operation.as_ref(),
-            seconds(&call["timeout_seconds"]),
-            seconds(&call["poll_interval_seconds"]),
+            millis(&call["timeout_ms"]),
+            millis(&call["poll_interval_ms"]),
         )
         .await;
+    let waited_ms = started.elapsed().as_millis();
     let polls = api.sent().len();
-    let produced = match waited {
+    let mut produced = match waited {
         Ok(()) => json!({"outcome": "admitted", "polls": polls}),
         Err(error @ ThalovantError::AdmissionTimeout { .. }) => {
             assert!(error.is_connection_error() && error.is_timeout());
-            json!({"outcome": "timeout"})
+            let mut produced = json!({"outcome": "timeout"});
+            if expect.get("polls").is_some() {
+                produced["polls"] = json!(polls);
+            }
+            produced
         }
         Err(ThalovantError::AdmissionFailed { error_code, .. }) => {
             json!({"outcome": "failed", "error_code": error_code, "polls": polls})
@@ -537,6 +552,14 @@ async fn admission_case(case: &Value) -> (Value, ScriptedApi) {
         }
         Err(other) => panic!("{}: unexpected {other:?}", name(case)),
     };
+    if let Some(bound) = expect.get("waited_at_least_ms").and_then(Value::as_u64) {
+        // Recorded as the bound it met, so every SDK records the same value.
+        produced["waited_at_least_ms"] = if waited_ms >= u128::from(bound) {
+            json!(bound)
+        } else {
+            json!(waited_ms as u64)
+        };
+    }
     (produced, api)
 }
 
@@ -573,8 +596,8 @@ async fn run_handler(spec: Value) -> Result<HomeAnswer, String> {
     if spec["raises"] == Value::Bool(true) {
         return Err("the conversation agent is gone".to_string());
     }
-    if let Some(wait) = spec["sleep_seconds"].as_f64() {
-        tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+    if let Some(wait) = spec["sleep_ms"].as_u64() {
+        tokio::time::sleep(Duration::from_millis(wait)).await;
     }
     let mut answer = HomeAnswer::new(
         spec["response_type"].as_str().unwrap_or("action_done"),
@@ -603,9 +626,9 @@ async fn home_link_runs_its_vectors() {
                 None,
             );
             let timeout = case
-                .get("timeout_seconds")
-                .map(seconds)
-                .unwrap_or(thalovant::DEFAULT_HOME_HANDLER_TIMEOUT);
+                .get("timeout_ms")
+                .map(millis)
+                .unwrap_or(DEFAULT_HOME_HANDLER_TIMEOUT);
             let handler = case["handler"].clone();
             let payload = answer_home_request(
                 &replies,
@@ -638,10 +661,10 @@ fn the_contract_lists_match_the_sdk() {
     assert_eq!(HOME_REQUEST, home["request_type"]);
     assert_eq!(HOME_RESPONSE, home["response_type"]);
     assert_eq!(
-        json!(HOME_REQUEST_TIMEOUT.as_secs()),
-        home["reply_timeout_seconds"]
+        json!(HOME_REQUEST_TIMEOUT.as_millis() as u64),
+        home["reply_timeout_ms"]
     );
-    assert_eq!(HOME_REQUEST_TIMEOUT.subsec_nanos(), 0);
+    assert_eq!(DEFAULT_HOME_HANDLER_TIMEOUT.as_millis(), 9000);
     assert_eq!(
         json!(HOME_ASSISTANT_SCOPES),
         device["home_assistant_scopes"]
@@ -736,4 +759,158 @@ async fn slow_down_stays_with_its_device_code_and_a_refusal_keeps_its_kind() {
     };
     assert_eq!(linked.api_refusal(), Some(ApiRefusal::AlreadyLinked));
     assert_eq!(linked.linked_client_id(), Some("c-9"));
+}
+
+fn exchange(method: &str, path: &str, status: u16, body: &str) -> Value {
+    json!({"request": {"method": method, "path": path},
+        "response": {"status": status, "content_type": "application/json", "body": body}})
+}
+
+#[tokio::test]
+async fn only_the_token_in_use_revokes_itself_on_a_401_and_a_sign_in_rearms_it() {
+    let token = r#"{"access_token":"tok-1","token_id":"id-1"}"#;
+    let unauthorized = r#"{"detail":"Could not validate credentials"}"#;
+    let api = ScriptedApi::start(&json!([
+        // Another token by id: a 404 and a 401 are the API's answer, returned.
+        exchange(
+            "DELETE",
+            "/v1/auth/api-tokens/other",
+            404,
+            r#"{"detail":"Not found"}"#
+        ),
+        exchange("DELETE", "/v1/auth/api-tokens/other", 401, unauthorized),
+        // A password sign-in has no token id, so it forgets id-1's.
+        exchange(
+            "POST",
+            "/v1/auth/token",
+            200,
+            r#"{"access_token":"session-1"}"#
+        ),
+        // A device login signs in again, and revoking it is sent again.
+        exchange("POST", "/v1/auth/device/token", 200, token),
+        exchange("DELETE", "/v1/auth/api-tokens/id-1", 401, unauthorized),
+        exchange("POST", "/v1/auth/device/token", 200, token),
+        exchange("DELETE", "/v1/auth/api-tokens/id-1", 204, ""),
+    ]))
+    .await;
+    let mut control = ControlPlane::new(api.url.clone(), Some("tok-0".to_string()));
+    for status in [404, 401] {
+        let error = control
+            .revoke_api_token(Some("other"))
+            .await
+            .expect_err("another token's refusal is an error");
+        assert_eq!(error.status_code(), Some(status));
+    }
+    assert_eq!(control.access_token.as_deref(), Some("tok-0"));
+
+    control
+        .login("person@example.com", "pw", None)
+        .await
+        .expect("password sign-in");
+    assert_eq!(control.token_id(), None);
+    assert!(
+        control.revoke_api_token(None).await.is_err(),
+        "a session token has no id to revoke by default"
+    );
+
+    let grant = DeviceAuthorization {
+        device_code: "dc".to_string(),
+        user_code: String::new(),
+        verification_uri: "https://x".to_string(),
+        verification_uri_complete: None,
+        expires_in: None,
+        interval: Some(5),
+        raw: Map::new(),
+    };
+    for _ in 0..2 {
+        control.poll_device_login(&grant).await.expect("approved");
+        assert_eq!(control.token_id(), Some("id-1"));
+        control.revoke_api_token(None).await.expect("revoked");
+        assert!(control.access_token.is_none() && control.token_id().is_none());
+        // Nothing is sent for this one.
+        control
+            .revoke_api_token(None)
+            .await
+            .expect("again, a no-op");
+    }
+    // A token set by hand is not the one revoked: there is nothing to revoke
+    // it by, and saying so is the honest answer.
+    control.access_token = Some("by-hand".to_string());
+    assert!(control.revoke_api_token(None).await.is_err());
+    api.finish("revoke");
+}
+
+#[tokio::test]
+async fn a_validation_error_is_read_where_it_says_what_it_is_about() {
+    // FastAPI's own shape: `detail` is the list of errors.
+    let about_kind = r#"{"detail":[{"type":"literal_error","loc":["body","spec","connection_type"],"msg":"Input should be voice_satellite","input":"home_assistant"}]}"#;
+    let about_kind_by_string = r#"{"detail":"Request validation failed","errors":[{"loc":"body.spec.connectionType","msg":"bad"}]}"#;
+    let about_site = r#"{"detail":[{"type":"missing","loc":["body","spec","siteId"],"msg":"Field required","input":{"connection_type":"home_assistant"}}]}"#;
+    let create = |body: &str| {
+        json!({"request": {"method": "POST", "path": "/v1/clients"},
+            "response": {"status": 422, "content_type": "application/problem+json", "body": body}})
+    };
+    let api = ScriptedApi::start(&json!([
+        create(about_kind),
+        create(about_kind_by_string),
+        create(about_site)
+    ]))
+    .await;
+    let control = ControlPlane::new(api.url.clone(), Some("synthetic-token".to_string()));
+    let hub = json!({"id": "hub-1", "domain": "kitchen.thalovant.io", "wss_enabled": true});
+    let mut unsupported = Vec::new();
+    for _ in 0..3 {
+        let error = control
+            .create_client_identity_of_type(
+                hub.clone(),
+                "home_assistant",
+                BootstrapIdentityOptions {
+                    name: "Home Assistant".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("a 422");
+        assert_eq!(error.status_code(), Some(422));
+        unsupported.push(matches!(
+            error,
+            ThalovantError::UnsupportedConnectionType { .. }
+        ));
+    }
+    assert_eq!(unsupported, [true, true, false]);
+    api.finish("validation errors");
+}
+
+#[tokio::test]
+async fn a_429_without_a_wait_named_waits_the_poll_interval() {
+    let path = "/v1/operations/op-1";
+    let limited = |body: &str| exchange("GET", path, 429, body);
+    let api = ScriptedApi::start(&json!([
+        limited(r#"{"detail":"slow down"}"#),
+        // A top-level wait, and a negative one that names nothing.
+        limited(r#"{"retry_after_seconds":0.2}"#),
+        limited(r#"{"retry_after_seconds":-5,"detail":{"retry_after_seconds":0}}"#),
+        exchange("GET", path, 200, r#"{"status":"ready"}"#),
+    ]))
+    .await;
+    let control = ControlPlane::new(api.url.clone(), Some("synthetic-token".to_string()));
+    let operation: OperationResource = serde_json::from_value(json!({
+        "id": "op-1", "kind": "client.sync", "aggregate_type": "client", "aggregate_id": null,
+        "status": "requested", "details": {}, "git_commit_sha": null, "error_code": null,
+        "error_message": null, "created_at": "", "updated_at": "", "committed_at": null,
+        "applied_at": null, "ready_at": null, "terminal_at": null, "links": {}
+    }))
+    .unwrap();
+    let started = std::time::Instant::now();
+    control
+        .wait_for_admission(
+            Some(&operation),
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("admitted after the waits");
+    assert!(started.elapsed() >= Duration::from_millis(240));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    api.finish("429");
 }
