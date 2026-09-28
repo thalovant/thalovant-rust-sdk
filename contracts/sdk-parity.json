@@ -50,7 +50,7 @@
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/connection-admission-vectors.json": "41eb4a83835bd50390d000fa7396b7067dafa24f3023b34985e6b254cf5fc259",
-        "tests/home_link.rs": "4df8ae0716d08fa047ffd544df78ccb80966b08acb393dc9ffb774dbd89d1b4c"
+        "tests/home_link.rs": "209d1e21c9fb496ceb7a73e9e9ee34e500c0729c004317e49e8b90aecec6b5f4"
       },
       "vectors": {
         "connection-admission-vectors.json": "tests/conformance/connection-admission-vectors.json"
@@ -67,7 +67,7 @@
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/connection-kinds-vectors.json": "2baef508194472279ff2446105a1408e381b2f9e4bfc03e5f96d9c6529ddf604",
-        "tests/home_link.rs": "4df8ae0716d08fa047ffd544df78ccb80966b08acb393dc9ffb774dbd89d1b4c"
+        "tests/home_link.rs": "209d1e21c9fb496ceb7a73e9e9ee34e500c0729c004317e49e8b90aecec6b5f4"
       },
       "vectors": {
         "connection-kinds-vectors.json": "tests/conformance/connection-kinds-vectors.json"
@@ -112,7 +112,7 @@
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/device-login-vectors.json": "8a2257cd80b5d2dfa9553420b51617c697b1ad4e6af60ba83e980e1731fa7854",
-        "tests/home_link.rs": "4df8ae0716d08fa047ffd544df78ccb80966b08acb393dc9ffb774dbd89d1b4c"
+        "tests/home_link.rs": "209d1e21c9fb496ceb7a73e9e9ee34e500c0729c004317e49e8b90aecec6b5f4"
       },
       "vectors": {
         "device-login-vectors.json": "tests/conformance/device-login-vectors.json"
@@ -137,7 +137,7 @@
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/home-link-vectors.json": "3dc3d38020f3d1b7a2df61d0048fb13685a5361d2dff82710c1e1833cccc576f",
         "tests/conformance/link-keeping-vectors.json": "b3be27131c051c527d7b917dd6d7d24692920a0f59694b1031f009724e3de4bc",
-        "tests/home_link.rs": "4df8ae0716d08fa047ffd544df78ccb80966b08acb393dc9ffb774dbd89d1b4c",
+        "tests/home_link.rs": "209d1e21c9fb496ceb7a73e9e9ee34e500c0729c004317e49e8b90aecec6b5f4",
         "tests/link_keeping.rs": "6fa0ef14c8bc29b4451db174ab7bbc2b2ecda0688fa81164b10cac3ecaa78a18"
       },
       "vectors": {

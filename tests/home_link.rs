@@ -531,6 +531,26 @@ async fn connection_kinds_run_their_vectors() {
 // -- connection admission -----------------------------------------------------
 
 /// A loopback port nothing listens on.
+/// A loopback port that never answers an HTTP request: it accepts each
+/// connection and resets it at once. A closed port would do on Linux and
+/// macOS, but Windows retries a refused connect for about two seconds, the
+/// whole budget of the admission case "an API out of reach is reported as it
+/// is". The listener lives as long as the runtime of the test that made it.
+async fn resetting_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a resetting listener");
+    let port = listener.local_addr().expect("listener address").port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            // Close with a reset, not a FIN.
+            let _ = stream.set_zero_linger();
+            drop(stream);
+        }
+    });
+    port
+}
+
 fn closed_port() -> u16 {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a probe");
     probe.local_addr().expect("probe address").port()
@@ -564,7 +584,7 @@ async fn admission_case(case: &Value) -> (Value, ScriptedApi) {
         .and_then(|port| port.parse::<u16>().ok())
         .expect("the loopback port");
     let url = if call["api"] == "unreachable" {
-        format!("http://127.0.0.1:{}", closed_port())
+        format!("http://127.0.0.1:{}", resetting_port().await)
     } else {
         api.url.clone()
     };
