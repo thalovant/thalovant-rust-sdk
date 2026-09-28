@@ -289,6 +289,11 @@ impl Replier for HubSession {
 /// - `failed_to_handle` when it returns an error or panics;
 /// - `timeout` when it has not answered within `timeout`.
 ///
+/// The reply gets what is left of the hub's [`HOME_REQUEST_TIMEOUT`] after
+/// the handler (or of `timeout`, when that is longer): an answer delivered
+/// after the hub has given up is only noise. A reply still unsent then is
+/// [`ThalovantError::Timeout`](crate::ThalovantError::Timeout).
+///
 /// Returns the payload sent, or the error sending it.
 pub async fn answer_home_request<R, H, Fut, E>(
     replier: &R,
@@ -301,10 +306,20 @@ where
     H: FnOnce(HomeRequest) -> Fut,
     Fut: Future<Output = std::result::Result<HomeAnswer, E>>,
 {
+    let reply_by = tokio::time::Instant::now() + HOME_REQUEST_TIMEOUT.max(timeout);
     let request = HomeRequest::from_event(event);
     let answer = handle(handler, request.clone(), timeout).await;
     let payload = home_response(&request, answer);
-    replier.reply(event, HOME_RESPONSE, payload.clone()).await?;
+    tokio::time::timeout_at(
+        reply_by,
+        replier.reply(event, HOME_RESPONSE, payload.clone()),
+    )
+    .await
+    .map_err(|_| {
+        crate::ThalovantError::Timeout(
+            "the home response could not be sent before the hub's deadline".into(),
+        )
+    })??;
     Ok(payload)
 }
 
@@ -407,6 +422,35 @@ impl std::fmt::Debug for HomeRequestSubscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replier whose reply never completes.
+    struct Stalling;
+
+    impl Replier for Stalling {
+        fn reply(
+            &self,
+            _event: &Event,
+            _msg_type: &str,
+            _data: Data,
+        ) -> impl Future<Output = Result<()>> + Send {
+            std::future::pending()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reply_gets_only_what_is_left_of_the_hubs_bound() {
+        let started = tokio::time::Instant::now();
+        let event = Event::new(HOME_REQUEST, Data::new(), crate::Context::new(), None);
+        let outcome = answer_home_request(
+            &Stalling,
+            &event,
+            |_| async { Ok::<_, ()>(HomeAnswer::action_done("done")) },
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(matches!(outcome, Err(crate::ThalovantError::Timeout(_))));
+        assert_eq!(started.elapsed(), HOME_REQUEST_TIMEOUT);
+    }
 
     #[test]
     fn speech_decodes_what_html_unescape_decodes() {

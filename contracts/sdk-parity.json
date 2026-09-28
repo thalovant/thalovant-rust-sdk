@@ -122,7 +122,7 @@
       "implementation": {
         "src/client.rs": "79eff1608275422d761db1661908ca9ed233247c19c8b328ed1cbb012ff85029",
         "src/events.rs": "81ddd83fe8c04c0f59539b40e32d4616da6099badc4fe37b1519648a6a390a99",
-        "src/home.rs": "b2228ab2afcc4096480ba734cce9bcd5fa9cb5679a522e2aa0d2c56ad572b75f",
+        "src/home.rs": "c39febb9e2ea950dcda2dbe770ac15ebeb40cb5e1b0fbd89c637f33f5798bb85",
         "src/home/entities.rs": "ad717945af2bda9a9b7115ec515abe9fbd9e00dc65f7819c420537b45b604b08",
         "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c",
         "src/session.rs": "1d64385ad4246a6f967a59492432ebf064a6397b3d26f22d34bc380f252dce9f",
