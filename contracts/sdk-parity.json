@@ -3,7 +3,7 @@
     "api-errors": {
       "implementation": {
         "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
-        "src/errors.rs": "484d99a8d13dc1b5093134116126700a6412ffabf600ea964a5d8eb8c77f57d8",
+        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
         "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
       },
       "reason": "ApiProblem and ThalovantError's api_problem/api_code/api_detail live in src/errors.rs; api_response_error() in src/control.rs parses every failure body once and fills ApiResponse.problem, leaving the bounded, redacted display line as it was, and ApiProblem's hand-written Debug redacts secret-named keys so {:?} and an unwrap() panic cannot print an echoed password. tests/api_errors.rs serves each shared vector from a loopback HTTP peer, reads it back through ControlPlane::get_hub and records what it produced through tests/common/mod.rs, which is hashed beside it because it controls canonicalisation.",
@@ -42,7 +42,7 @@
     "connection-admission": {
       "implementation": {
         "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
-        "src/errors.rs": "484d99a8d13dc1b5093134116126700a6412ffabf600ea964a5d8eb8c77f57d8",
+        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
         "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
       },
       "reason": "wait_for_admission in src/control.rs polls GET /v1/operations/{id} (the OperationResource id, else the id at the end of links.self): ready, no operation and 404 are admitted, failed and timed_out are ThalovantError::AdmissionFailed with the operation's error_code, requested/committed/applied keep polling, a 5xx is ridden out, another API refusal is AdmissionFailed with its status and problem, and the deadline (each GET bounded by it) is ThalovantError::AdmissionTimeout, for which is_timeout() and is_connection_error() in src/errors.rs are both true -- the runner asserts both. An absolute links.self on another origin than the API's is ThalovantError::Api and never fetched. A 429 is ridden out too, waiting the problem's retry_after_seconds (top level or inside a detail object) or the poll interval when that is longer, and a 429 asking for longer than is left is AdmissionTimeout at once; an unreachable API passes through unchanged. Every duration in the vectors is whole milliseconds, so the recorder keeps its strict whole-number rule. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
@@ -59,7 +59,7 @@
     "connection-kinds": {
       "implementation": {
         "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
-        "src/errors.rs": "484d99a8d13dc1b5093134116126700a6412ffabf600ea964a5d8eb8c77f57d8",
+        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
         "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
       },
       "reason": "create_client_identity_of_type sends spec.connection_type and spec.version, deletes a client whose answer does not echo the kind (DELETE with If-Match: the answer's etag) and fails with ThalovantError::UnsupportedConnectionType, as it does for a 422 naming connection_type in its detail or code or in a validation error's loc or msg (under errors, or under detail when that is a list), never in the rest of the body, which echoes the request; get_client and delete_client (etag read first when none is given, one retry on 412, 404 is deleted) live in src/control.rs. Refusals are not retyped: an existing call still returns ThalovantError::ApiResponse, and ThalovantError::api_refusal() in src/errors.rs classifies Auth (401, 423, 403 Insufficient scopes), Plan (402, 403 plan_limit) and AlreadyLinked (409 home_assistant_already_linked, with linked_client_id() read from client_id/existing_client_id/connection_id, top level then nested detail). The runner asserts every refusal it classifies is still ApiResponse. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
@@ -104,7 +104,7 @@
     "device-login": {
       "implementation": {
         "src/control.rs": "dd1d2a277eb858ac5cda4c7b106d82c57923d4523b7baefbac5278975234a20e",
-        "src/errors.rs": "484d99a8d13dc1b5093134116126700a6412ffabf600ea964a5d8eb8c77f57d8",
+        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
         "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c"
       },
       "reason": "begin_device_login, poll_device_login (one POST /v1/auth/device/token, returning the ApiToken or ThalovantError::DeviceLoginPending with the interval -- lengthened by five seconds for good per device code, kept in the control plane's private device_intervals -- DeviceLoginExpired or DeviceLoginDenied, each with the status and boxed problem) and revoke_api_token live in src/control.rs; revoking the token in use treats the API's 401 as revoked and forgets it, revoking again sends nothing until the next sign-in (a private flag every sign-in clears), and every sign-in sets token_id from its own answer; the variants and their status_code/api_problem answers in src/errors.rs. A 2xx without an access_token is ThalovantError::Api; any other failure goes through api_response_error(), which also fixes login_with_browser's poll dropping the status and body. Verification URLs go through browser_command's http(s)/host/no-credentials check, and every error is checked against message_excludes in Display and both Debug forms. HOME_ASSISTANT_SCOPES is asserted equal to the vector file's list. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
@@ -125,7 +125,7 @@
         "src/home.rs": "b2228ab2afcc4096480ba734cce9bcd5fa9cb5679a522e2aa0d2c56ad572b75f",
         "src/home/entities.rs": "ad717945af2bda9a9b7115ec515abe9fbd9e00dc65f7819c420537b45b604b08",
         "src/lib.rs": "e817a6fd9dce3c179da5ce27603f1fd2547d122ae8637a6d5262688424d4275c",
-        "src/session.rs": "29edc92a9a6c56a32f432179b195d44e9fce6738b2fa73b9d1c7d63b8102b6ba",
+        "src/session.rs": "1d64385ad4246a6f967a59492432ebf064a6397b3d26f22d34bc380f252dce9f",
         "src/transport.rs": "8c388f87d6b4d532337dab38781caa6cc78bbd9b643a91af515323d6607a96ee"
       },
       "reason": "src/home.rs holds HOME_REQUEST/HOME_RESPONSE, HOME_REQUEST_TIMEOUT, RESPONSE_TYPES and ERROR_CODES (asserted equal to the vector file's lists), HomeRequest, HomeAnswer, home_response, plain_speech (strip_ssml, then character references decoded as html.unescape does -- every numeric reference, and HTML 4's named ones, &apos; and the upper-case spellings, in src/home/entities.rs, generated from Python's html.entities; any other HTML5 name is left as written -- then Unicode whitespace collapsed as str.isspace sees it), answer_home_request (handler bounded by tokio::time::timeout; an error or panic is failed_to_handle, elapsed is timeout, outside the lists is unknown, exactly one reply) and answer_home_requests. reply_context is in src/events.rs, Client::reply in src/client.rs, which replies from Event::context, the context exactly as the hub sent it. src/session.rs adds per-type handlers bound on every client the session builds, a state callback, connect() with the 0.75 s settle window, run() with the ladder, drop detection and the 600 s refusal grace, and for_identity; src/transport.rs remembers whether the last WSS close was a refusal (no status, 1000, 1005, 1008, or a 401/403 upgrade) and wakes waiters when a link stops. Session tests are colocated in src/session.rs, as this SDK's unit suites are, so that file is implementation here; src/transport_noise_tests.rs runs the refusal close codes, the settle window and a home request answered back along its route over a real WSS Noise link. tests/home_link.rs runs every home-link case through answer_home_request with a replier that records what it is asked to send, asserts exactly one thalovant.home.response, and records the payload (or the reply_context) through tests/common/mod.rs before asserting.",
@@ -198,7 +198,7 @@
     },
     "refusal": {
       "implementation": {
-        "src/errors.rs": "484d99a8d13dc1b5093134116126700a6412ffabf600ea964a5d8eb8c77f57d8",
+        "src/errors.rs": "b70d327ae79d17966f8489afc69ccc212c1fff00fdcb1ffb076061f99a9450af",
         "src/transport.rs": "8c388f87d6b4d532337dab38781caa6cc78bbd9b643a91af515323d6607a96ee"
       },
       "reason": "refusal_belongs_to_ask() and failure_error() live in src/refusal.rs with their vector suite colocated, as this SDK's private unit suites are, so the module is recorded as test evidence beside the errors and transport it rests on; collect_ask_reply() in client.rs applies the rule with the transport's count of asks, queries and fire-and-forget utterances inside the shared grace window -- recorded once connected and immediately before the publish, and kept when the publish errors, since emit_bus over HTTP can fail after the hub holds the frame. ThalovantError gains Unanswered and PolicyDenied.quota, boxed so the enum every Result carries stays inside clippy's result_large_err limit.",
@@ -238,7 +238,7 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. The connected-client factory owns failed connection cleanup; Python performs that dial internally and retains failed retirement before replacement. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
       "status": "required",
       "tests": {
-        "src/session.rs": "29edc92a9a6c56a32f432179b195d44e9fce6738b2fa73b9d1c7d63b8102b6ba"
+        "src/session.rs": "1d64385ad4246a6f967a59492432ebf064a6397b3d26f22d34bc380f252dce9f"
       }
     }
   },

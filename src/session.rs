@@ -85,6 +85,39 @@ type EventHandler = Arc<dyn Fn(Event) -> BoxFuture<'static, ()> + Send + Sync>;
 type StateCallback = Arc<dyn Fn(bool) + Send + Sync>;
 /// The tasks one handler still has running, by task number.
 type Running = Arc<StateMutex<HashMap<u64, AbortHandle>>>;
+
+/// A handler task's entry in its registration's [`Running`] map, removed when
+/// the task ends however it ends: finished, panicked, or aborted, even before
+/// it first ran. Without it a handler that panics on some events leaves one
+/// entry per event behind for as long as it stays registered.
+struct RunningEntry {
+    running: Running,
+    task: u64,
+}
+
+impl Drop for RunningEntry {
+    fn drop(&mut self) {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.task);
+    }
+}
+
+/// Abort every task a handler still has running. The map is drained first
+/// and its lock released before any abort, so a task's own [`RunningEntry`]
+/// can never wait on it.
+fn abort_running(running: &Running) {
+    let tasks: Vec<AbortHandle> = running
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .drain()
+        .map(|(_, task)| task)
+        .collect();
+    for task in tasks {
+        task.abort();
+    }
+}
 struct Registration {
     id: u64,
     event_type: String,
@@ -156,11 +189,16 @@ impl Inner {
             else {
                 continue;
             };
+            // The lock is held until the task is recorded, so its entry can
+            // only be removed after it was inserted.
             let mut tasks = running.lock().unwrap();
-            let done = running.clone();
+            let entry = RunningEntry {
+                running: running.clone(),
+                task,
+            };
             let handle = tokio::spawn(async move {
+                let _entry = entry;
                 work.await;
-                done.lock().unwrap().remove(&task);
             });
             tasks.insert(task, handle.abort_handle());
         }
@@ -346,9 +384,7 @@ impl HubSession {
         {
             let registration = handlers.events.remove(index);
             drop(handlers);
-            for (_, task) in registration.running.lock().unwrap().drain() {
-                task.abort();
-            }
+            abort_running(&registration.running);
             return true;
         }
         let before = handlers.states.len();
@@ -685,9 +721,16 @@ impl HubSession {
         let mut held = self.inner.held.lock().await;
         let dropped = self.drop_client(&mut held).await;
         drop(held);
-        let mut handlers = self.inner.handlers.lock().unwrap();
-        handlers.events.clear();
-        handlers.states.clear();
+        // Forget every handler and cancel what they still have running, as
+        // `off` does, so a closed session owns no detached task.
+        let registrations = {
+            let mut handlers = self.inner.handlers.lock().unwrap();
+            handlers.states.clear();
+            std::mem::take(&mut handlers.events)
+        };
+        for registration in registrations {
+            abort_running(&registration.running);
+        }
         dropped
     }
 }
@@ -995,6 +1038,58 @@ mod tests {
         };
         let session = HubSession::new(factory, HubSessionPolicy::default()).unwrap();
         (session, built)
+    }
+
+    #[tokio::test]
+    async fn a_handler_that_panics_leaves_nothing_running_and_close_cancels_the_rest() {
+        let (session, built) = building(vec![None]);
+        let session = session.with_settle_window(Duration::ZERO);
+        session
+            .on("boom", |_| async move { panic!("a handler that panics") })
+            .unwrap();
+        let (started, mut starting) = tokio::sync::mpsc::unbounded_channel();
+        let (ended, mut ending) = tokio::sync::mpsc::unbounded_channel::<()>();
+        session
+            .on("slow", move |_| {
+                let started = started.clone();
+                let ended = ended.clone();
+                async move {
+                    struct Ends(tokio::sync::mpsc::UnboundedSender<()>);
+                    impl Drop for Ends {
+                        fn drop(&mut self) {
+                            let _ = self.0.send(());
+                        }
+                    }
+                    let _ends = Ends(ended);
+                    let _ = started.send(());
+                    std::future::pending::<()>().await;
+                }
+            })
+            .unwrap();
+        session.connect().await.unwrap();
+        let client = built.lock().unwrap()[0].clone();
+        for n in 0..5 {
+            client.transport.deliver_for_test(event("boom", n));
+        }
+        let running = |event_type: &str| {
+            let handlers = session.inner.handlers.lock().unwrap();
+            let registration = handlers
+                .events
+                .iter()
+                .find(|registration| registration.event_type == event_type)
+                .expect("registered");
+            let count = registration.running.lock().unwrap().len();
+            count
+        };
+        eventually("the panicked tasks are forgotten", || running("boom") == 0).await;
+
+        client.transport.deliver_for_test(event("slow", 1));
+        starting.recv().await.unwrap();
+        assert_eq!(running("slow"), 1);
+        session.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ending.recv())
+            .await
+            .expect("close cancelled the running handler");
     }
 
     #[tokio::test]

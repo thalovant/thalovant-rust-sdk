@@ -343,7 +343,7 @@ pub enum ThalovantError {
     /// exists and may still be admitted, so waiting longer or connecting later
     /// can succeed.
     #[error(
-        "admission timeout: the hub did not admit the connection within {timeout:?}; it may still"
+        "admission timeout: the hub did not admit the connection within {timeout:?}; it may still admit it later"
     )]
     AdmissionTimeout {
         /// How long the wait was.
