@@ -11,6 +11,7 @@ pub mod control;
 pub mod errors;
 pub mod events;
 pub mod hive;
+pub mod home;
 pub mod hubs;
 pub mod identity;
 pub mod intents;
@@ -33,16 +34,22 @@ pub use client::{
 pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
 pub use control::{
-    AnalyticsOverviewOptions, BootstrapIdentityOptions, BootstrapIdentityResult, ControlPlane,
-    DeviceAuthorization, DeviceLoginOptions, DevicePrompt, HubSkillWaitOptions, LoginOptions,
-    MarketplaceSkillsOptions, MemoryListOptions, OperationResource, OperationStatus,
-    ReleaseOptions, SkillInstallOptions, DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL,
-    DEFAULT_SKILL_SOURCE_TYPE,
+    AnalyticsOverviewOptions, ApiToken, BootstrapIdentityOptions, BootstrapIdentityResult,
+    ControlPlane, DeviceAuthorization, DeviceLoginOptions, DevicePrompt, HubSkillWaitOptions,
+    LoginOptions, MarketplaceSkillsOptions, MemoryListOptions, OperationResource, OperationStatus,
+    ReleaseOptions, SkillInstallOptions, CONNECTION_TYPE_HOME_ASSISTANT, DEFAULT_ADMISSION_TIMEOUT,
+    DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_OPERATION_POLL_INTERVAL,
+    DEFAULT_SKILL_SOURCE_TYPE, HOME_ASSISTANT_SCOPES,
 };
-pub use errors::{ApiProblem, Result, ThalovantError};
+pub use errors::{ApiProblem, ApiRefusal, Result, ThalovantError};
 pub use events::{
     context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
-    utterance_payload, Context, Data, Event, Reply,
+    reply_context, utterance_payload, Context, Data, Event, Reply,
+};
+pub use home::{
+    answer_home_request, answer_home_requests, home_response, plain_speech, HomeAnswer,
+    HomeRequest, HomeRequestSubscription, Replier, DEFAULT_HOME_HANDLER_TIMEOUT, ERROR_CODES,
+    HOME_REQUEST, HOME_REQUEST_TIMEOUT, HOME_RESPONSE, RESPONSE_TYPES,
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use intents::{
@@ -87,5 +94,6 @@ pub use inventory::{
 };
 pub mod session;
 pub use session::{
-    hub_hostname, HubSession, HubSessionEvent, HubSessionPolicy, OriginAttempt, OriginPreference,
+    hub_hostname, HandlerId, HubSession, HubSessionEvent, HubSessionPolicy, OriginAttempt,
+    OriginPreference, DEFAULT_REFUSAL_GRACE, DEFAULT_SETTLE_WINDOW,
 };

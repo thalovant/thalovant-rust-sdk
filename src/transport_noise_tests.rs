@@ -35,6 +35,8 @@ struct Responder {
     buffer: Vec<u8>,
     patterns: Vec<String>,
     hellos: usize,
+    /// Every bus message the client sent after the handshake.
+    received: Vec<HiveMessage>,
 }
 impl Responder {
     fn new() -> Self {
@@ -52,6 +54,7 @@ impl Responder {
             buffer: vec![],
             patterns: vec![],
             hellos: 0,
+            received: vec![],
         }
     }
     fn reset(&mut self) -> Vec<NoiseWrite> {
@@ -72,6 +75,18 @@ impl Responder {
             Self::plain("hello", self.hello.clone()),
             Self::plain("shake", self.offer.clone()),
         ]
+    }
+    /// One message from the hub, encrypted, in a single frame.
+    fn encrypt(&mut self, message: &HiveMessage) -> NoiseWrite {
+        let session = self.session.as_mut().expect("the handshake is complete");
+        let plain = [&[0_u8][..], &serde_json::to_vec(message).unwrap()].concat();
+        let mut encrypted = vec![0; 65535];
+        let length = session.write_message(&plain, &mut encrypted).unwrap();
+        encrypted.truncate(length);
+        NoiseWrite {
+            payload: encrypted,
+            binary: true,
+        }
     }
     fn plain(kind: &str, payload: Map<String, Value>) -> NoiseWrite {
         NoiseWrite {
@@ -124,6 +139,7 @@ impl Responder {
             if message.msg_type != "bus" {
                 return Err(ThalovantError::Connection("unexpected message".into()));
             }
+            self.received.push(message);
             let chunks: Vec<_> = payload.chunks(65000).collect();
             let mut replies = vec![];
             for (i, chunk) in chunks.iter().enumerate() {
@@ -1955,4 +1971,264 @@ async fn a_peer_close_during_handshake_is_not_reported_as_timeout() {
         .last_error
         .unwrap()
         .contains("RAW-SECRET"));
+}
+
+/// A fake hub that completes the handshake, then does `after` with the socket.
+async fn handshake_then<F, Fut, T>(listener: TcpListener, after: F) -> T
+where
+    F: FnOnce(WebSocketStream<TcpStream>, Responder) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+    let mut responder = Responder::new();
+    for write in responder.reset() {
+        socket
+            .send(WebSocketMessage::Text(
+                String::from_utf8(write.payload).unwrap(),
+            ))
+            .await
+            .unwrap();
+    }
+    while responder.session.is_none() {
+        let (raw, binary) = match socket.next().await.unwrap().unwrap() {
+            WebSocketMessage::Text(text) => (text.into_bytes(), false),
+            WebSocketMessage::Binary(bytes) => (bytes, true),
+            _ => continue,
+        };
+        for write in responder.receive(&raw, binary).unwrap() {
+            socket
+                .send(if write.binary {
+                    WebSocketMessage::Binary(write.payload)
+                } else {
+                    WebSocketMessage::Text(String::from_utf8(write.payload).unwrap())
+                })
+                .await
+                .unwrap();
+        }
+    }
+    after(socket, responder).await
+}
+
+fn wss_identity(endpoint: &str) -> Identity {
+    Identity::from_value(json!({"site_id":"test","key":"test-access","password":test_password(),"default_master":endpoint,"data_plane_endpoints":{"wss":endpoint}})).unwrap()
+}
+
+#[tokio::test]
+async fn a_close_right_after_the_handshake_says_whether_it_was_a_refusal() {
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+    for (close, refused) in [
+        (Some(CloseCode::Policy), true),
+        (Some(CloseCode::Normal), true),
+        (None, true),
+        (Some(CloseCode::Error), false),
+        (Some(CloseCode::Again), false),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let transport = WssTransport::new(wss_identity(&endpoint));
+        let dir = FixtureDir::new();
+        transport.set_noise_state_dir(Some(dir.0.clone())).await;
+        let server = tokio::spawn(handshake_then(listener, move |mut socket, _| async move {
+            socket
+                .send(WebSocketMessage::Close(close.map(|code| CloseFrame {
+                    code,
+                    reason: "".into(),
+                })))
+                .await
+                .unwrap();
+        }));
+        timeout(Duration::from_secs(12), transport.connect())
+            .await
+            .unwrap()
+            .unwrap();
+        let runtime = RuntimeTransport::Wss(transport.clone());
+        timeout(Duration::from_secs(2), runtime.stopped())
+            .await
+            .expect("the close is heard as it happens");
+        server.await.unwrap();
+        assert_eq!(transport.closed_refused(), refused, "{close:?}");
+        assert_eq!(runtime.closed_refused(), refused, "{close:?}");
+    }
+
+    // A socket that simply drops is the network's trouble, not a verdict.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let transport = WssTransport::new(wss_identity(&endpoint));
+    let dir = FixtureDir::new();
+    transport.set_noise_state_dir(Some(dir.0.clone())).await;
+    let server = tokio::spawn(handshake_then(listener, |socket, _| async move {
+        drop(socket);
+    }));
+    timeout(Duration::from_secs(12), transport.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+    timeout(
+        Duration::from_secs(2),
+        RuntimeTransport::Wss(transport.clone()).stopped(),
+    )
+    .await
+    .unwrap();
+    assert!(!transport.closed_refused());
+}
+
+#[tokio::test]
+async fn a_hub_session_hears_a_refusal_inside_the_settle_window() {
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+    for (code, refused) in [(CloseCode::Policy, true), (CloseCode::Error, false)] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let identity = wss_identity(&endpoint);
+        let dir = FixtureDir::new();
+        let state = dir.0.clone();
+        let server = tokio::spawn(handshake_then(listener, move |mut socket, _| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = socket
+                .send(WebSocketMessage::Close(Some(CloseFrame {
+                    code,
+                    reason: "".into(),
+                })))
+                .await;
+        }));
+        let session = crate::HubSession::new(
+            move || {
+                let identity = identity.clone();
+                let state = state.clone();
+                async move {
+                    let client = crate::Client::with_protocol(identity, HubProtocol::Wss)?;
+                    if let RuntimeTransport::Wss(wss) = &client.transport {
+                        wss.set_noise_state_dir(Some(state)).await;
+                    }
+                    // The budget the other WSS fixtures use: the first
+                    // handshake runs argon2id at 64 MiB, which a debug build
+                    // under a busy runner does not finish in the default 6 s.
+                    client.connect_with_timeout(Duration::from_secs(20)).await?;
+                    Ok(client)
+                }
+            },
+            crate::HubSessionPolicy::default(),
+        )
+        .unwrap();
+        let result = timeout(Duration::from_secs(30), session.connect())
+            .await
+            .unwrap();
+        server.await.unwrap();
+        if refused {
+            assert!(
+                matches!(result, Err(ThalovantError::HubRefused(_))),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ThalovantError::Connection(_))),
+                "{result:?}"
+            );
+        }
+        assert!(!session.held());
+        session.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_hub_session_answers_a_home_request_back_along_its_route() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let identity = wss_identity(&endpoint);
+    let dir = FixtureDir::new();
+    let state = dir.0.clone();
+    let request = HiveMessage {
+        msg_type: "bus".into(),
+        payload: json!({
+            "type": crate::HOME_REQUEST,
+            "data": {"request_id": "r-1", "utterance": "turn off the kitchen light",
+                "lang": "en-US", "conversation_id": "conv-1"},
+            "context": {"source": "thalovant-skill-home", "destination": ["ha-peer", "other"],
+                "session": {"session_id": "kitchen"}, "request_id": "r-1"},
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+        ..Default::default()
+    };
+    let server = tokio::spawn(handshake_then(
+        listener,
+        move |mut socket, mut responder| async move {
+            // Well after the link counts, as a real request would be.
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let write = responder.encrypt(&request);
+            socket
+                .send(WebSocketMessage::Binary(write.payload))
+                .await
+                .unwrap();
+            loop {
+                let raw = match socket.next().await.unwrap().unwrap() {
+                    WebSocketMessage::Binary(bytes) => bytes,
+                    _ => continue,
+                };
+                for write in responder.receive(&raw, true).unwrap() {
+                    let _ = socket.send(WebSocketMessage::Binary(write.payload)).await;
+                }
+                if let Some(reply) = responder
+                    .received
+                    .iter()
+                    .find(|message| message.payload["type"] == crate::HOME_RESPONSE)
+                {
+                    return reply.payload.clone();
+                }
+            }
+        },
+    ));
+    let session = crate::HubSession::new(
+        move || {
+            let identity = identity.clone();
+            let state = state.clone();
+            async move {
+                let client = crate::Client::with_protocol(identity, HubProtocol::Wss)?;
+                if let RuntimeTransport::Wss(wss) = &client.transport {
+                    wss.set_noise_state_dir(Some(state)).await;
+                }
+                client.connect_with_timeout(Duration::from_secs(20)).await?;
+                Ok(client)
+            }
+        },
+        crate::HubSessionPolicy::default(),
+    )
+    .unwrap();
+    let answering = crate::answer_home_requests(
+        &session,
+        |request| async move {
+            assert_eq!(request.utterance, "turn off the kitchen light");
+            Ok::<_, std::convert::Infallible>(crate::HomeAnswer::action_done(
+                "<speak>Turned off the kitchen light.</speak>",
+            ))
+        },
+        crate::DEFAULT_HOME_HANDLER_TIMEOUT,
+    )
+    .unwrap();
+    timeout(Duration::from_secs(30), session.connect())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply = timeout(Duration::from_secs(30), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reply["data"],
+        json!({"request_id": "r-1", "speech": "Turned off the kitchen light.",
+            "response_type": "action_done", "continue_conversation": false,
+            "conversation_id": "conv-1"})
+    );
+    // The route turned round, from the context as the hub sent it.
+    assert_eq!(reply["context"]["source"], "ha-peer");
+    assert_eq!(reply["context"]["destination"], "thalovant-skill-home");
+    assert_eq!(
+        reply["context"]["session"],
+        json!({"session_id": "kitchen"})
+    );
+    assert_eq!(reply["context"]["request_id"], "r-1");
+    answering.stop();
+    session.close().await.unwrap();
 }

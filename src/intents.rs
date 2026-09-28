@@ -95,8 +95,8 @@ pub struct IntentInventoryOptions {
     pub fallback: bool,
     /// Retry an empty listing once in the language's usual form. On by
     /// default: a listing that returns nothing from a hub which demonstrably
-    /// answers in that language is a fault, not a preference. See
-    /// [`crate::language_matching::usual_form`].
+    /// answers in that language is a fault, not a preference. The usual form
+    /// is the crate's private `language_matching::usual_form`.
     pub nearest: bool,
 }
 

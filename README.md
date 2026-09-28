@@ -142,7 +142,10 @@ stdout print, and `timeout: Duration::from_secs(...)` to change the default
 Failures are typed: `ThalovantError::DeviceAuthorizationDenied` when the
 request is rejected in the browser, `ThalovantError::DeviceAuthorizationExpired`
 when the code expires first (call `login_with_browser` again for a new code),
-and `ThalovantError::Timeout` when `timeout` elapses.
+and `ThalovantError::Timeout` when `timeout` elapses. Any other failed poll is
+`ThalovantError::ApiResponse`, carrying what the API said. To show the code and
+poll on your own schedule, use `begin_device_login` and `poll_device_login`;
+see [Home Assistant Link](#home-assistant-link).
 
 ## CI: Direct API Token Auth
 
@@ -893,6 +896,155 @@ what it was sent) is only ever in `api_problem()`, never in the message.
 `ApiProblem`'s `Debug` redacts secret-named keys, so `{:?}` and an `unwrap()`
 panic do not print them either.
 
+## Home Assistant Link
+
+A Home Assistant integration, or any home controller, links to a hub in four
+steps: sign in on the device, create a `home_assistant` connection, wait for
+the hub to admit it, then answer the hub's requests.
+
+### 1. Sign in on the device
+
+`login_with_browser` does the whole device flow in one call. A config flow
+that shows the code and polls on its own schedule takes it one step at a time:
+
+```rust
+use thalovant::{ControlPlane, ThalovantError, HOME_ASSISTANT_SCOPES};
+
+let mut control = ControlPlane::default();
+let grant = control
+    .begin_device_login(HOME_ASSISTANT_SCOPES, Some("Home Assistant"))
+    .await?;
+println!("Visit {} and enter {}", grant.verification_uri, grant.user_code);
+
+let mut wait = grant.poll_interval();
+let token = loop {
+    tokio::time::sleep(wait).await;
+    match control.poll_device_login(&grant).await {
+        Ok(token) => break token,
+        Err(ThalovantError::DeviceLoginPending { interval, .. }) => wait = interval,
+        Err(error) => return Err(error.into()),
+    }
+};
+// Store token.access_token as a secret; token.expires_at says when it ends.
+```
+
+`HOME_ASSISTANT_SCOPES` is `hubs:read`, `clients:read` and `clients:write`,
+which is also all a Free plan can approve. The pending error's `interval`
+already includes any `slow_down` the API asked for: five seconds more, for the
+rest of that code's life. `DeviceLoginExpired` means begin again for a new
+code, and `DeviceLoginDenied` means the person said no. On approval the control
+plane keeps the token (`control.access_token`) and its id
+(`control.token_id()`). `control.revoke_api_token(None)` revokes that token and
+forgets it; a token may always revoke itself. Neither the device code nor the
+token appears in any error message or `{:?}`.
+
+### 2. Create the connection
+
+```rust
+use thalovant::{ApiRefusal, BootstrapIdentityOptions, CONNECTION_TYPE_HOME_ASSISTANT};
+
+let hub = control.get_hub(&hub_id).await?;
+let options = BootstrapIdentityOptions {
+    name: "Home Assistant (Kitchen)".into(),
+    ..Default::default()
+};
+let result = match control
+    .create_client_identity_of_type(hub, CONNECTION_TYPE_HOME_ASSISTANT, options)
+    .await
+{
+    Ok(result) => result,
+    Err(error) => {
+        match error.api_refusal() {
+            Some(ApiRefusal::AlreadyLinked) => {
+                println!("linked already, by {:?}", error.linked_client_id())
+            }
+            Some(ApiRefusal::Plan) => println!("the plan does not allow it"),
+            Some(ApiRefusal::Auth) => println!("sign in again"),
+            _ => {}
+        }
+        return Err(error.into());
+    }
+};
+```
+
+A hub takes one Home Assistant connection. The kind is sent as
+`spec.connection_type`, and the API must repeat it: an API that does not know
+the kind yet answers 422, and one that ignores it makes an ordinary connection.
+Both fail with `ThalovantError::UnsupportedConnectionType`, and the SDK deletes
+a connection made of the wrong kind before it fails. Every other refusal is
+the `ThalovantError::ApiResponse` it always was; `api_refusal()` says which
+kind it is, and keeps `api_code()`, `api_detail()` and `api_problem()` beside
+it. To remove a link, `control.delete_client(&client_id, None)` reads the
+etag first, retries once if the connection changed in between, and counts one
+already gone as deleted.
+
+### 3. Wait for the hub to admit it
+
+A new connection is admitted about ninety seconds after it is created:
+
+```rust
+use thalovant::{DEFAULT_ADMISSION_TIMEOUT, DEFAULT_OPERATION_POLL_INTERVAL};
+
+control
+    .wait_for_admission(
+        result.operation().as_ref(),
+        DEFAULT_ADMISSION_TIMEOUT,
+        DEFAULT_OPERATION_POLL_INTERVAL,
+    )
+    .await?;
+```
+
+`ThalovantError::AdmissionFailed` carries the operation's `error_code`.
+`ThalovantError::AdmissionTimeout` is both `is_timeout()` and
+`is_connection_error()`: the connection exists and may still be admitted, so
+connecting later can work. The wait follows the operation's `links.self` only
+on the API's own origin.
+
+### 4. Answer the hub's requests
+
+A home skill on the hub sends `thalovant.home.request` with what the person
+said; the integration answers with one `thalovant.home.response`:
+
+```rust
+use thalovant::{
+    answer_home_requests, HomeAnswer, HubSession, HubSessionPolicy, DEFAULT_HOME_HANDLER_TIMEOUT,
+};
+
+let session = HubSession::for_identity(result.identity.clone(), HubSessionPolicy::default())?;
+session.on_state_change(|up| println!("hub link {}", if up { "up" } else { "down" }));
+let answering = answer_home_requests(
+    &session,
+    |request| async move {
+        // Hand request.utterance, said in request.lang, to the conversation agent.
+        Ok::<_, std::io::Error>(HomeAnswer::action_done("Turned off the kitchen light."))
+    },
+    DEFAULT_HOME_HANDLER_TIMEOUT,
+)?;
+session.run().await?; // until session.close()
+```
+
+Every request gets exactly one response, sent as a reply: the request's
+context with `source` and `destination` turned round, so it goes back the way
+it came. `speech` is sent as plain text, with markup removed and character
+references decoded. When the handler cannot answer, the SDK answers for it
+with empty speech and a code, and the hub speaks its own sentence in the
+device's language: `failed_to_handle` when the handler returns an error or
+panics, `timeout` when it takes longer than the timeout (nine seconds, inside
+the hub's ten), and `unknown` when it answers with a type or code outside
+`RESPONSE_TYPES` and `ERROR_CODES`. A request's `conversation_id` is echoed
+when the answer sets none. Drop `answering`, or call `answering.stop()`, to
+stop.
+
+`run()` keeps the link until `close()`. It notices a drop as it happens and
+reconnects on the retry ladder (10 seconds, doubling to 120). A new link only
+counts once it has stayed up for 0.75 seconds, because a hub that does not
+know the connection's key says so only by closing right after the handshake.
+Such a refusal is expected while a new connection waits to be admitted, so
+`run()` keeps trying for ten minutes before it returns
+`ThalovantError::HubRefused`. `session.on(event_type, handler)` handles any
+other message type the same way, on every client the session builds, and
+`session.reply(&event, msg_type, data)` answers one yourself.
+
 ## API Shape
 
 - `ControlPlane::default()`
@@ -934,6 +1086,10 @@ panic do not print them either.
 - `control.update_memory_item(memory_id, payload)`
 - `control.delete_memory_item(memory_id)`
 - `control.create_client_identity_for_hub_id(hub_id, options)`
+- `control.create_client_identity_of_type(hub, connection_type, options)` (`CONNECTION_TYPE_HOME_ASSISTANT`; `result.client_id()`, `result.connection_type()`, `result.operation()`)
+- `control.get_client(client_id)`, `control.delete_client(client_id, etag)`
+- `control.wait_for_admission(operation, timeout, poll_interval)`
+- `control.begin_device_login(scopes, client_name)`, `control.poll_device_login(&authorization)` (`ApiToken`), `control.revoke_api_token(token_id)`, `control.token_id()`
 - `Identity::from_config(profile)`
 - `Client::from_config(profile)`
 - `Identity::from_file(path)`
@@ -955,6 +1111,10 @@ panic do not print them either.
 - `client.list_intents(lang, options)` (`IntentListOptions`)
 - `client.describe_intent(skill_id, intent_name, lang, options)` (`IntentDescribeOptions`)
 - `error.status_code()`, `error.api_code()`, `error.api_detail()`, `error.api_problem()` (`ApiProblem`) on a `ThalovantError`; see [Reading An API Error](#reading-an-api-error)
+- `error.api_refusal()` (`ApiRefusal`), `error.linked_client_id()`, `error.is_timeout()`, `error.is_connection_error()`
+- `client.reply(&event, msg_type, data)`, `reply_context(&context)`
+- `HubSession::for_identity(identity, policy)`, `session.connect()`, `session.run()`, `session.on(event_type, handler)`, `session.off(id)`, `session.on_state_change(callback)`, `session.reply(&event, msg_type, data)`
+- `answer_home_requests(&session, handler, timeout)`, `answer_home_request(&replier, &event, handler, timeout)`, `home_response(&request, answer)`, `plain_speech(text)`; see [Home Assistant Link](#home-assistant-link)
 
 ## Development
 

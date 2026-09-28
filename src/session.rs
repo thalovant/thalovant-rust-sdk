@@ -1,19 +1,33 @@
 //! Managed hub connections with explicit host scheduling and no ambiguous replay.
 use crate::transport::TransportConnectionPhase;
-use crate::{AskOptions, Client, Context, Data, Event, Reply, Result, ThalovantError};
+use crate::{AskOptions, Client, Context, Data, Event, Identity, Reply, Result, ThalovantError};
+use futures_util::future::BoxFuture;
 use std::{
+    collections::HashMap,
     future::Future,
+    panic::AssertUnwindSafe,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex as StateMutex,
+        Arc, Mutex as StateMutex, Weak,
     },
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{broadcast, Mutex},
-    task::JoinHandle,
+    sync::{broadcast, Mutex, Notify},
+    task::{AbortHandle, JoinHandle},
 };
+
+/// How long a new link must stay up before [`HubSession::connect`] counts it.
+///
+/// A hub that does not know a connection's key -- or does not know it yet --
+/// says so only by closing the socket right after the handshake.
+pub const DEFAULT_SETTLE_WINDOW: Duration = Duration::from_millis(750);
+/// How long [`HubSession::run`] keeps trying through refusals before it gives
+/// up. A connection just created is refused until its hub has admitted it --
+/// about ninety seconds -- so a refusal is only final once it has lasted this
+/// long.
+pub const DEFAULT_REFUSAL_GRACE: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug)]
 pub struct HubSessionPolicy {
@@ -62,7 +76,33 @@ pub enum HubSessionEvent {
     Lagged(u64),
     Disconnected,
 }
+/// A handler registered with [`HubSession::on`] or
+/// [`HubSession::on_state_change`]; [`HubSession::off`] removes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HandlerId(u64);
 type ConnectFuture = Pin<Box<dyn Future<Output = Result<Client>> + Send>>;
+type EventHandler = Arc<dyn Fn(Event) -> BoxFuture<'static, ()> + Send + Sync>;
+type StateCallback = Arc<dyn Fn(bool) + Send + Sync>;
+/// The tasks one handler still has running, by task number.
+type Running = Arc<StateMutex<HashMap<u64, AbortHandle>>>;
+struct Registration {
+    id: u64,
+    event_type: String,
+    handler: EventHandler,
+    running: Running,
+}
+#[derive(Default)]
+struct Handlers {
+    next_id: u64,
+    next_task: u64,
+    events: Vec<Registration>,
+    states: Vec<(u64, StateCallback)>,
+}
+#[derive(Clone, Copy)]
+struct Link {
+    settle: Duration,
+    refusal_grace: Duration,
+}
 struct Held {
     client: Option<Client>,
     retired: Option<Client>,
@@ -85,12 +125,77 @@ struct Inner {
     closed: AtomicBool,
     warming: AtomicBool,
     has_client: AtomicBool,
+    handlers: StateMutex<Handlers>,
+    link: StateMutex<Link>,
+    /// Wakes [`HubSession::run`] for [`HubSession::close`].
+    wake: Notify,
+}
+impl Inner {
+    /// Hand `event` to every handler registered for its type, each on a task
+    /// of its own.
+    fn dispatch(&self, event: &Event) {
+        let matching: Vec<(EventHandler, Running, u64)> = {
+            let mut handlers = self.handlers.lock().unwrap();
+            let matching: Vec<(EventHandler, Running)> = handlers
+                .events
+                .iter()
+                .filter(|registration| registration.event_type == event.name)
+                .map(|registration| (registration.handler.clone(), registration.running.clone()))
+                .collect();
+            matching
+                .into_iter()
+                .map(|(handler, running)| {
+                    handlers.next_task = handlers.next_task.wrapping_add(1);
+                    (handler, running, handlers.next_task)
+                })
+                .collect()
+        };
+        for (handler, running, task) in matching {
+            // Built before any lock is taken: a handler may remove itself.
+            let Ok(work) = std::panic::catch_unwind(AssertUnwindSafe(|| handler(event.clone())))
+            else {
+                continue;
+            };
+            let mut tasks = running.lock().unwrap();
+            let done = running.clone();
+            let handle = tokio::spawn(async move {
+                work.await;
+                done.lock().unwrap().remove(&task);
+            });
+            tasks.insert(task, handle.abort_handle());
+        }
+    }
+
+    /// Tell every state callback the link came up or went down.
+    fn announce(&self, up: bool) {
+        let callbacks: Vec<StateCallback> = self
+            .handlers
+            .lock()
+            .unwrap()
+            .states
+            .iter()
+            .map(|(_, callback)| callback.clone())
+            .collect();
+        for callback in callbacks {
+            // A callback that panics must not take the session's state with it.
+            let _ = std::panic::catch_unwind(AssertUnwindSafe(|| callback(up)));
+        }
+    }
 }
 /// Clone handles share the same client, admission barrier and subscription bus.
 /// The factory connects a fresh client and owns cleanup if it fails/cancels.
 #[derive(Clone)]
 pub struct HubSession {
     inner: Arc<Inner>,
+}
+/// A session that does not keep it open: what a handler the session holds
+/// keeps of it.
+#[derive(Clone)]
+pub(crate) struct WeakHubSession(Weak<Inner>);
+impl WeakHubSession {
+    pub(crate) fn upgrade(&self) -> Option<HubSession> {
+        self.0.upgrade().map(|inner| HubSession { inner })
+    }
 }
 impl HubSession {
     pub fn new<F, Fut>(connect: F, policy: HubSessionPolicy) -> Result<Self>
@@ -120,8 +225,137 @@ impl HubSession {
                 closed: AtomicBool::new(false),
                 warming: AtomicBool::new(false),
                 has_client: AtomicBool::new(false),
+                handlers: StateMutex::new(Handlers::default()),
+                link: StateMutex::new(Link {
+                    settle: DEFAULT_SETTLE_WINDOW,
+                    refusal_grace: DEFAULT_REFUSAL_GRACE,
+                }),
+                wake: Notify::new(),
             }),
         })
+    }
+    /// A session whose clients connect with `identity`, over the protocol it
+    /// prefers ([`Client::auto`]).
+    ///
+    /// A hub that closes the link while the connection is being set up, the
+    /// way it refuses credentials (see
+    /// [`WssTransport::closed_refused`](crate::WssTransport::closed_refused)),
+    /// is reported as [`ThalovantError::HubRefused`].
+    pub fn for_identity(identity: Identity, policy: HubSessionPolicy) -> Result<Self> {
+        Self::new(
+            move || {
+                let identity = identity.clone();
+                async move {
+                    let client = Client::auto(identity)?;
+                    match client.connect().await {
+                        Ok(()) => Ok(client),
+                        Err(error) => {
+                            let refused = client.transport.closed_refused();
+                            let _ = client.close().await;
+                            Err(if refused {
+                                ThalovantError::HubRefused(
+                                    "the hub closed the link during the handshake: it does not accept these credentials, or not yet".into(),
+                                )
+                            } else {
+                                error
+                            })
+                        }
+                    }
+                }
+            },
+            policy,
+        )
+    }
+    /// This session, counting a new link only once it has stayed up for
+    /// `window` ([`DEFAULT_SETTLE_WINDOW`]); zero counts it at once.
+    pub fn with_settle_window(self, window: Duration) -> Self {
+        self.inner.link.lock().unwrap().settle = window;
+        self
+    }
+    /// This session, with [`HubSession::run`] giving up once refusals have
+    /// lasted `grace` ([`DEFAULT_REFUSAL_GRACE`]). Zero is refused.
+    pub fn with_refusal_grace(self, grace: Duration) -> Result<Self> {
+        if grace.is_zero() {
+            return Err(ThalovantError::Connection(
+                "the refusal grace must be positive".into(),
+            ));
+        }
+        self.inner.link.lock().unwrap().refusal_grace = grace;
+        Ok(self)
+    }
+    /// How long a new link must stay up before [`HubSession::connect`]
+    /// counts it.
+    pub fn settle_window(&self) -> Duration {
+        self.inner.link.lock().unwrap().settle
+    }
+    /// How long [`HubSession::run`] keeps trying through refusals.
+    pub fn refusal_grace(&self) -> Duration {
+        self.inner.link.lock().unwrap().refusal_grace
+    }
+    pub(crate) fn downgrade(&self) -> WeakHubSession {
+        WeakHubSession(Arc::downgrade(&self.inner))
+    }
+    /// Call `handler` with every event of `event_type` that arrives, on the
+    /// current client and on every one the session builds after it.
+    ///
+    /// Each event is handled on a task of its own, so a slow handler does not
+    /// hold up the next event. [`HubSession::off`] removes the handler and
+    /// cancels what it still has running. Fails only when the session is
+    /// closed.
+    pub fn on<F, Fut>(&self, event_type: &str, handler: F) -> Result<HandlerId>
+    where
+        F: Fn(Event) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(ThalovantError::Connection("hub session is closed".into()));
+        }
+        let handler: EventHandler = Arc::new(move |event| Box::pin(handler(event)));
+        let mut handlers = self.inner.handlers.lock().unwrap();
+        handlers.next_id += 1;
+        let id = handlers.next_id;
+        handlers.events.push(Registration {
+            id,
+            event_type: event_type.to_string(),
+            handler,
+            running: Running::default(),
+        });
+        Ok(HandlerId(id))
+    }
+    /// Call `callback` with `true` when the link comes up and `false` when it
+    /// goes down. It runs while the session changes state, so keep it quick:
+    /// spawn anything that waits.
+    pub fn on_state_change<F>(&self, callback: F) -> HandlerId
+    where
+        F: Fn(bool) + Send + Sync + 'static,
+    {
+        let mut handlers = self.inner.handlers.lock().unwrap();
+        handlers.next_id += 1;
+        let id = handlers.next_id;
+        handlers.states.push((id, Arc::new(callback)));
+        HandlerId(id)
+    }
+    /// Remove a handler or a state callback. A handler's tasks still running
+    /// are cancelled. `false` when it was not registered (any more).
+    pub fn off(&self, id: HandlerId) -> bool {
+        let mut handlers = self.inner.handlers.lock().unwrap();
+        if let Some(index) = handlers
+            .events
+            .iter()
+            .position(|registration| registration.id == id.0)
+        {
+            let registration = handlers.events.remove(index);
+            drop(handlers);
+            for (_, task) in registration.running.lock().unwrap().drain() {
+                task.abort();
+            }
+            return true;
+        }
+        let before = handlers.states.len();
+        handlers
+            .states
+            .retain(|(registered, _)| *registered != id.0);
+        handlers.states.len() != before
     }
     pub fn held(&self) -> bool {
         self.inner.has_client.load(Ordering::Acquire)
@@ -165,12 +399,24 @@ impl HubSession {
             relay.abort()
         }
         if let Some(client) = held.client.take() {
-            self.inner.has_client.store(false, Ordering::Release);
+            if self.inner.has_client.swap(false, Ordering::AcqRel) {
+                self.inner.announce(false);
+            }
             held.retired = Some(client)
         }
         Self::cleanup(held).await
     }
+    fn back_off(&self) {
+        let mut retry = self.inner.retry.lock().unwrap();
+        retry.at = Some(Instant::now() + retry.wait);
+        retry.wait = self.inner.policy.next_wait(retry.wait);
+    }
     async fn ensure(&self, held: &mut Held) -> Result<Client> {
+        self.establish(held, false).await
+    }
+    /// The held client, or a new one; `settle` holds a new one to the settle
+    /// window before counting it.
+    async fn establish(&self, held: &mut Held, settle: bool) -> Result<Client> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(ThalovantError::Connection("hub session is closed".into()));
         }
@@ -181,9 +427,7 @@ impl HubSession {
         let client = match (self.inner.connect)().await {
             Ok(client) => client,
             Err(error) => {
-                let mut retry = self.inner.retry.lock().unwrap();
-                retry.at = Some(Instant::now() + retry.wait);
-                retry.wait = self.inner.policy.next_wait(retry.wait);
+                self.back_off();
                 return Err(error);
             }
         };
@@ -192,7 +436,22 @@ impl HubSession {
             Self::cleanup(held).await?;
             return Err(ThalovantError::Connection("hub session is closed".into()));
         }
+        // Subscribed before the settle window, so what arrives during it is
+        // handled once the link counts, not lost.
         let mut receiver = client.transport.subscribe();
+        if settle {
+            if let Err(error) = settled(&client, self.settle_window()).await {
+                held.retired = Some(client);
+                let _ = Self::cleanup(held).await;
+                self.back_off();
+                return Err(error);
+            }
+            if self.inner.closed.load(Ordering::Acquire) {
+                held.retired = Some(client);
+                Self::cleanup(held).await?;
+                return Err(ThalovantError::Connection("hub session is closed".into()));
+            }
+        }
         let generation = {
             let mut events = self.inner.events.lock().unwrap();
             events.generation = events.generation.wrapping_add(1);
@@ -212,7 +471,9 @@ impl HubSession {
                 };
                 match received {
                     Ok(event) => {
-                        let _ = sender.send(HubSessionEvent::Message(event));
+                        let _ = sender.send(HubSessionEvent::Message(event.clone()));
+                        drop(events);
+                        inner.dispatch(&event);
                     }
                     Err(broadcast::error::RecvError::Lagged(count)) => {
                         let _ = sender.send(HubSessionEvent::Lagged(count));
@@ -225,10 +486,14 @@ impl HubSession {
             }
         }));
         held.client = Some(client.clone());
-        self.inner.has_client.store(true, Ordering::Release);
-        let mut retry = self.inner.retry.lock().unwrap();
-        retry.at = None;
-        retry.wait = self.inner.policy.retry;
+        {
+            let mut retry = self.inner.retry.lock().unwrap();
+            retry.at = None;
+            retry.wait = self.inner.policy.retry;
+        }
+        if !self.inner.has_client.swap(true, Ordering::AcqRel) {
+            self.inner.announce(true);
+        }
         Ok(client)
     }
     /// Start one coalesced off-path attempt; a host may await its result.
@@ -303,15 +568,148 @@ impl HubSession {
         self.call(|client| async move { client.emit(event_type, data, context).await })
             .await
     }
+    /// Answer a message the hub sent, back along the route it came; see
+    /// [`Client::reply`].
+    pub async fn reply(&self, event: &Event, msg_type: &str, data: Data) -> Result<()> {
+        self.call(|client| async move { client.reply(event, msg_type, data).await })
+            .await
+    }
+    /// Make one attempt: return with a live link, or say why there is none.
+    ///
+    /// A link already held and alive is kept. A new one counts only once it
+    /// has stayed up for the settle window ([`DEFAULT_SETTLE_WINDOW`]): a hub
+    /// that closes it before then without a status, or with 1000, 1005 or
+    /// 1008, has refused the connection's credentials, which is
+    /// [`ThalovantError::HubRefused`]; any other early close is a
+    /// [`ThalovantError::Connection`] drop. A failed attempt moves the retry
+    /// ladder on.
+    pub async fn connect(&self) -> Result<()> {
+        let mut held = self.inner.held.lock().await;
+        if let Some(client) = &held.client {
+            if alive(client).await {
+                return Ok(());
+            }
+            self.drop_client(&mut held).await?;
+        }
+        self.establish(&mut held, true).await.map(|_| ())
+    }
+    /// Stay connected until [`HubSession::close`], by policy.
+    ///
+    /// Connects with [`HubSession::connect`]. A held link is watched: a drop
+    /// is noticed as it happens, and the link is also looked at every
+    /// `policy.probe`. After a failed attempt it waits out the retry ladder
+    /// (10 s doubling to 120 s by default) before the next. A hub refusing
+    /// the credentials is retried like any other failure until the refusals
+    /// have lasted the refusal grace ([`DEFAULT_REFUSAL_GRACE`]): a new
+    /// connection is refused until its hub admits it. Then this returns
+    /// [`ThalovantError::HubRefused`].
+    ///
+    /// Returns `Ok(())` once the session is closed. An identity the client
+    /// cannot use at all ([`ThalovantError::MissingIdentityField`],
+    /// [`ThalovantError::InvalidIdentity`],
+    /// [`ThalovantError::UnsupportedProtocol`]) ends it at once with that
+    /// error; everything else is retried.
+    pub async fn run(&self) -> Result<()> {
+        let mut refused_since: Option<tokio::time::Instant> = None;
+        loop {
+            let woken = self.inner.wake.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let held = self.inner.held.lock().await.client.clone();
+            if let Some(client) = held {
+                if alive(&client).await {
+                    refused_since = None;
+                    tokio::select! {
+                        _ = client.transport.stopped() => {}
+                        _ = tokio::time::sleep(self.inner.policy.probe) => {}
+                        _ = &mut woken => {}
+                    }
+                    if self.inner.closed.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let mut held = self.inner.held.lock().await;
+                    if let Some(current) = &held.client {
+                        if !alive(current).await {
+                            // A cleanup that fails is retried by the next
+                            // attempt, which reports it.
+                            let _ = self.drop_client(&mut held).await;
+                        }
+                    }
+                    continue;
+                }
+            }
+            // The rung this attempt stands on: a failure waits it out, and
+            // moves the ladder to the next.
+            let wait = self.retry_wait();
+            match self.connect().await {
+                Ok(()) => {
+                    refused_since = None;
+                    continue;
+                }
+                Err(error @ ThalovantError::HubRefused(_)) => {
+                    let now = tokio::time::Instant::now();
+                    let since = *refused_since.get_or_insert(now);
+                    if now.duration_since(since) >= self.refusal_grace() {
+                        return Err(error);
+                    }
+                }
+                Err(
+                    error @ (ThalovantError::MissingIdentityField(_)
+                    | ThalovantError::InvalidIdentity(_)
+                    | ThalovantError::UnsupportedProtocol(_)),
+                ) => return Err(error),
+                Err(_) => refused_since = None,
+            }
+            if self.inner.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = &mut woken => {}
+            }
+        }
+    }
     /// Terminal close retains responsibility for a failed cleanup; retry close.
+    ///
+    /// Stops [`HubSession::run`] and forgets every handler and state
+    /// callback, once they have heard the link go down.
     pub async fn close(&self) -> Result<()> {
         self.inner.closed.store(true, Ordering::Release);
+        self.inner.wake.notify_waiters();
         {
             self.inner.events.lock().unwrap().sender = None;
         }
         let mut held = self.inner.held.lock().await;
-        self.drop_client(&mut held).await
+        let dropped = self.drop_client(&mut held).await;
+        drop(held);
+        let mut handlers = self.inner.handlers.lock().unwrap();
+        handlers.events.clear();
+        handlers.states.clear();
+        dropped
     }
+}
+/// Hold a new link to the settle window: `Ok` once it has stayed up for
+/// `window`, or why it did not.
+async fn settled(client: &Client, window: Duration) -> Result<()> {
+    if window.is_zero() {
+        return Ok(());
+    }
+    if tokio::time::timeout(window, client.transport.stopped())
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    Err(if client.transport.closed_refused() {
+        ThalovantError::HubRefused(
+            "the hub closed the link right after the handshake: it does not accept these credentials, or not yet".into(),
+        )
+    } else {
+        ThalovantError::Connection("the hub closed the link right after the handshake".into())
+    })
 }
 pub fn hub_hostname(master: &str) -> String {
     let text = master.trim();
@@ -541,6 +939,257 @@ mod tests {
         assert!(attempts[1].address.is_none());
         assert!(attempts[2].address.is_none());
         assert!(preference.cooling_down());
+    }
+
+    fn wss_client() -> Client {
+        let identity = Identity::from_value(serde_json::json!({
+            "access_key": "fixture", "password": "password", "site_id": "fixture",
+            "default_master": "https://hub.example",
+            "data_plane_endpoints": {"wss": "wss://hub.example/hivemind"},
+        }))
+        .unwrap();
+        Client::with_protocol(identity, crate::HubProtocol::Wss).unwrap()
+    }
+
+    fn event(name: &str, n: u64) -> Event {
+        Event::new(
+            name,
+            serde_json::json!({"n": n}).as_object().unwrap().clone(),
+            Context::new(),
+            None,
+        )
+    }
+
+    async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+        for _ in 0..2000 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("never happened: {what}");
+    }
+
+    /// Every client a session built.
+    type Built = Arc<StateMutex<Vec<Client>>>;
+
+    /// A session whose factory keeps every client it builds, closing each as
+    /// a hub would -- `Some(refused)` -- 100 ms after the handshake, or not
+    /// at all; the last entry of `closes` goes on repeating.
+    fn building(closes: Vec<Option<bool>>) -> (HubSession, Built) {
+        let built = Built::default();
+        let kept = built.clone();
+        let factory = move || {
+            let mut built = kept.lock().unwrap();
+            let close = closes.get(built.len()).or(closes.last()).copied().flatten();
+            let client = wss_client();
+            if let Some(refused) = close {
+                let closing = client.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    closing.transport.close_for_test(refused).await;
+                });
+            }
+            built.push(client.clone());
+            std::future::ready(Ok(client))
+        };
+        let session = HubSession::new(factory, HubSessionPolicy::default()).unwrap();
+        (session, built)
+    }
+
+    #[tokio::test]
+    async fn a_handler_is_bound_onto_every_client_and_off_cancels_it() {
+        let (session, built) = building(vec![None]);
+        let session = session.with_settle_window(Duration::ZERO);
+        let (heard, mut hearing) = tokio::sync::mpsc::unbounded_channel();
+        let id = session
+            .on("thalovant.home.request", move |event| {
+                let heard = heard.clone();
+                async move {
+                    let _ = heard.send(event.data["n"].as_u64().unwrap());
+                }
+            })
+            .unwrap();
+        // Registered before the first client exists.
+        session.connect().await.unwrap();
+        let first = built.lock().unwrap()[0].clone();
+        first.transport.deliver_for_test(event("other", 1));
+        first
+            .transport
+            .deliver_for_test(event("thalovant.home.request", 2));
+        assert_eq!(hearing.recv().await, Some(2));
+
+        // The link drops; the next attempt builds another client, and the
+        // handler is on it, while the old one is no longer heard.
+        first.transport.close_for_test(false).await;
+        session.connect().await.unwrap();
+        let second = built.lock().unwrap()[1].clone();
+        first
+            .transport
+            .deliver_for_test(event("thalovant.home.request", 3));
+        second
+            .transport
+            .deliver_for_test(event("thalovant.home.request", 4));
+        assert_eq!(hearing.recv().await, Some(4));
+
+        // off() cancels what the handler still has running.
+        let (started, mut starting) = tokio::sync::mpsc::unbounded_channel();
+        let (ended, mut ending) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let slow = session
+            .on("slow", move |_| {
+                let started = started.clone();
+                let ended = ended.clone();
+                async move {
+                    struct Ends(tokio::sync::mpsc::UnboundedSender<()>);
+                    impl Drop for Ends {
+                        fn drop(&mut self) {
+                            let _ = self.0.send(());
+                        }
+                    }
+                    let _ends = Ends(ended);
+                    let _ = started.send(());
+                    std::future::pending::<()>().await;
+                }
+            })
+            .unwrap();
+        second.transport.deliver_for_test(event("slow", 5));
+        starting.recv().await.unwrap();
+        assert!(session.off(slow));
+        tokio::time::timeout(Duration::from_secs(2), ending.recv())
+            .await
+            .expect("the running handler was cancelled");
+        assert!(session.off(id));
+        assert!(!session.off(id));
+        second
+            .transport
+            .deliver_for_test(event("thalovant.home.request", 6));
+        // Nothing arrives: the channel ends instead, because off() dropped
+        // the handler and the sender it held.
+        assert!(
+            !matches!(
+                tokio::time::timeout(Duration::from_millis(100), hearing.recv()).await,
+                Ok(Some(_))
+            ),
+            "a removed handler was still called"
+        );
+        session.close().await.unwrap();
+        assert!(session.on("x", |_| async {}).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_settle_window_tells_a_refusal_from_a_drop() {
+        for close in [Some(true), Some(false), None] {
+            let (session, _) = building(vec![close]);
+            let states = Arc::new(StateMutex::new(Vec::new()));
+            let seen = states.clone();
+            session.on_state_change(move |up| seen.lock().unwrap().push(up));
+            let started = tokio::time::Instant::now();
+            let result = session.connect().await;
+            match close {
+                Some(true) => assert!(
+                    matches!(result, Err(ThalovantError::HubRefused(_))),
+                    "{result:?}"
+                ),
+                Some(false) => assert!(
+                    matches!(result, Err(ThalovantError::Connection(_))),
+                    "{result:?}"
+                ),
+                None => {
+                    result.unwrap();
+                    assert!(started.elapsed() >= DEFAULT_SETTLE_WINDOW);
+                }
+            }
+            // A link that closed inside the window never counted, and moved
+            // the ladder on.
+            assert_eq!(session.held(), close.is_none());
+            assert_eq!(
+                *states.lock().unwrap(),
+                vec![true; usize::from(close.is_none())]
+            );
+            let rung = if close.is_some() { 20 } else { 10 };
+            assert_eq!(session.retry_wait(), Duration::from_secs(rung));
+            session.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_gives_up_once_refusals_outlast_the_grace() {
+        // Refused at 0, 10 and 30 s: the third is 30 s after the first.
+        let (session, built) = building(vec![Some(true)]);
+        let session = session.with_refusal_grace(Duration::from_secs(30)).unwrap();
+        let started = tokio::time::Instant::now();
+        let error = session.run().await.unwrap_err();
+        assert!(matches!(error, ThalovantError::HubRefused(_)), "{error:?}");
+        assert!(error.is_connection_error());
+        assert_eq!(built.lock().unwrap().len(), 3);
+        assert!(started.elapsed() >= Duration::from_secs(30));
+        session.close().await.unwrap();
+
+        // A drop in between is not a refusal, so the count starts again:
+        // refused at 0, dropped at 10, refused at 30 and at 70.
+        let (session, built) = building(vec![Some(true), Some(false), Some(true)]);
+        let session = session.with_refusal_grace(Duration::from_secs(25)).unwrap();
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            session.run().await,
+            Err(ThalovantError::HubRefused(_))
+        ));
+        assert_eq!(built.lock().unwrap().len(), 4);
+        assert!(started.elapsed() >= Duration::from_secs(70));
+        session.close().await.unwrap();
+        assert!(
+            HubSession::new(|| async { Ok(client()) }, HubSessionPolicy::default())
+                .unwrap()
+                .with_refusal_grace(Duration::ZERO)
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_keeps_the_link_and_close_ends_it() {
+        let (session, built) = building(vec![None]);
+        let states = Arc::new(StateMutex::new(Vec::new()));
+        let seen = states.clone();
+        session.on_state_change(move |up| seen.lock().unwrap().push(up));
+        let running = tokio::spawn({
+            let session = session.clone();
+            async move { session.run().await }
+        });
+        eventually("the link came up", || *states.lock().unwrap() == [true]).await;
+
+        // The link drops: run notices as it happens, not at the next probe a
+        // minute later, and builds another.
+        let dropped = tokio::time::Instant::now();
+        let first = built.lock().unwrap()[0].clone();
+        first.transport.close_for_test(false).await;
+        eventually("the link came back", || {
+            *states.lock().unwrap() == [true, false, true]
+        })
+        .await;
+        assert!(dropped.elapsed() < Duration::from_secs(5));
+        assert_eq!(built.lock().unwrap().len(), 2);
+
+        // A held link is left alone at every probe.
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        assert_eq!(built.lock().unwrap().len(), 2);
+
+        session.close().await.unwrap();
+        running.await.unwrap().unwrap();
+        assert_eq!(*states.lock().unwrap(), [true, false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn an_identity_the_client_cannot_use_ends_run_at_once() {
+        let session = HubSession::new(
+            || async { Err(ThalovantError::MissingIdentityField("password")) },
+            HubSessionPolicy::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            session.run().await,
+            Err(ThalovantError::MissingIdentityField(_))
+        ));
+        session.close().await.unwrap();
     }
 
     #[test]

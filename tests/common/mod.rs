@@ -32,7 +32,10 @@ use sha2::{Digest, Sha256};
 /// Rust writes an f64 of 1.0 as `1.0`; the reference now writes it as `1`,
 /// because that is what JavaScript, Go, C# and Swift all write and JSON has
 /// one number type. `conversation-vectors.json` has `activated_at: 1.0`.
-fn same_number_everywhere(value: &Value) -> Value {
+///
+/// `fractions` admits a number with a fractional part, for the digest of a
+/// vector file only; see [`vector_digest`].
+fn same_number_everywhere(value: &Value, fractions: bool) -> Value {
     match value {
         Value::Number(number) => {
             // An integer is already spelled the one way; serde writes it
@@ -41,24 +44,39 @@ fn same_number_everywhere(value: &Value) -> Value {
                 return value.clone();
             }
             let float = number.as_f64().expect("a json number is one of the three");
+            if float.fract() == 0.0 && float.is_finite() && float.abs() <= 9_007_199_254_740_992.0 {
+                return Value::from(float as i64);
+            }
+            // Python's repr and serde_json's writer (ryu) both spell a finite
+            // double as its shortest round-trip digits, positionally, from
+            // 1e-4 up to 1e16: 0.01, 0.2, 0.05. Outside that one switches to
+            // an exponent where the other does not, so there is no agreement
+            // to reach.
+            let magnitude = float.abs();
+            if fractions && float.is_finite() && (1e-4..1e16).contains(&magnitude) {
+                return value.clone();
+            }
             // Refused rather than narrowed. Only a whole number inside 2^53 is
             // written the same way by every language here; anything else --
             // 1.5, or 1e-7, or a u64 too large for f64 to hold exactly -- has
             // a spelling that differs per language, and narrowing it would
-            // record a digest for a value nobody produced. No vector contains
-            // one, and if one ever does this should stop rather than lie.
-            assert!(
-                float.fract() == 0.0 && float.is_finite() && float.abs() <= 9_007_199_254_740_992.0,
+            // record a digest for a value nobody produced. No produced value
+            // is one, and if one ever is this should stop rather than lie.
+            panic!(
                 "conformance: cannot canonicalise {float}: only whole numbers within 2^53 are \
                  spelled the same way in every language"
             );
-            Value::from(float as i64)
         }
-        Value::Array(items) => Value::Array(items.iter().map(same_number_everywhere).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| same_number_everywhere(item, fractions))
+                .collect(),
+        ),
         Value::Object(fields) => Value::Object(
             fields
                 .iter()
-                .map(|(key, item)| (key.clone(), same_number_everywhere(item)))
+                .map(|(key, item)| (key.clone(), same_number_everywhere(item, fractions)))
                 .collect::<Map<String, Value>>(),
         ),
         _ => value.clone(),
@@ -67,7 +85,21 @@ fn same_number_everywhere(value: &Value) -> Value {
 
 /// A stable digest of a produced value, agreeing across languages.
 pub fn canonical_digest(value: &Value) -> String {
-    let canonical = serde_json::to_string(&same_number_everywhere(value)).expect("serialise");
+    digest_of(&same_number_everywhere(value, false))
+}
+
+/// The digest of a parsed vector file, which ties the record to its input.
+///
+/// A vector's inputs can carry a duration with a fractional part
+/// (`timeout_seconds: 0.2`, `poll_interval_seconds: 0.01`) that no produced
+/// value does, and the reference digests the file as parsed. Those are spelled
+/// alike from 1e-4 to 1e16, so they are admitted here and nowhere else.
+pub fn vector_digest(value: &Value) -> String {
+    digest_of(&same_number_everywhere(value, true))
+}
+
+fn digest_of(canonical: &Value) -> String {
+    let canonical = serde_json::to_string(canonical).expect("serialise");
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
@@ -167,7 +199,7 @@ fn merge(parts: &Path, target: &Path) {
             .unwrap_or_else(|error| panic!("read {vector_file}: {error}"));
         let parsed: Value = serde_json::from_str(&raw).expect("parse vectors");
         let mut entry = Map::new();
-        entry.insert("digest".into(), Value::from(canonical_digest(&parsed)));
+        entry.insert("digest".into(), Value::from(vector_digest(&parsed)));
         entry.insert(
             "cases".into(),
             Value::Object(

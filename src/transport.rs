@@ -129,6 +129,9 @@ struct ConnectionControl {
     cancelled: AtomicBool,
     active_attempt: AtomicBool,
     retired: Notify,
+    /// Woken whenever the link goes down (closed by either side, or failed);
+    /// see [`RuntimeTransport::stopped`].
+    stopped: Notify,
 }
 
 /// Drops what is past the grace window, and any excess beyond the cap.
@@ -453,6 +456,71 @@ impl RuntimeTransport {
             Self::Mqtt(transport) => transport.send_hive_message(message, encrypt).await,
         }
     }
+
+    /// Whether the hub's last close of this link read as a refusal of its
+    /// credentials; see [`WssTransport::closed_refused`]. Always `false` for
+    /// HTTP and MQTT, whose hubs do not say it this way.
+    pub fn closed_refused(&self) -> bool {
+        match self {
+            Self::Wss(transport) => transport.closed_refused(),
+            Self::Http(_) | Self::Mqtt(_) => false,
+        }
+    }
+
+    /// Hand `event` to this transport's subscribers as if the hub had sent it.
+    #[cfg(test)]
+    pub(crate) fn deliver_for_test(&self, event: Event) {
+        let _ = match self {
+            Self::Http(transport) => transport.state.bus_tx.send(event),
+            Self::Wss(transport) => transport.state.bus_tx.send(event),
+            Self::Mqtt(transport) => transport.state.bus_tx.send(event),
+        };
+    }
+
+    /// Close this link as a hub would: with a refusal of the credentials, or
+    /// as a drop.
+    #[cfg(test)]
+    pub(crate) async fn close_for_test(&self, refused: bool) {
+        match self {
+            Self::Wss(transport) => {
+                transport
+                    .state
+                    .closed_refused
+                    .store(refused, Ordering::Release);
+                transport.mark_disconnected().await;
+            }
+            Self::Http(transport) => {
+                assert!(!refused, "only a WSS link says it was refused");
+                let _ = transport.disconnect_inner().await;
+            }
+            Self::Mqtt(transport) => {
+                assert!(!refused, "only a WSS link says it was refused");
+                transport.mark_disconnected().await;
+            }
+        }
+    }
+
+    /// Resolves once the link is not up: closed by either side, or failed.
+    ///
+    /// Woken by the transport as the link goes down, so a caller hears of a
+    /// drop at once rather than at its next probe. A session a failed send
+    /// invalidated reads as down without such a wake, so a caller that must
+    /// not miss one also looks at its own cadence.
+    pub(crate) async fn stopped(&self) {
+        let control = self.control();
+        loop {
+            let woken = control.stopped.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if matches!(
+                self.connection_info().await.phase,
+                TransportConnectionPhase::Closed | TransportConnectionPhase::Error
+            ) {
+                return;
+            }
+            woken.await;
+        }
+    }
 }
 
 async fn send_with_deadline(
@@ -687,6 +755,7 @@ impl HttpTransport {
             health.transport_alive = false;
             health.connection.phase = TransportConnectionPhase::Closed;
         }
+        self.state.lifecycle.stopped.notify_waiters();
         if !self.state.admitted.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -808,6 +877,8 @@ impl HttpTransport {
                     health.last_error = Some(error.to_string());
                     health.connection.phase = TransportConnectionPhase::Error;
                     health.connection.last_error = Some(error.to_string());
+                    drop(health);
+                    transport.state.lifecycle.stopped.notify_waiters();
                     break;
                 }
             }
@@ -991,6 +1062,8 @@ impl HttpTransport {
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
         health.connection.last_error = Some(error.to_string());
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 }
 
@@ -1006,6 +1079,9 @@ struct WssTransportState {
     lifecycle: ConnectionControl,
     identity: Identity,
     session_valid: AtomicBool,
+    /// Whether the hub's last close read as a refusal; see
+    /// [`WssTransport::closed_refused`].
+    closed_refused: AtomicBool,
     user_agent: String,
     bus_tx: broadcast::Sender<Event>,
     hive_tx: broadcast::Sender<HiveMessage>,
@@ -1031,6 +1107,7 @@ impl WssTransport {
             state: Arc::new(WssTransportState {
                 lifecycle: ConnectionControl::default(),
                 session_valid: AtomicBool::new(false),
+                closed_refused: AtomicBool::new(false),
                 identity,
                 user_agent: DEFAULT_USER_AGENT.to_string(),
                 bus_tx,
@@ -1073,12 +1150,27 @@ impl WssTransport {
         self.state.hive_tx.subscribe()
     }
 
+    /// Whether the hub's last close of this link read as a refusal of its
+    /// credentials rather than a drop.
+    ///
+    /// A hub closes the socket without a status for an access key it does not
+    /// know -- or not yet: a connection just created is refused until its hub
+    /// admits it -- and with 1008 for an authorization it will not take; 1000
+    /// and 1005 read the same way. It can also refuse the upgrade itself with
+    /// HTTP 401 or 403. Any other close code (1011, 1013), and a socket that
+    /// simply dropped, is the hub's trouble or the network's, not a verdict
+    /// on the credentials. Reset by every connect.
+    pub fn closed_refused(&self) -> bool {
+        self.state.closed_refused.load(Ordering::Acquire)
+    }
+
     pub async fn connect(&self) -> Result<()> {
         RuntimeTransport::Wss(self.clone()).connect().await
     }
 
     async fn connect_locked(&self) -> Result<()> {
         self.disconnect_inner().await?;
+        self.state.closed_refused.store(false, Ordering::Release);
         let dir = self.state.noise_state_dir.lock().await.clone();
         *self.state.noise.lock().await = Some(NoiseChannel::new(self.state.identity.clone(), dir));
         *self.state.health.lock().await = TransportHealth::default();
@@ -1107,9 +1199,14 @@ impl WssTransport {
                 return Err(error);
             }
         };
-        let stream = connect_async(endpoint)
-            .await
-            .map_err(|err| ThalovantError::Connection(err.to_string()));
+        let stream = connect_async(endpoint).await.map_err(|err| {
+            if let tokio_tungstenite::tungstenite::Error::Http(response) = &err {
+                if matches!(response.status().as_u16(), 401 | 403) {
+                    self.state.closed_refused.store(true, Ordering::Release);
+                }
+            }
+            ThalovantError::Connection(err.to_string())
+        });
         let (stream, _) = match stream {
             Ok(stream) => stream,
             Err(error) => {
@@ -1151,6 +1248,15 @@ impl WssTransport {
                         }
                     }
                     Ok(WebSocketMessage::Close(frame)) => {
+                        // Before the disconnect wakes anyone waiting on it,
+                        // so they read the verdict with the close.
+                        let refused = frame
+                            .as_ref()
+                            .is_none_or(|frame| is_refusal_close(u16::from(frame.code)));
+                        transport
+                            .state
+                            .closed_refused
+                            .store(refused, Ordering::Release);
                         transport.mark_disconnected().await;
                         // The close status explains a peer refusal without echoing
                         // arbitrary remote reason text into diagnostics.
@@ -1383,6 +1489,8 @@ impl WssTransport {
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
         health.connection.last_error = Some(error.to_string());
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 
     async fn mark_disconnected(&self) {
@@ -1392,6 +1500,8 @@ impl WssTransport {
         health.handshake_complete = false;
         health.transport_alive = false;
         health.connection.phase = TransportConnectionPhase::Closed;
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 
     async fn set_connection(&self, connection: TransportConnectionInfo) {
@@ -1843,6 +1953,8 @@ impl MqttTransport {
         health.last_error = Some(error.to_string());
         health.connection.phase = TransportConnectionPhase::Error;
         health.connection.last_error = Some(error.to_string());
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 
     async fn mark_disconnected(&self) {
@@ -1852,6 +1964,8 @@ impl MqttTransport {
         health.handshake_complete = false;
         health.transport_alive = false;
         health.connection.phase = TransportConnectionPhase::Closed;
+        drop(health);
+        self.state.lifecycle.stopped.notify_waiters();
     }
 
     async fn set_connection(&self, connection: TransportConnectionInfo) {
@@ -2218,6 +2332,14 @@ fn dispatch_noise_message(
             _ => {}
         }
     }
+}
+
+/// A hub closes with no status for an access key it does not know and after
+/// a Noise abort, and with 1008 for an authorization it will not take; 1000
+/// and 1005 read the same way. Anything else (1011, 1013) is the hub's
+/// trouble, not a verdict on the credentials.
+fn is_refusal_close(code: u16) -> bool {
+    matches!(code, 1000 | 1005 | 1008)
 }
 
 fn connecting_connection() -> TransportConnectionInfo {
