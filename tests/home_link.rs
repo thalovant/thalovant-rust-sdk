@@ -803,8 +803,11 @@ async fn only_the_token_in_use_revokes_itself_on_a_401_and_a_sign_in_rearms_it()
     }
     assert_eq!(control.access_token.as_deref(), Some("tok-0"));
 
+    // Made at run time: the scripted API never reads it, and a literal here
+    // is a hard-coded credential as far as code scanning can tell.
+    let password = uuid::Uuid::new_v4().to_string();
     control
-        .login("person@example.com", "pw", None)
+        .login("person@example.com", &password, None)
         .await
         .expect("password sign-in");
     assert_eq!(control.token_id(), None);

@@ -50,7 +50,7 @@
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/connection-admission-vectors.json": "07c362b5de849d5f85a20b3b4f961271b7b7fe13a13a58ee1d195e6da8a6cbbf",
-        "tests/home_link.rs": "d400d218f1fe54b098999134609e14559b09c601c84e2d89b3557148dfcca89e"
+        "tests/home_link.rs": "dc851dabec5fb7fe18f67cf80c442a3b121ab8b2c1f8c43ee3129f8f166c261d"
       },
       "vectors": {
         "connection-admission-vectors.json": "tests/conformance/connection-admission-vectors.json"
@@ -67,7 +67,7 @@
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/connection-kinds-vectors.json": "2baef508194472279ff2446105a1408e381b2f9e4bfc03e5f96d9c6529ddf604",
-        "tests/home_link.rs": "d400d218f1fe54b098999134609e14559b09c601c84e2d89b3557148dfcca89e"
+        "tests/home_link.rs": "dc851dabec5fb7fe18f67cf80c442a3b121ab8b2c1f8c43ee3129f8f166c261d"
       },
       "vectors": {
         "connection-kinds-vectors.json": "tests/conformance/connection-kinds-vectors.json"
@@ -112,7 +112,7 @@
       "tests": {
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/device-login-vectors.json": "8bcc6a3a1f2513ab2f9d134f861f1592f60dcb354ceeca826804de8ac0ba7210",
-        "tests/home_link.rs": "d400d218f1fe54b098999134609e14559b09c601c84e2d89b3557148dfcca89e"
+        "tests/home_link.rs": "dc851dabec5fb7fe18f67cf80c442a3b121ab8b2c1f8c43ee3129f8f166c261d"
       },
       "vectors": {
         "device-login-vectors.json": "tests/conformance/device-login-vectors.json"
@@ -134,7 +134,7 @@
         "src/transport_noise_tests.rs": "72ae11739425164c176921cf08b95b7a4c4256826c5e634731453db4f7301057",
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/home-link-vectors.json": "e3fb5129970190fba82061db41109c20096e8f2999b2eeac8c742cceb38ddb64",
-        "tests/home_link.rs": "d400d218f1fe54b098999134609e14559b09c601c84e2d89b3557148dfcca89e"
+        "tests/home_link.rs": "dc851dabec5fb7fe18f67cf80c442a3b121ab8b2c1f8c43ee3129f8f166c261d"
       },
       "vectors": {
         "home-link-vectors.json": "tests/conformance/home-link-vectors.json"
