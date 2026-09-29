@@ -169,7 +169,7 @@ jobs:
 
       - name: Run tests
         if: needs.plan.outputs.release_needed == 'true'
-        run: cargo test --all-features
+        run: cargo test --all-features -- --test-threads=2
 
       - name: Check package contents
         if: needs.plan.outputs.release_needed == 'true'
