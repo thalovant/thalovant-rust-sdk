@@ -90,7 +90,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test --all-features -- --test-threads=2
 
       - name: Build deterministic crate and CycloneDX SBOM
         id: artifacts
