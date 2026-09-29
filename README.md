@@ -1095,11 +1095,11 @@ so by closing during the handshake or right after it, with no status, 1000 or
 authenticate: both are a `ThalovantError::Connection` that `is_hub_refused()`
 is true for, and a new link only counts once it has stayed up for 0.75
 seconds. A close after the hub has sent anything that decrypts is a drop, not a
-refusal: a hub turns a key away before it says a word. Any other refusal is
-expected while a new connection waits to be admitted, so `run()` keeps trying
-for ten minutes before it returns it. One refusal is not retried: a refusal
-right as an XX handshake ends means the hub pinned another key for this
-connection (`is_client_key_rejected()`, see
+refusal: a hub turns a key away before it says a word. A refusal is expected
+while a new connection waits to be admitted, so `run()` keeps trying for ten
+minutes before it returns it, with one exception: a refusal right as an XX
+handshake ends means the hub pinned another key for this connection
+(`is_client_key_rejected()`, see
 [Transport Security](#transport-security)), and `run()` returns it at once,
 since only re-pairing or sharing the key folder can fix it. A hub
 whose Noise key is not the one pinned for it is a `Connection` error that
