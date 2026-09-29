@@ -262,6 +262,12 @@ pub fn pin_hub_key(dir: Option<&Path>, node_id: &str, remote_static_key: &str) -
 /// hub -- a pin filed under `node_id` -- the key and the pin file are
 /// **copied**, never moved: another program may still read `legacy`. Returns
 /// whether it copied.
+///
+/// A `legacy` folder it cannot read copies nothing (`Ok(false)`). A failure
+/// writing `target` is an error, which the caller must not go past: the pins
+/// go first and the key last, so carrying on would make a key of its own
+/// beside the hub's pin, which the hub refuses, and never copy again. Failing
+/// leaves no key, so the next attempt copies again.
 pub(crate) fn adopt_legacy_key(target: &Path, legacy: &Path, node_id: &str) -> Result<bool> {
     let target_key = target.join(NOISE_KEY_FILENAME);
     let legacy_key = legacy.join(NOISE_KEY_FILENAME);
@@ -277,15 +283,24 @@ pub(crate) fn adopt_legacy_key(target: &Path, legacy: &Path, node_id: &str) -> R
             return Ok(false);
         }
     }
+    // The old folder, read under its lock. Anything wrong there copies
+    // nothing: this folder starts afresh, as a new identity would.
     let (key, pins) = {
-        let _guard = lock_state(Some(legacy))?;
-        let (pins, _) = read_pins(Some(legacy))?;
+        let Ok(_guard) = lock_state(Some(legacy)) else {
+            return Ok(false);
+        };
+        let Ok((pins, _)) = read_pins(Some(legacy)) else {
+            return Ok(false);
+        };
         if !pins.contains_key(node_id) {
             // The old key never met this identity's hub: it is not the key
             // the hub pinned for it, so there is nothing to keep.
             return Ok(false);
         }
-        (load_existing_noise_key(&legacy_key)?, pins)
+        let Ok(key) = load_existing_noise_key(&legacy_key) else {
+            return Ok(false);
+        };
+        (key, pins)
     };
     let _guard = lock_state(Some(target))?;
     // Another process may have adopted, or started afresh, meanwhile.
@@ -297,6 +312,10 @@ pub(crate) fn adopt_legacy_key(target: &Path, legacy: &Path, node_id: &str) -> R
     if existing.is_empty() {
         write_pins(&pins_path, &pins)?;
     }
+    #[cfg(test)]
+    if fail_adopted_key_write(target) {
+        return Err(std::io::Error::other("no space left on device").into());
+    }
     match write_private_exclusive(&target_key, &hex::encode(key)) {
         Ok(()) => Ok(true),
         Err(ThalovantError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -304,6 +323,19 @@ pub(crate) fn adopt_legacy_key(target: &Path, legacy: &Path, node_id: &str) -> R
         }
         Err(error) => Err(error),
     }
+}
+
+/// Folders whose next adopted key write fails, after the pins went in.
+#[cfg(test)]
+pub(crate) static FAIL_ADOPTED_KEY_WRITE: std::sync::Mutex<Vec<PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn fail_adopted_key_write(target: &Path) -> bool {
+    let mut folders = FAIL_ADOPTED_KEY_WRITE.lock().unwrap();
+    let before = folders.len();
+    folders.retain(|folder| folder != target);
+    folders.len() != before
 }
 
 /// Drop a pinned hub key.

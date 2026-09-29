@@ -3528,6 +3528,34 @@ fn a_key_that_met_this_hub_is_copied_into_the_new_folder_never_moved() {
     assert!(!adopt_legacy_key(&fresh.0, &empty.0, "test-hub").unwrap());
 }
 
+#[test]
+fn a_copy_cut_short_before_the_key_fails_and_is_made_again() {
+    let legacy = FixtureDir::new();
+    let target = FixtureDir::new();
+    let key = load_or_create_noise_key(Some(&legacy.0)).unwrap();
+    let hub_key = "ab".repeat(32);
+    pin_hub_key(Some(&legacy.0), "test-hub", &hub_key).unwrap();
+
+    // The pins go in, then writing the key fails: an error, and no key.
+    crate::noise_store::FAIL_ADOPTED_KEY_WRITE
+        .lock()
+        .unwrap()
+        .push(target.0.clone());
+    assert!(adopt_legacy_key(&target.0, &legacy.0, "test-hub").is_err());
+    assert_eq!(
+        load_noise_pin(Some(&target.0), "test-hub").unwrap(),
+        Some(hub_key)
+    );
+    assert!(!target
+        .0
+        .join(crate::noise_store::NOISE_KEY_FILENAME)
+        .exists());
+
+    // The next attempt copies the key the hub pinned.
+    assert!(adopt_legacy_key(&target.0, &legacy.0, "test-hub").unwrap());
+    assert_eq!(load_or_create_noise_key(Some(&target.0)).unwrap(), key);
+}
+
 // The first handshake from a new folder takes the key the hub already knows,
 // so a device whose identity file is not in the default folder keeps its link.
 #[tokio::test]
@@ -3559,6 +3587,48 @@ async fn the_first_handshake_from_a_new_folder_takes_the_key_the_hub_pinned() {
     // KK straight away: the hub's pin came along too.
     let patterns = hub.patterns();
     assert_eq!(patterns[patterns.len() - 1], "KKpsk0");
+}
+
+// A copy that fails writing the key fails the connect instead of going on
+// with a key of its own, which the hub would refuse; the next one copies.
+#[tokio::test]
+async fn a_connect_whose_key_copy_fails_leaves_no_key_and_the_next_one_copies() {
+    let hub = FakeHub::start().await;
+    let identity = wss_identity(&hub.endpoint);
+    let legacy = FixtureDir::new();
+    assert_eq!(handshake_outcome(&identity, &legacy.0).await, "connected");
+    let beside = FixtureDir::new();
+    let transport = WssTransport::new(identity.clone());
+    transport.set_noise_state_dir(Some(beside.0.clone())).await;
+    transport
+        .state
+        .lifecycle
+        .key_folder
+        .lock()
+        .unwrap()
+        .adopt_from = Some(legacy.0.clone());
+    crate::noise_store::FAIL_ADOPTED_KEY_WRITE
+        .lock()
+        .unwrap()
+        .push(beside.0.clone());
+    let failed = timeout(Duration::from_secs(30), transport.connect())
+        .await
+        .unwrap();
+    assert!(failed.is_err(), "went on past a failed copy");
+    let _ = transport.disconnect().await;
+    assert!(!beside
+        .0
+        .join(crate::noise_store::NOISE_KEY_FILENAME)
+        .exists());
+    timeout(Duration::from_secs(30), transport.connect())
+        .await
+        .unwrap()
+        .expect("the hub knows the copied key");
+    transport.disconnect().await.unwrap();
+    assert_eq!(
+        load_or_create_noise_key(Some(&beside.0)).unwrap(),
+        load_or_create_noise_key(Some(&legacy.0)).unwrap()
+    );
 }
 
 // The rejected key says where the key is, and where the other program's is.

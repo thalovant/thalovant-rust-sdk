@@ -2904,9 +2904,10 @@ impl NoiseChannel {
             ));
         }
         if let (Some(target), Some(from)) = (self.state_dir.as_deref(), self.adopt_from.take()) {
-            // Best effort: a folder it cannot copy into starts afresh, as it
-            // did before.
-            let _ = adopt_legacy_key(target, &from, &self.node_id);
+            // An old folder it cannot read copies nothing. A copy that fails
+            // writing fails this connect, leaving no key, so the next one
+            // copies again rather than meeting the hub with a key of its own.
+            adopt_legacy_key(target, &from, &self.node_id)?;
         }
         let pin = load_noise_pin(self.state_dir.as_deref(), &self.node_id)?;
         // After a failed KK, XX whatever is pinned; the pin is still checked
