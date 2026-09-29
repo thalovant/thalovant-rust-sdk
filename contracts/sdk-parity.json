@@ -2,7 +2,7 @@
   "capabilities": {
     "api-errors": {
       "implementation": {
-        "src/control.rs": "1b696e108a6fcc776cee972ec1d3337f308c6c11e808e2337f9f887ad96fb3fc",
+        "src/control.rs": "a6fbff73f9590334243f528a8be0588b41630169d8bc99478b02e56cb7441c20",
         "src/errors.rs": "fd3e3c8f289ede61438a03f4198a6e03db0e582326a2c155d9e66239a2ec14cb",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d",
         "src/redact.rs": "e84cc12f06c3def1be5475486aa6da53288710bb5ab245beccb60787dfa7d1b8"
@@ -42,7 +42,7 @@
     },
     "connection-admission": {
       "implementation": {
-        "src/control.rs": "1b696e108a6fcc776cee972ec1d3337f308c6c11e808e2337f9f887ad96fb3fc",
+        "src/control.rs": "a6fbff73f9590334243f528a8be0588b41630169d8bc99478b02e56cb7441c20",
         "src/errors.rs": "fd3e3c8f289ede61438a03f4198a6e03db0e582326a2c155d9e66239a2ec14cb",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d"
       },
@@ -59,7 +59,7 @@
     },
     "connection-kinds": {
       "implementation": {
-        "src/control.rs": "1b696e108a6fcc776cee972ec1d3337f308c6c11e808e2337f9f887ad96fb3fc",
+        "src/control.rs": "a6fbff73f9590334243f528a8be0588b41630169d8bc99478b02e56cb7441c20",
         "src/errors.rs": "fd3e3c8f289ede61438a03f4198a6e03db0e582326a2c155d9e66239a2ec14cb",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d"
       },
@@ -82,9 +82,9 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "1b696e108a6fcc776cee972ec1d3337f308c6c11e808e2337f9f887ad96fb3fc",
+        "src/control.rs": "a6fbff73f9590334243f528a8be0588b41630169d8bc99478b02e56cb7441c20",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
-        "src/native_auth.rs": "c5e1d05fa71c4ae3ae37e1225deaa8157d504ebb54d4558b7e9f9fecfafda02f"
+        "src/native_auth.rs": "3672a473b3388e41db298b5c1661eba581d06d8e487dc226dd162c2c8053f49d"
       }
     },
     "conversation": {
@@ -104,7 +104,7 @@
     },
     "device-login": {
       "implementation": {
-        "src/control.rs": "1b696e108a6fcc776cee972ec1d3337f308c6c11e808e2337f9f887ad96fb3fc",
+        "src/control.rs": "a6fbff73f9590334243f528a8be0588b41630169d8bc99478b02e56cb7441c20",
         "src/errors.rs": "fd3e3c8f289ede61438a03f4198a6e03db0e582326a2c155d9e66239a2ec14cb",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d"
       },
@@ -126,7 +126,7 @@
         "src/home.rs": "eb9221cadbf80a4ee78b451ad14c85cb065f13140f2815ffd86d529f20853750",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d",
         "src/noise.rs": "875e0f096d46b0b62b0ea87a1251a15c84bdcf2b8dc6a4272a404e9b9e771b50",
-        "src/noise_store.rs": "eb8a92de8573d5ee43da234256d2be5ce659e37265493f08980672b2f114704a",
+        "src/noise_store.rs": "88c5b270bcea93faeb25db615d176447be3d84da8482261741a5459a1c2d1a0c",
         "src/rich.rs": "d441e77895b4f39932dba8f91ff643e0e53df886e4c40287da2e70d5c7574438",
         "src/session.rs": "1d23d717a24c5dd84e443a2d6f71045748b3ff17cf3a290d81b6fd6a4b15c735",
         "src/transport.rs": "d75af98862231ea0b722641469d2fa678682c74b4d6ad5ddb07b6d159704a7f2"
@@ -134,7 +134,7 @@
       "reason": "src/home.rs holds HOME_REQUEST/HOME_RESPONSE, HOME_REQUEST_TIMEOUT, RESPONSE_TYPES and ERROR_CODES (asserted equal to the vector file's lists), HomeRequest, HomeAnswer, home_response, plain_speech (src/rich.rs strip_ssml removes only real tags, comments and processing instructions; decode_references decodes numeric references, the five XML entities and &nbsp; and nothing else; Unicode White_Space collapses), and answer_home_request/answer_home_request_within: everything within the hub's 10 s counted from the call, the handler on a spawned task given min(timeout, what is left) and answered timeout at the deadline while it is left to finish, the reply given what the handler left, never started after the bound and withdrawn when it passes (None when there was no time). reply_context is in src/events.rs (a destination with no source gives no destination), Client::reply in src/client.rs, replying from Event::context as the hub sent it. src/transport.rs holds close_refuses and close_refuses_after (1000/1005/1008 during the handshake or within 750 ms after it, a code learnt up to 250 ms late, and never once a frame from the hub decrypted: the WSS read loop and every carrier's receive set that flag for any frame, JSON, WIRE-1, a chunk or the encrypted HELLO), a refusal right as an XX handshake ends with nothing from the hub turned into client_key_rejected naming both key folders (plain refusal after KK), and the typed handshake verdicts: a message that fails to authenticate and a refusal close are HubRefused, a pin mismatch HubKeyChanged, and a failed KK is followed at once by one XX in the same connect; src/noise.rs and src/noise_store.rs carry the pattern selection and the pin it checks. src/session.rs holds LinkSupervisor, a pure function run() asks after every attempt (hold, dial again at once after a drop, the 10 s to 120 s ladder, 600 s of refusals, stop at once on a key change or a rejected client key), per-type handlers and the settle window; its own unit tests are colocated, as this SDK's are, so it is implementation here. tests/home_link.rs runs every home-link case (reply_context, speech, answer, deadline with a transport that takes send_ms); tests/link_keeping.rs runs the close and supervise cases and the policy; src/transport_noise_tests.rs runs the handshake cases, each as a kept link connects (HubSession connect with the settle window), against a loopback Noise hub that records the patterns it sees and pins the client's key, closing with no status on a contradicting one before it sends anything, and the queued cases over a real link whose writer another frame holds for busy_ms (a send may be withdrawn only while it waits for the writer; once it holds it, the write runs to completion on its own task), a real close right after the handshake, and run() stopping at once on a changed key. All record through tests/common/mod.rs before asserting.",
       "status": "required",
       "tests": {
-        "src/transport_noise_tests.rs": "f5a0a15a791895fc23e4d42772a14e3b1429f5ca068017353698c1ec5183909e",
+        "src/transport_noise_tests.rs": "cf3cc1f38ce4d424d5170bb4214e986e4e900db675ecf2e87c067131ef42c335",
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/home-link-vectors.json": "bfaadf8f9c588ae79c02263743c8d3be0d80f8fad2db8ebce81158d0c336c547",
         "tests/conformance/link-keeping-vectors.json": "eea7f573e802cf447b6776868d513ad1fb086c1ec7300629ab5f9ec09c9c3257",
@@ -150,7 +150,7 @@
       "implementation": {
         "src/client.rs": "9c4301a85d3da99c81f165ec95f12042abdddb0f51e7ecfe6fdea4a73d7cfb23",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d",
-        "src/noise_store.rs": "eb8a92de8573d5ee43da234256d2be5ce659e37265493f08980672b2f114704a",
+        "src/noise_store.rs": "88c5b270bcea93faeb25db615d176447be3d84da8482261741a5459a1c2d1a0c",
         "src/protocols.rs": "a42115fd0de0dc49c4cee86872130f5ee3ab510ebc4b10d33adff4dcbd978905",
         "src/transport.rs": "d75af98862231ea0b722641469d2fa678682c74b4d6ad5ddb07b6d159704a7f2"
       },
@@ -158,7 +158,7 @@
       "status": "required",
       "tests": {
         "src/identity.rs": "7eeef6822788b239aafda4f682fac2ceae686cc3e27529385cac80d654d91f63",
-        "src/transport_noise_tests.rs": "f5a0a15a791895fc23e4d42772a14e3b1429f5ca068017353698c1ec5183909e"
+        "src/transport_noise_tests.rs": "cf3cc1f38ce4d424d5170bb4214e986e4e900db675ecf2e87c067131ef42c335"
       }
     },
     "inventory": {
@@ -184,7 +184,7 @@
       "reason": "connect_kk_then_xx in src/transport.rs runs every carrier's connect: a KK attempt that does not authenticate -- over HTTPS polling also a request answered 401 or 403 while the KK exchange is under way -- is followed at once by one XX attempt in the same connect, whose outcome is the connect's. Over HTTPS a 401 or 403 while the client sends the last frames of an XX handshake it completed (HttpTransport::receive_frame), or on a poll right after it, before any frame from the hub decrypted, is the hub refusing this client's own key: ThalovantError::client_key_rejected in src/errors.rs, still the HUB_REFUSED Connection with is_client_key_rejected() on top, and RuntimeTransport::closed_refused() now reports it for HTTP so the session's settle window (src/session.rs) sees it; after KK the same answer is a plain refusal. MQTT has no refusal to relay, so a hub that aborts there just stops answering and no rejected key is told. src/transport_noise_tests.rs runs the ten cases through the real HttpTransport over TLS against HttpFixture in carrier mode (a hub responder that pins the client key and aborts on a contradicting one, then answers every request of the aborted session 401) and the real MqttTransport against a loopback TLS broker, each as a kept link connects (HubSession connect with the 750 ms settle window), and records {outcome, patterns} through tests/common/mod.rs before asserting.",
       "status": "required",
       "tests": {
-        "src/transport_noise_tests.rs": "f5a0a15a791895fc23e4d42772a14e3b1429f5ca068017353698c1ec5183909e",
+        "src/transport_noise_tests.rs": "cf3cc1f38ce4d424d5170bb4214e986e4e900db675ecf2e87c067131ef42c335",
         "tests/common/mod.rs": "599048d0490eb01102edd3f35c48a7744c56d24d6d263d3deee4bcdde3e8d71b",
         "tests/conformance/link-carrier-vectors.json": "dae55b50c45c69b47a1c08eec472dd2e8eb2844251d1dc2951e7c5440f87e260"
       },
@@ -249,7 +249,7 @@
       "status": "required",
       "tests": {
         "src/client.rs": "9c4301a85d3da99c81f165ec95f12042abdddb0f51e7ecfe6fdea4a73d7cfb23",
-        "src/transport_noise_tests.rs": "f5a0a15a791895fc23e4d42772a14e3b1429f5ca068017353698c1ec5183909e",
+        "src/transport_noise_tests.rs": "cf3cc1f38ce4d424d5170bb4214e986e4e900db675ecf2e87c067131ef42c335",
         "tests/data/reply-claim-vectors.json": "45f2731589e612d5a849376d94073c57b0fef426a92e1d065c58c48442b1ffdc",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
         "tests/reply_claims.rs": "28b12c2282adb27afbc267751ef8a4bfa989a70dc1e351d9e259e3ef7dfa0b69"

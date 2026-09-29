@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use rand::RngCore;
+use rand::Rng;
 
 use crate::errors::{Result, ThalovantError};
 use crate::identity::{assert_secure_secret_file, default_config_path};
@@ -176,7 +176,7 @@ pub fn load_or_create_noise_key(dir: Option<&Path>) -> Result<[u8; 32]> {
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             let mut key = [0_u8; 32];
-            rand::thread_rng().fill_bytes(&mut key);
+            rand::rng().fill_bytes(&mut key);
             fs::create_dir_all(&dir)?;
             // Publish only complete, flushed bytes without replacing a winner.
             // A killed writer leaves an untrusted temporary file, never a

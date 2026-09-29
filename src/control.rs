@@ -11,7 +11,7 @@ use crate::{
     tls::ensure_rustls_provider,
 };
 use base64::{engine::general_purpose, Engine as _};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -2590,7 +2590,9 @@ fn browser_command(raw: &str, os: &str) -> Option<(&'static str, Vec<String>)> {
 
 fn new_secret() -> String {
     let mut raw = [0_u8; 32];
-    OsRng.fill_bytes(&mut raw);
+    SysRng
+        .try_fill_bytes(&mut raw)
+        .expect("the operating system random source failed");
     general_purpose::URL_SAFE_NO_PAD.encode(raw)
 }
 
