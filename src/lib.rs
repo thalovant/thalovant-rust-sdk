@@ -35,11 +35,12 @@ pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
 pub use control::{
     AnalyticsOverviewOptions, ApiToken, BootstrapIdentityOptions, BootstrapIdentityResult,
-    ControlPlane, DeviceAuthorization, DeviceLoginOptions, DevicePrompt, HubSkillWaitOptions,
-    LoginOptions, MarketplaceSkillsOptions, MemoryListOptions, OperationResource, OperationStatus,
-    ReleaseOptions, SkillInstallOptions, CONNECTION_TYPE_HOME_ASSISTANT, DEFAULT_ADMISSION_TIMEOUT,
-    DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_OPERATION_POLL_INTERVAL,
-    DEFAULT_SKILL_SOURCE_TYPE, HOME_ASSISTANT_SCOPES,
+    ControlPlane, DeviceAuthorization, DeviceLoginOptions, DeviceLoginRequest, DevicePrompt,
+    HubSkillWaitOptions, LoginOptions, MarketplaceSkillsOptions, MemoryListOptions,
+    OperationResource, OperationStatus, ReleaseOptions, SkillInstallOptions,
+    CONNECTION_TYPE_HOME_ASSISTANT, DEFAULT_ADMISSION_TIMEOUT, DEFAULT_CONTROL_API_URL,
+    DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_OPERATION_POLL_INTERVAL, DEFAULT_SKILL_SOURCE_TYPE,
+    HOME_ASSISTANT_CLIENT_ID, HOME_ASSISTANT_SCOPES,
 };
 pub use errors::{ApiProblem, ApiRefusal, Result, ThalovantError};
 pub use events::{
@@ -76,9 +77,9 @@ pub use protocols::{
 pub use rich::{display_items_from_event_data, rich_media_from_data, strip_ssml, DisplayItem};
 pub use stream::{EventPredicate, EventStream, ListenOptions};
 pub use transport::{
-    close_refuses, mqtt_topics_for_identity, HttpTransport, MqttTopicSet, MqttTransport,
-    RuntimeTransport, TransportConnectionInfo, TransportConnectionPhase, TransportHealth,
-    WssTransport, CLOSE_CODE_GRACE, REFUSAL_CLOSE_CODES, REFUSAL_SETTLE,
+    close_refuses, close_refuses_after, mqtt_topics_for_identity, HttpTransport, MqttTopicSet,
+    MqttTransport, RuntimeTransport, TransportConnectionInfo, TransportConnectionPhase,
+    TransportHealth, WssTransport, CLOSE_CODE_GRACE, REFUSAL_CLOSE_CODES, REFUSAL_SETTLE,
 };
 pub use wire::{decode_hive_binary_frame, encode_hive_binary_frame};
 

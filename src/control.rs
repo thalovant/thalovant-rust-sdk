@@ -41,6 +41,12 @@ pub const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(180);
 /// The scopes a Home Assistant link asks for at sign-in, and all a Free plan
 /// can approve.
 pub const HOME_ASSISTANT_SCOPES: &[&str] = &["hubs:read", "clients:read", "clients:write"];
+/// The registered app id Home Assistant signs in as: the `client_id` of a
+/// device login ([`ControlPlane::begin_device_login_as`]). The approval screen
+/// then shows the platform's own name for it as verified, and approving it
+/// again replaces the token the last approval gave it instead of counting a
+/// second against the plan.
+pub const HOME_ASSISTANT_CLIENT_ID: &str = "thalovant-home-assistant";
 /// `spec.connection_type` of a Home Assistant link.
 pub const CONNECTION_TYPE_HOME_ASSISTANT: &str = "home_assistant";
 
@@ -251,6 +257,68 @@ impl ApiToken {
             expires_at: text("expires_at"),
             token_id: text("token_id"),
         })
+    }
+}
+
+/// A pending device sign-in as the person approving it sees it, from
+/// [`ControlPlane::describe_device_login`].
+///
+/// `client_verified` is true only when a registered app asked -- it named its
+/// `client_id` -- and the API vouches for it: `client_name` is then the
+/// platform's own name for that app, and `device_name` whatever the device
+/// called itself, which nothing checks. Otherwise `client_name` is the
+/// device's own claim.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeviceLoginRequest {
+    /// What the token would carry.
+    pub scopes: Vec<String>,
+    /// Who asked: the platform's name for a registered app, else the
+    /// device's own claim.
+    pub client_name: Option<String>,
+    /// When the code stops being usable: an RFC 3339 timestamp exactly as the
+    /// API sent it.
+    pub expires_at: Option<String>,
+    /// The registered app that asked, when one did.
+    pub client_id: Option<String>,
+    /// Whether the platform vouches for `client_name`: true only when the API
+    /// says so and names the app.
+    pub client_verified: bool,
+    /// What the device called itself, beside a registered app's name.
+    pub device_name: Option<String>,
+}
+
+impl DeviceLoginRequest {
+    fn from_map(payload: &Map<String, Value>) -> Self {
+        let text = |key: &str| {
+            payload
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let client_id = text("client_id");
+        Self {
+            scopes: payload
+                .get("scopes")
+                .and_then(Value::as_array)
+                .map(|scopes| {
+                    scopes
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            client_name: text("client_name"),
+            expires_at: text("expires_at"),
+            // Verified only as the API says it, and only with the app named:
+            // a true without an id says nothing about who asked.
+            client_verified: payload.get("client_verified") == Some(&Value::Bool(true))
+                && client_id.is_some(),
+            client_id,
+            device_name: text("device_name"),
+        }
     }
 }
 
@@ -574,6 +642,21 @@ impl ControlPlane {
     /// other failed poll is [`ThalovantError::ApiResponse`], carrying what the
     /// API said.
     pub async fn login_with_browser(&mut self, options: DeviceLoginOptions) -> Result<Value> {
+        self.login_with_browser_as(options, None).await
+    }
+
+    /// [`ControlPlane::login_with_browser`], signing in as the registered app
+    /// `client_id`, such as [`HOME_ASSISTANT_CLIENT_ID`]; see
+    /// [`ControlPlane::begin_device_login_as`]. `None` is
+    /// [`ControlPlane::login_with_browser`] itself.
+    ///
+    /// A method rather than a field of [`DeviceLoginOptions`], so that no
+    /// options literal stops compiling.
+    pub async fn login_with_browser_as(
+        &mut self,
+        options: DeviceLoginOptions,
+        client_id: Option<&str>,
+    ) -> Result<Value> {
         let DeviceLoginOptions {
             scopes,
             client_name,
@@ -583,7 +666,7 @@ impl ControlPlane {
         } = options;
         let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
         let grant = self
-            .begin_device_login(&scopes, client_name.as_deref())
+            .begin_device_login_as(&scopes, client_name.as_deref(), client_id)
             .await?;
         match prompt.as_ref() {
             Some(prompt) => prompt(&grant),
@@ -627,6 +710,26 @@ impl ControlPlane {
         scopes: &[&str],
         client_name: Option<&str>,
     ) -> Result<DeviceAuthorization> {
+        self.begin_device_login_as(scopes, client_name, None).await
+    }
+
+    /// [`ControlPlane::begin_device_login`], signing in as a registered app.
+    ///
+    /// `client_id` names the app, such as [`HOME_ASSISTANT_CLIENT_ID`]: the
+    /// approval screen shows the platform's name for it as verified
+    /// (`client_name` becomes the device's own label beside it), and
+    /// approving the app again replaces the token it already holds. Such an
+    /// app may ask only for its own scopes, and an id the API does not know
+    /// is refused (HTTP 400 `unknown_client`, a
+    /// [`ThalovantError::ApiResponse`] carrying what the API said). `None`
+    /// leaves the field out; any string is sent as given, an empty one
+    /// included, which the API refuses rather than signing in unverified.
+    pub async fn begin_device_login_as(
+        &self,
+        scopes: &[&str],
+        client_name: Option<&str>,
+        client_id: Option<&str>,
+    ) -> Result<DeviceAuthorization> {
         let mut body = Map::new();
         if !scopes.is_empty() {
             body.insert(
@@ -636,6 +739,9 @@ impl ControlPlane {
         }
         if let Some(client_name) = client_name.filter(|value| !value.trim().is_empty()) {
             body.insert("client_name".to_string(), Value::from(client_name));
+        }
+        if let Some(client_id) = client_id {
+            body.insert("client_id".to_string(), Value::from(client_id));
         }
         let grant = self
             .request(
@@ -656,6 +762,31 @@ impl ControlPlane {
             return Err(ThalovantError::Api("device authorization requires HTTP(S) verification URLs without embedded credentials".into()));
         }
         Ok(grant)
+    }
+
+    /// Read a pending device sign-in by its `user_code`, as the person who
+    /// would approve it sees it.
+    ///
+    /// Sends `GET /v1/auth/device/codes/{user_code}`, signed in as that
+    /// person. Says which app asked and whether the platform vouches for its
+    /// name ([`DeviceLoginRequest::client_verified`]). A code that is
+    /// unknown, expired or already answered is a 404, returned as the
+    /// [`ThalovantError::ApiResponse`] it is; an answer that is not a JSON
+    /// object is [`ThalovantError::Api`].
+    pub async fn describe_device_login(&self, user_code: &str) -> Result<DeviceLoginRequest> {
+        let detail = self
+            .request(
+                "GET",
+                &format!("/v1/auth/device/codes/{}", urlencoding::encode(user_code)),
+                None,
+                None,
+                true,
+            )
+            .await?;
+        let detail = detail.as_object().ok_or_else(|| {
+            ThalovantError::Api("Thalovant API returned an unexpected response shape".to_string())
+        })?;
+        Ok(DeviceLoginRequest::from_map(detail))
     }
 
     /// Ask once whether a device sign-in was approved.
@@ -2680,7 +2811,11 @@ fn api_response_error(status: reqwest::StatusCode, body: &str) -> ThalovantError
 /// JSON).
 fn error_display_line(parsed: Option<&Value>) -> String {
     let rendered = match parsed {
-        Some(value) if value.is_object() => crate::redact::redact_value(value).to_string(),
+        // Never an echoed validation input, whatever its key or shape.
+        Some(Value::Object(map)) => Value::Object(crate::redact::redact_map(
+            &crate::redact::omit_echoed_inputs(map),
+        ))
+        .to_string(),
         _ => "(server error response omitted)".to_string(),
     };
     let collapsed = rendered.split_whitespace().collect::<Vec<_>>().join(" ");

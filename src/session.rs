@@ -79,6 +79,9 @@ pub enum LinkOutcome {
     /// The hub's Noise key is not the pinned one
     /// ([`ThalovantError::is_hub_key_changed`]).
     KeyChanged,
+    /// The hub refused this client's own Noise key: it pinned another one for
+    /// the connection ([`ThalovantError::is_client_key_rejected`]).
+    ClientKeyRejected,
 }
 
 /// What to do after an outcome; see [`LinkSupervisor::after`].
@@ -92,8 +95,8 @@ pub enum LinkDecision {
         /// How long to wait first.
         wait: Duration,
     },
-    /// Stop: retrying cannot help. `reason` is [`LinkOutcome::Refused`] or
-    /// [`LinkOutcome::KeyChanged`].
+    /// Stop: retrying cannot help. `reason` is [`LinkOutcome::Refused`],
+    /// [`LinkOutcome::KeyChanged`] or [`LinkOutcome::ClientKeyRejected`].
     GiveUp {
         /// Why.
         reason: LinkOutcome,
@@ -113,7 +116,9 @@ pub enum LinkDecision {
 ///   admits it, so wait the ladder's step as for a failure, until refusals
 ///   have lasted `refusal_grace` since the first of them (inclusive); then
 ///   give up;
-/// - [`LinkOutcome::KeyChanged`]: give up at once.
+/// - [`LinkOutcome::KeyChanged`]: give up at once;
+/// - [`LinkOutcome::ClientKeyRejected`]: give up at once, too: no handshake
+///   can change the key the hub pinned.
 #[derive(Clone, Debug)]
 pub struct LinkSupervisor {
     policy: HubSessionPolicy,
@@ -148,10 +153,8 @@ impl LinkSupervisor {
                     wait: Duration::ZERO,
                 }
             }
-            LinkOutcome::KeyChanged => {
-                return LinkDecision::GiveUp {
-                    reason: LinkOutcome::KeyChanged,
-                }
+            LinkOutcome::KeyChanged | LinkOutcome::ClientKeyRejected => {
+                return LinkDecision::GiveUp { reason: outcome }
             }
             LinkOutcome::Refused => {
                 let since = *self.refused_since.get_or_insert(now);
@@ -407,30 +410,16 @@ impl HubSession {
     /// A hub that closes the link while the connection is being set up, the
     /// way it refuses credentials (see
     /// [`WssTransport::closed_refused`](crate::WssTransport::closed_refused)),
-    /// is reported as a refusal ([`ThalovantError::is_hub_refused`]).
+    /// is reported as a refusal ([`ThalovantError::is_hub_refused`]); right
+    /// as an XX handshake ended, as the hub refusing this client's own key
+    /// ([`ThalovantError::is_client_key_rejected`]).
     pub fn for_identity(identity: Identity, policy: HubSessionPolicy) -> Result<Self> {
         Self::new(
             move || {
                 let identity = identity.clone();
                 async move {
                     let client = Client::auto(identity)?;
-                    match client.connect().await {
-                        Ok(()) => Ok(client),
-                        Err(error) => {
-                            let refused = client.transport.closed_refused()
-                                && matches!(error, ThalovantError::Connection(_))
-                                && !error.is_hub_refused()
-                                && !error.is_hub_key_changed();
-                            let _ = client.close().await;
-                            Err(if refused {
-                                ThalovantError::hub_refused(
-                                    "the hub closed the link during the handshake: it does not accept these credentials, or not yet",
-                                )
-                            } else {
-                                error
-                            })
-                        }
-                    }
+                    connect_for_session(client, crate::client::DEFAULT_CONNECT_TIMEOUT).await
                 }
             },
             policy,
@@ -773,7 +762,8 @@ impl HubSession {
     /// new connection is refused until its hub admits it. Then this returns
     /// a refusal ([`ThalovantError::is_hub_refused`]). A hub whose key is not the pinned one
     /// ends it at once ([`ThalovantError::is_hub_key_changed`]): retrying
-    /// cannot change that.
+    /// cannot change that. So does a hub that refuses this client's own key
+    /// ([`ThalovantError::is_client_key_rejected`]).
     ///
     /// Returns `Ok(())` once the session is closed. An identity the client
     /// cannot use at all ([`ThalovantError::MissingIdentityField`],
@@ -821,6 +811,10 @@ impl HubSession {
                 }
                 Err(error) if error.is_hub_key_changed() => {
                     supervisor.after(LinkOutcome::KeyChanged, origin.elapsed());
+                    return Err(error);
+                }
+                Err(error) if error.is_client_key_rejected() => {
+                    supervisor.after(LinkOutcome::ClientKeyRejected, origin.elapsed());
                     return Err(error);
                 }
                 Err(error) if error.is_hub_refused() => {
@@ -888,12 +882,33 @@ async fn settled(client: &Client, window: Duration) -> Result<()> {
         return Ok(());
     }
     Err(if client.transport.closed_refused() {
-        ThalovantError::hub_refused(
-            "the hub closed the link right after the handshake: it does not accept these credentials, or not yet",
-        )
+        // After XX, with nothing from the hub: its own key refused.
+        client.transport.refusal_after_handshake().await
     } else {
         ThalovantError::Connection("the hub closed the link right after the handshake".into())
     })
+}
+
+/// Connect `client` for a session: `Ok` with it once connected, else why not,
+/// closing it. A hub that closed the link as it was being set up the way it
+/// refuses credentials is reported as that refusal.
+pub(crate) async fn connect_for_session(client: Client, timeout: Duration) -> Result<Client> {
+    match client.connect_with_timeout(timeout).await {
+        Ok(()) => Ok(client),
+        Err(error) => {
+            let refused = client.transport.closed_refused()
+                && matches!(error, ThalovantError::Connection(_))
+                && !error.is_hub_refused()
+                && !error.is_hub_key_changed();
+            let error = if refused {
+                client.transport.refusal_after_handshake().await
+            } else {
+                error
+            };
+            let _ = client.close().await;
+            Err(error)
+        }
+    }
 }
 pub fn hub_hostname(master: &str) -> String {
     let text = master.trim();

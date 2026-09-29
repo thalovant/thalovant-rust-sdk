@@ -116,16 +116,38 @@ fn hive_int_to_type(type_id: u8) -> &'static str {
     }
 }
 
+/// The most a compressed part of a binary frame may inflate to: 32 MiB.
+///
+/// A reassembled Noise message is itself capped at 32 MiB
+/// ([`NOISE_MAX_REASSEMBLY`](crate::noise::NOISE_MAX_REASSEMBLY)); without a
+/// cap here, a small frame of zeros from a hub could make the client allocate
+/// gigabytes.
+pub const MAX_INFLATED: usize = 32 * 1024 * 1024;
+
 fn decode_wire_text(payload: &[u8], compressed: bool) -> Result<String> {
     let bytes = if compressed {
-        let mut decoder = ZlibDecoder::new(payload);
-        let mut out = Vec::new();
-        decoder.read_to_end(&mut out)?;
-        out
+        inflate(payload, MAX_INFLATED)?
     } else {
         payload.to_vec()
     };
     String::from_utf8(bytes).map_err(|err| ThalovantError::Runtime(err.to_string()))
+}
+
+/// Inflate a zlib stream to at most `limit` bytes. A stream that inflates
+/// past it refuses the frame, and so does one that ends before its end
+/// marker: flate2 reports that as the [`ThalovantError::Io`] error
+/// (`UnexpectedEof`) a corrupt stream has always been.
+fn inflate(payload: &[u8], limit: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    ZlibDecoder::new(payload)
+        .take(limit as u64 + 1)
+        .read_to_end(&mut out)?;
+    if out.len() > limit {
+        return Err(ThalovantError::Runtime(format!(
+            "HiveMind binary frame inflates past the size limit ({limit} bytes)"
+        )));
+    }
+    Ok(out)
 }
 
 fn parse_map(raw: &str) -> Result<Map<String, Value>> {
@@ -216,5 +238,53 @@ mod tests {
         assert_eq!(encoded[0], 0x82);
         assert_eq!(decoded.msg_type, "bus");
         assert_eq!(decoded.payload["type"], "test.event");
+    }
+
+    fn zlib(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A compressed bus frame: `{}` metadata, then `payload`.
+    fn compressed_frame(payload: &[u8]) -> Vec<u8> {
+        let metadata = zlib(b"{}");
+        let mut frame = vec![0x80 | (1 << 1) | 1, metadata.len() as u8];
+        frame.extend(metadata);
+        frame.extend(payload);
+        frame
+    }
+
+    #[test]
+    fn a_compressed_part_is_capped_when_it_inflates() {
+        // A small frame of zeros must not inflate to gigabytes (CWE-409).
+        let bomb = zlib(&vec![b'0'; MAX_INFLATED + 1]);
+        assert!(bomb.len() < 64 * 1024);
+        let error = decode_hive_binary_frame(&compressed_frame(&bomb)).unwrap_err();
+        assert!(error.to_string().contains("size limit"), "{error}");
+    }
+
+    #[test]
+    fn a_compressed_part_at_the_cap_still_inflates_and_a_truncated_one_is_refused() {
+        let body = serde_json::to_vec(
+            &json!({"type": "speak", "data": {"u": "x".repeat(20)}, "context": {}}),
+        )
+        .unwrap();
+        let limit = body.len();
+        assert_eq!(inflate(&zlib(&body), limit).unwrap(), body);
+        assert!(inflate(&zlib(&body), limit - 1)
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+        let decoded = decode_hive_binary_frame(&compressed_frame(&zlib(&body))).unwrap();
+        assert_eq!(decoded.payload["type"], "speak");
+        let whole = zlib(&body);
+        let truncated = &whole[..whole.len() - 4];
+        let error = decode_hive_binary_frame(&compressed_frame(truncated)).unwrap_err();
+        assert!(
+            matches!(&error, ThalovantError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{error:?}"
+        );
     }
 }

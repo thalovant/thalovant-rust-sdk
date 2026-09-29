@@ -6,7 +6,10 @@
 //! against the one the case names -- method, path, body or body subset,
 //! `If-Match` and `Authorization`. `home-link` holds the reply routing and the
 //! request/response rules, run through `answer_home_request` with a replier
-//! that records what it was asked to send. What the SDK produced is recorded
+//! that records what it was asked to send; its `queued` cases need a real
+//! link to a loopback hub, so they run beside the transport's Noise fixtures
+//! in `src/transport_noise_tests.rs` and record into the same file. What the
+//! SDK produced is recorded
 //! for the conformance record before it is compared with the case, shaped
 //! exactly as the Python reference's `tests/test_home_link_vectors.py` shapes
 //! it. The vector files are vendored byte for byte from the reference.
@@ -21,7 +24,8 @@ use thalovant::{
     answer_home_request, answer_home_request_within, plain_speech, reply_context, ApiRefusal,
     BootstrapIdentityOptions, ControlPlane, Data, DeviceAuthorization, Event, HomeAnswer,
     OperationResource, Replier, ThalovantError, DEFAULT_HOME_HANDLER_TIMEOUT,
-    HOME_ASSISTANT_SCOPES, HOME_REQUEST, HOME_REQUEST_TIMEOUT, HOME_RESPONSE,
+    HOME_ASSISTANT_CLIENT_ID, HOME_ASSISTANT_SCOPES, HOME_REQUEST, HOME_REQUEST_TIMEOUT,
+    HOME_RESPONSE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -339,38 +343,73 @@ async fn poll_once(
                 ThalovantError::DeviceLoginDenied { .. } => {
                     json!({"outcome": "denied", "status": error.status_code()})
                 }
-                _ => {
-                    let mut produced = Map::from_iter([
-                        ("outcome".to_string(), json!("error")),
-                        ("status".to_string(), json!(error.status_code())),
-                    ]);
-                    if error.status_code().is_some() {
-                        produced.extend(api_fields(&error));
-                    }
-                    Value::Object(produced)
-                }
+                _ => device_error(&error),
             }
         }
     }
 }
 
+/// A failure, with the api-errors fields when the API answered one: `status`
+/// is null only when there is no status at all.
+fn device_error(error: &ThalovantError) -> Value {
+    let mut produced = Map::from_iter([
+        ("outcome".to_string(), json!("error")),
+        ("status".to_string(), json!(error.status_code())),
+    ]);
+    if error.status_code().is_some() {
+        produced.extend(api_fields(error));
+    }
+    Value::Object(produced)
+}
+
 async fn device_case(case: &Value, spec: &Value) -> (Value, ScriptedApi) {
     let call = &case["call"];
     let api = ScriptedApi::start(&case["exchanges"]).await;
-    let mut control = ControlPlane::new(api.url.clone(), None);
+    // Only the approver's read is signed in; a device signing in has no
+    // token yet.
+    let token = (call["op"] == "describe").then(|| "synthetic-token".to_string());
+    let mut control = ControlPlane::new(api.url.clone(), token);
     let mut produced = Vec::new();
     let case_name = name(case);
-    if call["op"] == "begin" {
+    if call["op"] == "describe" {
+        match control
+            .describe_device_login(call["user_code"].as_str().expect("user_code"))
+            .await
+        {
+            Ok(request) => produced.push(json!({
+                "outcome": "described",
+                "scopes": request.scopes,
+                "client_name": request.client_name,
+                "client_id": request.client_id,
+                "client_verified": request.client_verified,
+                "device_name": request.device_name,
+            })),
+            Err(error) => {
+                excluded(&error, spec, case_name);
+                produced.push(device_error(&error));
+            }
+        }
+    } else if call["op"] == "begin" {
         let scopes: Vec<&str> = call["scopes"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(Value::as_str)
             .collect();
-        match control
-            .begin_device_login(&scopes, call["client_name"].as_str())
-            .await
-        {
+        let begun = match call["client_id"].as_str() {
+            Some(client_id) => {
+                control
+                    .begin_device_login_as(&scopes, call["client_name"].as_str(), Some(client_id))
+                    .await
+            }
+            // What every caller that names no app has always called.
+            None => {
+                control
+                    .begin_device_login(&scopes, call["client_name"].as_str())
+                    .await
+            }
+        };
+        match begun {
             Ok(grant) => produced.push(json!({
                 "outcome": "started",
                 "user_code": grant.user_code,
@@ -381,7 +420,7 @@ async fn device_case(case: &Value, spec: &Value) -> (Value, ScriptedApi) {
             })),
             Err(error) => {
                 excluded(&error, spec, case_name);
-                produced.push(json!({"outcome": "error", "status": error.status_code()}));
+                produced.push(device_error(&error));
             }
         }
     } else {
@@ -715,6 +754,11 @@ async fn home_link_runs_its_vectors() {
                 None,
             )
         };
+        if case["kind"] == "queued" {
+            // Over a real link: src/transport_noise_tests.rs runs and
+            // records these.
+            continue;
+        }
         let produced = if case["kind"] == "reply_context" {
             let context = case["context"].as_object().expect("context");
             Value::Object(reply_context(context))
@@ -836,6 +880,7 @@ fn the_contract_lists_match_the_sdk() {
         json!(HOME_ASSISTANT_SCOPES),
         device["home_assistant_scopes"]
     );
+    assert_eq!(HOME_ASSISTANT_CLIENT_ID, device["home_assistant_client_id"]);
 }
 
 // -- beyond the vectors -------------------------------------------------------

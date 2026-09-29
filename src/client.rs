@@ -71,6 +71,9 @@ fn distinct_conversations(conversations: &ConversationStore) -> usize {
         .len()
 }
 
+/// How long [`Client::connect`] waits for an authenticated link.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+
 impl Client {
     /// Keep the session a hub returned, to send with the next utterance.
     /// Keep one conversation under every session id that reaches it.
@@ -286,16 +289,43 @@ impl Client {
         Self::with_protocol(identity.clone(), default_runtime_protocol(&identity)?)
     }
 
+    /// A client for the identity in the JSON file at `path`, over the
+    /// protocol it prefers.
+    ///
+    /// Its Noise key is kept beside the file (`noise_key` and
+    /// `noise_pins.json` in the file's folder), so every program that reads
+    /// the same identity file presents the same key to the hub, which pins
+    /// one key per connection. For `~/.config/thalovant/identity.json` that
+    /// is where the key has always been. A folder this process cannot write
+    /// falls back to the default one. The first time the folder is used, a
+    /// key this identity already used from the default folder is copied into
+    /// it -- never moved -- when that key has met this identity's hub, so no
+    /// device is locked out by a new key. Setting a folder on the transport
+    /// (`set_noise_state_dir`) overrides all of this.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        Self::auto(Identity::from_file(path)?)
+        let path = path.as_ref();
+        Self::auto(Identity::from_file(path)?).map(|client| client.keeping_key_beside(path))
     }
 
+    /// A client for the identity in the default config file; its Noise key
+    /// is kept beside that file, as [`Client::from_file`] keeps it.
     pub fn from_config(profile: Option<&str>) -> Result<Self> {
-        Self::auto(Identity::from_config(profile)?)
+        Self::from_config_file(crate::identity::default_config_path()?, profile)
     }
 
+    /// A client for the identity in the config file at `path`; its Noise key
+    /// is kept beside that file, as [`Client::from_file`] keeps it.
     pub fn from_config_file(path: impl AsRef<Path>, profile: Option<&str>) -> Result<Self> {
+        let path = path.as_ref();
         Self::auto(Identity::from_config_file(path, profile)?)
+            .map(|client| client.keeping_key_beside(path))
+    }
+
+    /// This client, with its Noise key kept in the folder tied to the
+    /// identity file it was read from.
+    fn keeping_key_beside(self, file: &Path) -> Self {
+        self.transport.use_identity_file(file);
+        self
     }
 
     pub fn from_env() -> Result<Self> {
@@ -303,7 +333,7 @@ impl Client {
     }
 
     pub async fn connect(&self) -> Result<()> {
-        self.connect_with_timeout(Duration::from_secs(6)).await
+        self.connect_with_timeout(DEFAULT_CONNECT_TIMEOUT).await
     }
 
     pub async fn connect_with_timeout(&self, timeout_duration: Duration) -> Result<()> {
