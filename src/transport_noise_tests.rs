@@ -2606,7 +2606,7 @@ async fn handshake_outcome(identity: &Identity, state: &std::path::Path) -> &'st
 /// Give the client a new static key in the same folder, keeping its pins.
 fn replace_client_key(state: &std::path::Path) {
     let mut key = [0_u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut key);
     std::fs::write(
         state.join(crate::noise_store::NOISE_KEY_FILENAME),
         hex::encode(key),

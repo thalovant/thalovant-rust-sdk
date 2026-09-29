@@ -26,7 +26,7 @@
 //! redirect is useless without it.
 
 use base64::{engine::general_purpose, Engine as _};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::fmt;
 use url::Url;
@@ -136,7 +136,7 @@ fn base64_url(raw: &[u8]) -> String {
 
 fn random_url_safe(size: usize) -> String {
     let mut raw = vec![0u8; size];
-    rand::thread_rng().fill_bytes(&mut raw);
+    rand::rng().fill_bytes(&mut raw);
     base64_url(&raw)
 }
 
