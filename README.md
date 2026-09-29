@@ -552,6 +552,25 @@ Use `set_noise_state_dir` on `WssTransport`, `HttpTransport`, or `MqttTransport`
 to select another persistent directory. Keep the same directory when switching
 transports with one identity; regenerating the key breaks the hub's client pin.
 
+A hub pins one client key per connection, so every program that uses one
+identity has to present the same key. A client built from an identity file
+(`Client::from_file`, `Client::from_config_file`, `Client::from_config`) with
+no directory named keeps its key in the folder that file is in, so every
+program reading the same file shares it. For `~/.config/thalovant/identity.json`
+that is the folder the key has always been in, and nothing moves. An identity
+file elsewhere gets its own `noise_key` and `noise_pins.json` beside it; the
+first time that folder is used, a key this identity already used from the
+default folder is copied into it, never moved, but only when that key has met
+this identity's hub. A folder the process cannot write falls back to the
+default. `set_noise_state_dir` overrides all of it.
+
+When two programs reading one identity keep their keys apart anyway, the hub
+turns the second one away as its XX handshake ends. That error is a refusal
+(`is_hub_refused()`) and `is_client_key_rejected()` is true for it;
+`client_key_folders()` names the folder this client's key is in and the other
+likely one. No handshake can fix it: pair again, or point both programs at the
+folder with the key the hub trusts.
+
 The first connection to a hub trusts the key it presents and records it. A
 later connection presenting a different key is **refused**, because the SDK
 cannot tell a reinstalled hub from another machine answering at the same
@@ -908,11 +927,15 @@ the hub to admit it, then answer the hub's requests.
 that shows the code and polls on its own schedule takes it one step at a time:
 
 ```rust
-use thalovant::{ControlPlane, ThalovantError, HOME_ASSISTANT_SCOPES};
+use thalovant::{ControlPlane, ThalovantError, HOME_ASSISTANT_CLIENT_ID, HOME_ASSISTANT_SCOPES};
 
 let mut control = ControlPlane::default();
 let grant = control
-    .begin_device_login(HOME_ASSISTANT_SCOPES, Some("Home Assistant"))
+    .begin_device_login_as(
+        HOME_ASSISTANT_SCOPES,
+        Some("Home Assistant (kitchen)"),
+        Some(HOME_ASSISTANT_CLIENT_ID),
+    )
     .await?;
 println!("Visit {} and enter {}", grant.verification_uri, grant.user_code);
 
@@ -929,7 +952,14 @@ let token = loop {
 ```
 
 `HOME_ASSISTANT_SCOPES` is `hubs:read`, `clients:read` and `clients:write`,
-which is also all a Free plan can approve. The pending error's `interval`
+which is also all a Free plan can approve. `HOME_ASSISTANT_CLIENT_ID` signs in
+as the registered Home Assistant app: the approval screen shows the platform's
+own name for it as verified, with the `client_name` you pass beside it as the
+device's label, and approving it again replaces the token the app already has
+instead of counting a second one against the plan. An id the API does not know
+is refused with 400 `unknown_client`. `begin_device_login` without the id works
+as it always did, and `login_with_browser_as(options, client_id)` does the
+whole flow as a registered app. The pending error's `interval`
 already includes any `slow_down` the API asked for: five seconds more, for the
 rest of that code's life. `DeviceLoginExpired` means begin again for a new
 code, and `DeviceLoginDenied` means the person said no. On approval the control
@@ -939,6 +969,12 @@ forgets it; a token may always revoke itself. Revoking it twice is fine: a
 token already revoked or expired cannot authenticate its own revoke, so that
 401 counts as revoked, and a second call sends nothing. Neither the device code
 nor the token appears in any error message or `{:?}`.
+
+The person approving the code can read it first, signed in as themselves:
+`control.describe_device_login(user_code)` returns a `DeviceLoginRequest` with
+the `scopes`, `client_name`, `client_id`, `device_name`, `expires_at` and
+`client_verified`, which is true only for a registered app the platform vouches
+for. A code that is unknown, expired or already answered is a 404.
 
 ### 2. Create the connection
 
@@ -1058,8 +1094,14 @@ so by closing during the handshake or right after it, with no status, 1000 or
 1008, and a wrong password shows as a handshake message that does not
 authenticate: both are a `ThalovantError::Connection` that `is_hub_refused()`
 is true for, and a new link only counts once it has stayed up for 0.75
-seconds. Such a refusal is expected while a new connection waits to be
-admitted, so `run()` keeps trying for ten minutes before it returns it. A hub
+seconds. A close after the hub has sent anything that decrypts is a drop, not a
+refusal: a hub turns a key away before it says a word. A refusal is expected
+while a new connection waits to be admitted, so `run()` keeps trying for ten
+minutes before it returns it, with one exception: a refusal right as an XX
+handshake ends means the hub pinned another key for this connection
+(`is_client_key_rejected()`, see
+[Transport Security](#transport-security)), and `run()` returns it at once,
+since only re-pairing or sharing the key folder can fix it. A hub
 whose Noise key is not the one pinned for it is a `Connection` error that
 `is_hub_key_changed()` is true for, and `run()` stops at once: if the hub
 really was replaced, drop the stale pin with `forget_noise_pin` and connect
@@ -1113,7 +1155,8 @@ data)` answers one yourself.
 - `control.create_client_identity_of_type(hub, connection_type, options)` (`CONNECTION_TYPE_HOME_ASSISTANT`; `result.client_id()`, `result.connection_type()`, `result.operation()`)
 - `control.get_client(client_id)`, `control.delete_client(client_id, etag)`
 - `control.wait_for_admission(operation, timeout, poll_interval)`
-- `control.begin_device_login(scopes, client_name)`, `control.poll_device_login(&authorization)` (`ApiToken`), `control.revoke_api_token(token_id)`, `control.token_id()`
+- `control.begin_device_login(scopes, client_name)`, `control.begin_device_login_as(scopes, client_name, client_id)` (`HOME_ASSISTANT_CLIENT_ID`), `control.login_with_browser_as(options, client_id)`, `control.poll_device_login(&authorization)` (`ApiToken`), `control.revoke_api_token(token_id)`, `control.token_id()`
+- `control.describe_device_login(user_code)` (`DeviceLoginRequest`)
 - `Identity::from_config(profile)`
 - `Client::from_config(profile)`
 - `Identity::from_file(path)`
@@ -1136,10 +1179,11 @@ data)` answers one yourself.
 - `client.describe_intent(skill_id, intent_name, lang, options)` (`IntentDescribeOptions`)
 - `error.status_code()`, `error.api_code()`, `error.api_detail()`, `error.api_problem()` (`ApiProblem`) on a `ThalovantError`; see [Reading An API Error](#reading-an-api-error)
 - `error.api_refusal()` (`ApiRefusal`), `error.linked_client_id()`, `error.is_timeout()`, `error.is_connection_error()`
+- `error.is_hub_refused()`, `error.is_client_key_rejected()`, `error.client_key_folders()`, `error.is_hub_key_changed()`
 - `client.reply(&event, msg_type, data)`, `reply_context(&context)`
 - `HubSession::for_identity(identity, policy)`, `session.connect()`, `session.run()`, `session.on(event_type, handler)`, `session.off(id)`, `session.on_state_change(callback)`, `session.reply(&event, msg_type, data)`
 - `answer_home_requests(&session, handler, timeout)`, `answer_home_request(&replier, &event, handler, timeout)`, `answer_home_request_within(&replier, &event, handler, timeout, hub_timeout)`, `home_response(&request, answer)`, `plain_speech(text)`, `decode_references(text)`; see [Home Assistant Link](#home-assistant-link)
-- `LinkSupervisor::new(policy, refusal_grace)`, `supervisor.after(outcome, now)` (`LinkOutcome`, `LinkDecision`); `close_refuses(code, closed_after_handshake, code_late)`
+- `LinkSupervisor::new(policy, refusal_grace)`, `supervisor.after(outcome, now)` (`LinkOutcome`, `LinkDecision`); `close_refuses(code, closed_after_handshake, code_late)`, `close_refuses_after(code, closed_after_handshake, code_late, after_authenticated_frame)`
 
 ## Development
 
