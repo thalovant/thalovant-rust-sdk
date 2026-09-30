@@ -648,8 +648,28 @@ impl Reply {
         if !self.handled || !self.ok || self.failure_event.is_some() {
             return false;
         }
+        if self.has_asserted_claim() {
+            return true;
+        }
         let stages = self.pipeline_ids();
         stages.is_empty() || stages.iter().any(|stage| !stage.contains("fallback"))
+    }
+    /// Whether the skill's own speak event carries a literal `true` under
+    /// `meta.thalovant_claimed`. Scoped to speak-type events only: a
+    /// correlated event this reply happens to carry (e.g.
+    /// `ovos.utterance.handled`) must never be able to assert a claim on the
+    /// skill's behalf.
+    fn has_asserted_claim(&self) -> bool {
+        self.events.iter().any(|event| {
+            (event.name == crate::EVENT_SPEAK || event.name == crate::EVENT_OVOS_UTTERANCE_SPEAK)
+                && event
+                    .data
+                    .get("meta")
+                    .and_then(Value::as_object)
+                    .and_then(|meta| meta.get(crate::THALOVANT_CLAIMED_META_KEY))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+        })
     }
     fn context_identifiers(&self, key: &str) -> Vec<String> {
         let mut result = Vec::new();

@@ -7,6 +7,11 @@ fn shared_reply_claim_vectors() {
     for row in vectors["cases"].as_array().unwrap() {
         let handled = row["handled"].as_bool().unwrap();
         let failed = row["failed"].as_bool().unwrap();
+        let contexts = row["contexts"].as_array().unwrap();
+        let no_metas = Vec::new();
+        let metas = row["metas"].as_array().unwrap_or(&no_metas);
+        let no_names = Vec::new();
+        let names = row["names"].as_array().unwrap_or(&no_names);
         let reply = Reply {
             dropped_media: 0,
             text: "reply".into(),
@@ -15,17 +20,16 @@ fn shared_reply_claim_vectors() {
             ok: handled && !failed,
             session_id: None,
             request_id: None,
-            events: row["contexts"]
-                .as_array()
-                .unwrap()
+            events: contexts
                 .iter()
-                .map(|context| {
-                    Event::new(
-                        "speak",
-                        Map::new(),
-                        context.as_object().unwrap().clone(),
-                        None,
-                    )
+                .enumerate()
+                .map(|(i, context)| {
+                    let mut data = Map::new();
+                    if let Some(meta) = metas.get(i).and_then(Value::as_object) {
+                        data.insert("meta".into(), Value::Object(meta.clone()));
+                    }
+                    let name = names.get(i).and_then(Value::as_str).unwrap_or("speak");
+                    Event::new(name, data, context.as_object().unwrap().clone(), None)
                 })
                 .collect(),
             failure_event: failed.then(|| Event::new("failure", Map::new(), Map::new(), None)),

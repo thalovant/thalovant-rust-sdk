@@ -1396,3 +1396,16 @@ reply is not claimed. Successful replies without stage stamps retain legacy
 behavior and are claimed. Only nonempty string stamps are used; malformed
 metadata is ignored. Claim status does not authenticate a peer or suppress
 reply text. See the public SDK guide for native member names.
+
+A skill may positively assert that it genuinely answered from the fallback
+tier by putting `{"thalovant_claimed": true}` under its own `speak` event's
+`data.meta` (`THALOVANT_CLAIMED_META_KEY`). `Reply::claimed` checks only the
+skill's own speak-type events (`EVENT_SPEAK`/`EVENT_OVOS_UTTERANCE_SPEAK`) for
+a literal `true` under that key first; only that literal on one of those two
+event names counts, so `false`, a non-boolean value, the key's absence, or
+the same shape on any other collected event (a correlated
+`ovos.utterance.handled`, say) are all inert and fall through to the
+pipeline-tier heuristic above. The check runs after the handled/ok/no-failure
+gate, so it can only turn a would-be `false` into `true`, never rescue a
+failed or unhandled reply. A reply that never sets the key is judged exactly
+as before this addition.

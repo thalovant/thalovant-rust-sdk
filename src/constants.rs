@@ -36,6 +36,11 @@ pub fn is_failure_event(name: &str) -> bool {
 pub const EVENT_FALLBACK_LIST: &str = "ovos.skills.fallback.list";
 pub const EVENT_FALLBACK_LIST_RESPONSE: &str = "ovos.skills.fallback.list.response";
 
+/// Data key under a `speak` event's `meta` object a skill may set to positively
+/// assert that it genuinely answered, overriding the fallback-tier heuristic in
+/// `Reply::claimed`. Only a literal `true` asserts the claim.
+pub const THALOVANT_CLAIMED_META_KEY: &str = "thalovant_claimed";
+
 #[cfg(test)]
 mod tests {
     use super::*;
