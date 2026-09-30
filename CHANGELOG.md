@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.14.2 — 2026-09-30
+
+A skill may positively assert that it genuinely answered from the fallback tier. OVOS's `match_low` band (90-101) holds both a real fallback skill and the fleet's own generic "nothing matched" catch-all, and `Reply::claimed` could not tell them apart by pipeline id alone, so a satellite listening without a wake word read a genuine fallback answer as room noise and stayed silent. Takes the Python reference's `claim091/reply-claimed-meta-signal` round.
+
+- `THALOVANT_CLAIMED_META_KEY` (`"thalovant_claimed"`) is a data key a skill's own `speak` event may carry under `data.meta`, alongside the `skill_id` `thalovant-skillkit`'s `speak_to`/`emit_speech` already put there. `Reply::claimed` now checks every event for a literal `true` under that key before falling back to its existing pipeline-tier heuristic; only that literal counts, so `false`, a string, a number or the key's absence are all inert. The check runs after the existing `handled`/`ok`/no-failure gate, so it can only turn a would-be `false` into `true`, never a failed or unhandled reply into a claimed one. A reply that never sets the key is judged exactly as before — the fleet's real generic catch-all skill still comes back `claimed: false`.
+- Re-vendors `reply-claim-vectors.json` (23 cases, up from 14): the new cases cover an asserted claim on a fallback reply, the unasserted generic-catch-all shape unaffected, `false`/non-bool assertions as no-ops, an assertion on a later event still counting, an assertion unable to rescue a failed reply, and an assertion on a non-fallback reply as a no-op. Every pre-existing case's `contexts`/`expected` fields are unchanged.
+
 ## 0.14.0 — 2026-09-28
 
 The Python reference's 0.9.1 round: sign in as a registered app, read a code before approving it, tell a hub that refused this client's own key from any other refusal, and keep an identity file's key beside it. Everything is additive. No public function changed its signature, no public struct gained a field, and no error that existed changed its variant: a hub that refuses this client's key is still the `ThalovantError::Connection` refusal it was, with a new classifier to tell it apart.
