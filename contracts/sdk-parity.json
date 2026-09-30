@@ -20,7 +20,7 @@
     },
     "binary": {
       "implementation": {
-        "src/events.rs": "f1c4a9946c7a4b0639141700ffc7918d96ec95b743d78ae7f1a596dc42406d01",
+        "src/events.rs": "b63546b48589e443babbb3c3d8f43695eaf3af270af83c99f391b858d04d9feb",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
         "src/transport.rs": "d75af98862231ea0b722641469d2fa678682c74b4d6ad5ddb07b6d159704a7f2",
         "src/wire.rs": "c18fd8b24d5034ce3f2d324d232227373e85622251478e1d4c65352e78da43e0"
@@ -90,7 +90,7 @@
     "conversation": {
       "implementation": {
         "src/client.rs": "9c4301a85d3da99c81f165ec95f12042abdddb0f51e7ecfe6fdea4a73d7cfb23",
-        "src/events.rs": "f1c4a9946c7a4b0639141700ffc7918d96ec95b743d78ae7f1a596dc42406d01"
+        "src/events.rs": "b63546b48589e443babbb3c3d8f43695eaf3af270af83c99f391b858d04d9feb"
       },
       "reason": "carry_conversation and the client's per-session memory, run against the shared conversation vectors.",
       "status": "required",
@@ -122,7 +122,7 @@
     "home-link": {
       "implementation": {
         "src/client.rs": "9c4301a85d3da99c81f165ec95f12042abdddb0f51e7ecfe6fdea4a73d7cfb23",
-        "src/events.rs": "f1c4a9946c7a4b0639141700ffc7918d96ec95b743d78ae7f1a596dc42406d01",
+        "src/events.rs": "b63546b48589e443babbb3c3d8f43695eaf3af270af83c99f391b858d04d9feb",
         "src/home.rs": "eb9221cadbf80a4ee78b451ad14c85cb065f13140f2815ffd86d529f20853750",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d",
         "src/noise.rs": "875e0f096d46b0b62b0ea87a1251a15c84bdcf2b8dc6a4272a404e9b9e771b50",
@@ -209,7 +209,7 @@
     },
     "mesh": {
       "implementation": {
-        "src/events.rs": "f1c4a9946c7a4b0639141700ffc7918d96ec95b743d78ae7f1a596dc42406d01",
+        "src/events.rs": "b63546b48589e443babbb3c3d8f43695eaf3af270af83c99f391b858d04d9feb",
         "src/hive.rs": "706f82912de911a15e721a9179cdf412becde6071cd81995be41e64473b25a56",
         "src/transport.rs": "d75af98862231ea0b722641469d2fa678682c74b4d6ad5ddb07b6d159704a7f2"
       },
@@ -241,18 +241,18 @@
     },
     "runtime": {
       "implementation": {
-        "src/events.rs": "f1c4a9946c7a4b0639141700ffc7918d96ec95b743d78ae7f1a596dc42406d01",
+        "src/events.rs": "b63546b48589e443babbb3c3d8f43695eaf3af270af83c99f391b858d04d9feb",
         "src/lib.rs": "cc10c294447c3c094fabc1e7a9fe112a73e8933fb656f083a07a361d95b54e2d",
         "src/transport.rs": "d75af98862231ea0b722641469d2fa678682c74b4d6ad5ddb07b6d159704a7f2"
       },
-      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs. A skill may now positively assert a claim via THALOVANT_CLAIMED_META_KEY (\"thalovant_claimed\") on a speak event's data.meta; Reply::claimed checks every event for a literal true under that key, after the handled/ok/no-failure gate and before the pipeline-tier heuristic, so it can only turn a would-be false into true. Anything but a literal true is inert, and a reply that never sets the key is judged exactly as before.",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. HiveMind #251/#252 only changes the Python upstream client dispatcher; this consumer uses native single-dispatch transports (MCP delegates to the Node SDK), or caller-owned frame parsing in embedded C. No Python HiveMind bus dependency or slave-protocol reinjection exists here. Python now requires fixed upstream 1.1.9a1 and removes its identity-based suppression; equal independent native frames remain distinct. Reply claim metadata follows the Python string-ID contract, with first-seen ordering, case-sensitive fallback stages and legacy unstamped success. Invalid non-string stamps are ignored. Embedded C exposes bounded extraction and claim classification while its caller retains ordered IDs. A skill may now positively assert a claim via THALOVANT_CLAIMED_META_KEY (\"thalovant_claimed\") on its own speak event's data.meta; Reply::claimed checks only EVENT_SPEAK/EVENT_OVOS_UTTERANCE_SPEAK events for a literal true under that key, after the handled/ok/no-failure gate and before the pipeline-tier heuristic, so it can only turn a would-be false into true. A correlated non-speak event (e.g. ovos.utterance.handled) carrying the same meta shape is never scanned and cannot assert a claim. Anything but a literal true on a speak event is inert, and a reply that never sets the key is judged exactly as before.",
       "status": "required",
       "tests": {
         "src/client.rs": "9c4301a85d3da99c81f165ec95f12042abdddb0f51e7ecfe6fdea4a73d7cfb23",
         "src/transport_noise_tests.rs": "cf3cc1f38ce4d424d5170bb4214e986e4e900db675ecf2e87c067131ef42c335",
-        "tests/data/reply-claim-vectors.json": "1cbc462004555e6af183b365150fb32bf6e92052f5c053dd29be7d50e160a754",
+        "tests/data/reply-claim-vectors.json": "303bc10666baafbc85e67d7a9dcd6e0fbb16a99e539aed6d829fb0f4744c96b8",
         "tests/noise_interop.rs": "597a35f8da9564381c216fa638dc59cf408512ee82543b987dfd944add9267c8",
-        "tests/reply_claims.rs": "4ec7d9800eaa4f4119924dc8ce195feaf25713ce1994ed11fbdb421087fa7254"
+        "tests/reply_claims.rs": "964ba8a3892a7d8fd4d0fd1a3d3490bd5e8a384e3191b5c3d497b67895017670"
       },
       "vectors": {
         "reply-claim-vectors.json": "tests/data/reply-claim-vectors.json"
@@ -284,7 +284,8 @@
     "2460eb90bd56b1b182be3db365ba29bfef712d4ea2748061652ba0f28dcf6f50",
     "d33dc2be8b0074be4e16d89a4b615f0e6bc32d99fb513cb75e20c09cd0fab4b6",
     "3b0acf7c8b2f03bec95d9e9bba4f82e88c79ad3d98590988852e6c06deb48af0",
-    "50d65c1596a99e5db78c38c0898ca01bfbb105da305e9804f394f08756af7f50"
+    "50d65c1596a99e5db78c38c0898ca01bfbb105da305e9804f394f08756af7f50",
+    "841f3bbeec23f04c5decae75c9cfd6ea6a397992c7e4d7cd4195dc9dd919cd1a"
   ],
   "schema_version": 1
 }
