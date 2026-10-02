@@ -50,7 +50,7 @@ jobs:
           import re
           import subprocess
 
-          relevant_paths = ("src", "Cargo.toml", "README.md", "LICENSE")
+          relevant_paths = ("src", "Cargo.toml", "LICENSE")
 
           def git(*args: str, check: bool = True) -> str:
               result = subprocess.run(
