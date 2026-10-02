@@ -60,6 +60,11 @@ async fn main() -> thalovant::Result<()> {
 
 `ControlPlane::default()` uses `https://api.thalovant.com`.
 
+Keep `result.identity` secret: it holds the client credentials the hub uses.
+`result.as_value(true)` embeds the real credentials and the raw `hub` and
+`client` bodies, so never log it or write it anywhere world-readable. For
+diagnostics use `result.as_value(false)`, which redacts them.
+
 ## Documentation
 
 The full guide is at <https://docs.thalovant.com/developers/sdks/rust/>. Topics are covered there and on related pages.
@@ -97,7 +102,7 @@ cargo test --all-features
 
 ## Security
 
-See the [security policy](https://github.com/thalovant/.github/blob/main/SECURITY.md).
+See the [security policy](SECURITY.md).
 
 ## Licence
 
