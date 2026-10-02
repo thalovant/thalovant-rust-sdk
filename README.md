@@ -1,5 +1,7 @@
 # Thalovant Rust SDK
 
+[![crates.io](https://img.shields.io/crates/v/thalovant)](https://crates.io/crates/thalovant) [![CI](https://github.com/thalovant/thalovant-rust-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/thalovant/thalovant-rust-sdk/actions/workflows/ci.yml) [![Licence](https://img.shields.io/github/license/thalovant/thalovant-rust-sdk)](LICENSE) [![Docs](https://img.shields.io/badge/docs-docs.thalovant.com-5c6bc0)](https://docs.thalovant.com/developers/sdks/rust/)
+
 Rust SDK for connecting services, CLIs, devices, and agents to Thalovant hubs.
 
 The control API is used to discover hubs and provision a client identity. After
