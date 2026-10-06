@@ -311,13 +311,29 @@ impl Identity {
         )
     }
 
+    /// The public data-plane endpoint for a protocol, when known.
+    ///
+    /// An identity with no explicit WSS endpoint whose `default_master` is
+    /// itself a `wss://` or `ws://` URL (any case) uses it for WSS. The API's
+    /// identify payload, which a setup-link claim writes to the identity file
+    /// as it is, used to carry only `default_master`; reading no WSS endpoint
+    /// from it put every such client on HTTPS polling. An explicit endpoint
+    /// still wins, an `https://` master still gives none, and the master is
+    /// never an MQTT endpoint. Whether WSS is used at all is still
+    /// [`Identity::supports_protocol`]'s call, so a hub that disables it keeps
+    /// HTTPS. The Python reference, Node, Kotlin, .NET and Swift read it the
+    /// same way.
     pub fn endpoint_for(&self, protocol: HubProtocol) -> Option<String> {
         if protocol == HubProtocol::Https {
             return Some(self.base_url());
         }
-        self.data_plane_endpoints
-            .endpoint_for(protocol)
-            .map(str::to_string)
+        if let Some(endpoint) = self.data_plane_endpoints.endpoint_for(protocol) {
+            return Some(endpoint.to_string());
+        }
+        if protocol == HubProtocol::Wss && is_websocket_url(&self.default_master) {
+            return Some(self.default_master.clone());
+        }
+        None
     }
 
     pub fn enabled_protocols(&self) -> Vec<HubProtocol> {
@@ -327,6 +343,11 @@ impl Identity {
     pub fn supports_protocol(&self, protocol: HubProtocol) -> bool {
         self.protocols.is_enabled(protocol)
     }
+}
+
+fn is_websocket_url(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    lowered.starts_with("wss://") || lowered.starts_with("ws://")
 }
 
 impl fmt::Debug for Identity {
@@ -832,6 +853,89 @@ profiles:
         }))
         .unwrap();
 
+        let auto_client = Client::auto(identity).unwrap();
+        assert!(matches!(auto_client.transport, RuntimeTransport::Http(_)));
+    }
+
+    /// What the API's identify payload carried, and what a setup-link claim
+    /// writes to the identity file unchanged: the master URL and no
+    /// data-plane endpoints.
+    fn setup_link_identity(overrides: Value) -> Identity {
+        let mut values = json!({
+            "access_key": "client-access-key",
+            "password": "client-password",
+            "site_id": "stronghold",
+            "default_master": "wss://daily-desk.thalovant.io",
+            "default_port": 443
+        });
+        if let (Some(values), Some(overrides)) = (values.as_object_mut(), overrides.as_object()) {
+            for (key, value) in overrides {
+                values.insert(key.clone(), value.clone());
+            }
+        }
+        Identity::from_value(values).unwrap()
+    }
+
+    #[test]
+    fn a_wss_master_is_the_wss_endpoint_when_none_is_given() {
+        let identity = setup_link_identity(json!({}));
+        assert_eq!(
+            identity.endpoint_for(HubProtocol::Wss).as_deref(),
+            Some("wss://daily-desk.thalovant.io")
+        );
+        assert_eq!(
+            identity.endpoint_for(HubProtocol::Https).as_deref(),
+            Some("https://daily-desk.thalovant.io")
+        );
+    }
+
+    #[test]
+    fn a_ws_master_is_read_whatever_its_case() {
+        let identity = setup_link_identity(json!({"default_master": "WS://hub.local"}));
+        assert_eq!(
+            identity.endpoint_for(HubProtocol::Wss).as_deref(),
+            Some("WS://hub.local")
+        );
+    }
+
+    #[test]
+    fn an_explicit_wss_endpoint_still_wins_over_the_master() {
+        let identity = setup_link_identity(json!({
+            "data_plane_endpoints": {"wss": "wss://socket.example.com/hivemind/public"}
+        }));
+        assert_eq!(
+            identity.endpoint_for(HubProtocol::Wss).as_deref(),
+            Some("wss://socket.example.com/hivemind/public")
+        );
+    }
+
+    #[test]
+    fn an_http_master_gives_no_wss_endpoint() {
+        for master in ["https://daily-desk.thalovant.io", "http://hub.local"] {
+            let identity = setup_link_identity(json!({"default_master": master}));
+            assert_eq!(identity.endpoint_for(HubProtocol::Wss), None, "{master}");
+        }
+    }
+
+    #[test]
+    fn the_master_is_not_an_mqtt_endpoint() {
+        let identity = setup_link_identity(json!({}));
+        assert_eq!(identity.endpoint_for(HubProtocol::Mqtt), None);
+    }
+
+    #[test]
+    fn client_uses_wss_for_an_identity_from_a_setup_link() {
+        // Reading no WSS endpoint from a setup-link identity put a desktop
+        // satellite on HTTPS polling while its hub served WebSocket.
+        let auto_client = Client::auto(setup_link_identity(json!({}))).unwrap();
+        assert!(matches!(auto_client.transport, RuntimeTransport::Wss(_)));
+    }
+
+    #[test]
+    fn client_keeps_https_when_the_hub_disables_wss() {
+        let identity = setup_link_identity(json!({
+            "protocols": {"wss": {"enabled": false}, "http": {"enabled": true}}
+        }));
         let auto_client = Client::auto(identity).unwrap();
         assert!(matches!(auto_client.transport, RuntimeTransport::Http(_)));
     }

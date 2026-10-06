@@ -154,10 +154,10 @@
         "src/protocols.rs": "a42115fd0de0dc49c4cee86872130f5ee3ab510ebc4b10d33adff4dcbd978905",
         "src/transport.rs": "d75af98862231ea0b722641469d2fa678682c74b4d6ad5ddb07b6d159704a7f2"
       },
-      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The key-folder rule: Client::from_file, from_config_file and from_config call RuntimeTransport::use_identity_file (src/transport.rs), which keeps noise_key and noise_pins.json in the identity file's own folder unless a folder is named -- the default folder is the config file's, so ~/.config/thalovant/identity.json changes nothing -- and falls back to the default for a folder it cannot write; the first handshake from that folder copies (never moves) the key and the pin file from the default folder when a pin there is filed under this hub's node id (adopt_legacy_key in src/noise_store.rs). Identity keeps its public fields. src/transport_noise_tests.rs holds the folder choice, the copy (once, only for a key that met this hub, 0600, the old folder untouched) and a real handshake that connects over KK with the copied key; the paths are platform paths, so there is no vector.",
+      "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The key-folder rule: Client::from_file, from_config_file and from_config call RuntimeTransport::use_identity_file (src/transport.rs), which keeps noise_key and noise_pins.json in the identity file's own folder unless a folder is named -- the default folder is the config file's, so ~/.config/thalovant/identity.json changes nothing -- and falls back to the default for a folder it cannot write; the first handshake from that folder copies (never moves) the key and the pin file from the default folder when a pin there is filed under this hub's node id (adopt_legacy_key in src/noise_store.rs). Identity keeps its public fields. src/transport_noise_tests.rs holds the folder choice, the copy (once, only for a key that met this hub, 0600, the old folder untouched) and a real handshake that connects over KK with the copied key; the paths are platform paths, so there is no vector. 0.9.5 reference: Identity::endpoint_for(HubProtocol::Wss) falls back to a wss:// or ws:// default_master (any case) when the identity names no WSS endpoint, as a setup-link identity did; an explicit endpoint wins, an http(s) master gives none, the master is never MQTT, and a hub with protocols.wss disabled keeps HTTPS (src/identity.rs unit tests).",
       "status": "required",
       "tests": {
-        "src/identity.rs": "7eeef6822788b239aafda4f682fac2ceae686cc3e27529385cac80d654d91f63",
+        "src/identity.rs": "853c6fcd5165550d3a573c0322d600011cfeba382107b0a627b0133a22fb4fd2",
         "src/transport_noise_tests.rs": "cf3cc1f38ce4d424d5170bb4214e986e4e900db675ecf2e87c067131ef42c335"
       }
     },
@@ -285,7 +285,8 @@
     "d33dc2be8b0074be4e16d89a4b615f0e6bc32d99fb513cb75e20c09cd0fab4b6",
     "3b0acf7c8b2f03bec95d9e9bba4f82e88c79ad3d98590988852e6c06deb48af0",
     "50d65c1596a99e5db78c38c0898ca01bfbb105da305e9804f394f08756af7f50",
-    "841f3bbeec23f04c5decae75c9cfd6ea6a397992c7e4d7cd4195dc9dd919cd1a"
+    "841f3bbeec23f04c5decae75c9cfd6ea6a397992c7e4d7cd4195dc9dd919cd1a",
+    "3f37b7453397f577a1db5cf2db7f709ffa4b09194869e07970d0881239b7a218"
   ],
   "schema_version": 1
 }
