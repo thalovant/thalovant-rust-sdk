@@ -36,7 +36,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: "1.88.0"
+      # No Cargo.lock is committed, so this job resolves dependencies fresh.
+      # Without MSRV-aware resolution it takes the newest release of each,
+      # and one that raises its own rust-version past ours (uuid 1.27.0 needs
+      # 1.89) fails the job without any change here. "fallback" picks the
+      # newest version that still supports `rust-version`, which is what a
+      # 1.88 user's Cargo resolves too.
       - run: cargo test --all-targets --all-features -- --test-threads=2
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
 
   security:
     name: RustSec dependency audit
