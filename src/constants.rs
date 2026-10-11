@@ -32,9 +32,18 @@ pub fn is_failure_event(name: &str) -> bool {
     )
 }
 
-/// Optional OVOS fallback skill discovery.
+/// The fallback skill list ovos-core added in #951 and took out again in #988
+/// the same day. No runtime answers it, so nothing in this crate sends it
+/// any more; the names stay so that code importing them keeps compiling.
+/// Fallbacks are read from [`EVENT_SKILLS_LIST`].
 pub const EVENT_FALLBACK_LIST: &str = "ovos.skills.fallback.list";
 pub const EVENT_FALLBACK_LIST_RESPONSE: &str = "ovos.skills.fallback.list.response";
+/// Every skill the runtime loaded and what it declared it can do
+/// (OVOS-INTENT-4 section 10.3): `{"ok", "skills": [{skill_id, session_id,
+/// capabilities, intents}]}`. A skill whose capabilities include `fallback`
+/// is offered whatever nothing else matched.
+pub const EVENT_SKILLS_LIST: &str = "ovos.skills.list";
+pub const EVENT_SKILLS_LIST_RESPONSE: &str = "ovos.skills.list.response";
 
 /// Data key under a `speak` event's `meta` object a skill may set to positively
 /// assert that it genuinely answered, overriding the fallback-tier heuristic in
