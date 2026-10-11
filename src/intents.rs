@@ -24,6 +24,20 @@
 //!   answer -- the hub does not know that registration -- and leaves the
 //!   intent without sentences rather than failing.
 //!
+//! The listing without `lang` answers every language the hub loaded, which is
+//! how a client learns them: a hub speaks the languages in its `lang` and
+//! `secondary_langs` and lists nothing under any other tag, while it still
+//! answers a person asking in one (in its own language). The inventory then
+//! lists in the hub's language closest to the one asked and says so in
+//! [`HubIntentInventory::listed_in`].
+//!
+//! A third query names the skills nothing in the manifest can show:
+//!
+//! - `ovos.skills.list` `{}` -> `ovos.skills.list.response` `{"ok",
+//!   "skills": [{skill_id, session_id, capabilities, intents}]}` (section
+//!   10.3). A skill declaring the `fallback` capability is offered whatever
+//!   nothing else matched, and registers no sentence to show for it.
+//!
 //! A hub whose connection may not publish a type answers `hive.policy.denied`
 //! naming it; that becomes [`ThalovantError::PolicyDenied`] at once rather
 //! than a timeout. The engines' own manifests (`intent.service.adapt.manifest.get`
@@ -37,10 +51,10 @@
 
 use crate::{
     constants::{
-        EVENT_ADAPT_MANIFEST, EVENT_ADAPT_MANIFEST_GET, EVENT_FALLBACK_LIST,
-        EVENT_FALLBACK_LIST_RESPONSE, EVENT_INTENT_DESCRIBE, EVENT_INTENT_DESCRIBE_RESPONSE,
-        EVENT_INTENT_LIST, EVENT_INTENT_LIST_RESPONSE, EVENT_PADATIOUS_MANIFEST,
-        EVENT_PADATIOUS_MANIFEST_GET, EVENT_POLICY_DENIED,
+        EVENT_ADAPT_MANIFEST, EVENT_ADAPT_MANIFEST_GET, EVENT_INTENT_DESCRIBE,
+        EVENT_INTENT_DESCRIBE_RESPONSE, EVENT_INTENT_LIST, EVENT_INTENT_LIST_RESPONSE,
+        EVENT_PADATIOUS_MANIFEST, EVENT_PADATIOUS_MANIFEST_GET, EVENT_POLICY_DENIED,
+        EVENT_SKILLS_LIST, EVENT_SKILLS_LIST_RESPONSE,
     },
     errors::{Result, ThalovantError},
     events::{
@@ -100,6 +114,14 @@ pub struct IntentInventoryOptions {
     /// The usual form's listing is taken when it has a template row, or when
     /// the first was empty. The usual form is the crate's private
     /// `language_matching::usual_form`.
+    ///
+    /// When neither has a template row, the hub did not load that language,
+    /// and `ovos.intent.list` is asked once more without a `lang`, once per
+    /// inventory call: the hub's own languages, in which it answers a person
+    /// speaking any other. The language is chosen by
+    /// [`nearest_hub_language`] and recorded in
+    /// [`HubIntentInventory::listed_in`]. A hub that cannot answer that
+    /// listing leaves the result as it was.
     pub nearest: bool,
 }
 
@@ -432,10 +454,17 @@ pub struct HubIntentInventory {
     /// Legacy name: queries unavailable through denial or silence, not proof of an ACL denial.
     pub denied: Vec<String>,
     /// The tag the hub actually listed each requested language under, in
-    /// `languages` order. Equal to `languages` unless a listing came back
-    /// with no sentences (empty, or keyword rows only) and the language's
-    /// usual form answered instead, which is the only way the two differ. Callers rendering sentences must read them
-    /// from the tag that answered.
+    /// `languages` order. Equal to `languages` unless the listing in that
+    /// language had no sentences (empty, or keyword rows only) and another
+    /// answered instead: the language's usual form (`en-CA` -> `en-us`), or
+    /// else one of the languages the hub loaded -- the same language in
+    /// another region first, then the hub's own -- because a hub lists
+    /// nothing under a language it did not load and still answers a person
+    /// speaking it. A caller showing these sentences should say which
+    /// language they are in when this differs from what was asked in a way
+    /// the person would notice. Callers rendering sentences must read them
+    /// from the tag that answered. Two languages that land on the same
+    /// listing share one tag, spelt as first listed.
     pub listed_in: Vec<String>,
 }
 
@@ -464,6 +493,7 @@ impl HubIntentInventory {
             "source": self.source.as_str(),
             "denied": self.denied,
             "skills": self.skills.iter().map(HubSkillIntents::as_value).collect::<Vec<_>>(),
+            "listed_in": self.listed_in,
         })
     }
 }
@@ -474,11 +504,23 @@ impl Serialize for HubIntentInventory {
     }
 }
 
-/// A skill that may answer after the ordinary intent engines do not match.
+/// A skill that answers whatever nothing else matched.
+///
+/// It has no sentences to publish for that -- being offered everything is
+/// what a fallback is -- so a caller can learn that it exists and nothing
+/// more. That is still the difference between "no skill handles this" and
+/// "something will try".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct HubFallback {
     pub skill_id: String,
-    pub priority: i64,
+    /// Always `None`: no runtime serves one. The hub's own list of skills
+    /// (`ovos.skills.list`) says which skills declared the fallback
+    /// capability and not in what order they are tried, and the query that
+    /// would have carried the order (`ovos.skills.fallback.list`, ovos-core
+    /// #951) was reverted the same day it landed. A number here would be
+    /// invented, so there is none; the list is in skill id order and says
+    /// nothing about who goes first. Serialised as `null`.
+    pub priority: Option<i64>,
 }
 
 /// An intent inventory with separately discovered fallback capabilities.
@@ -518,7 +560,17 @@ impl Serialize for HubIntentCapabilities {
 }
 
 /// Optional fallback discovery has its own small budget after the inventory.
+///
+/// A runtime without `ovos.skills.list` never replies, and this runs on every
+/// capabilities call. A hub that has the handler answers from memory, and a
+/// connection not allowed to ask is refused at once, so a short window is
+/// enough for a real answer while an unsupporting hub costs a fraction of the
+/// budget.
 pub const FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// The capability a skill announces in `ovos.skills.list` when it takes what
+/// nothing else matched.
+pub const FALLBACK_CAPABILITY: &str = "fallback";
 
 pub(crate) async fn inventory_with_capabilities<L, I, S>(
     link: &L,
@@ -543,16 +595,22 @@ where
     })
 }
 
+/// Which skills answer whatever nothing else matched, or `None` if unknowable.
+///
+/// Read from `ovos.skills.list`: every skill the hub loaded, with the
+/// capabilities it declared. `None` means the hub could not say -- a timeout,
+/// a denial, `ok: false`, or `skills` not being a list -- and an empty list
+/// means it said there are none.
 pub(crate) async fn list_fallbacks<L: HubLink>(
     link: &L,
     deadline: Duration,
 ) -> Result<Option<Vec<HubFallback>>> {
     let event = match request_reply(
         link,
-        EVENT_FALLBACK_LIST,
-        EVENT_FALLBACK_LIST_RESPONSE,
+        EVENT_SKILLS_LIST,
+        EVENT_SKILLS_LIST_RESPONSE,
         Data::new(),
-        DEFAULT_LANG,
+        None,
         deadline,
     )
     .await
@@ -564,40 +622,46 @@ pub(crate) async fn list_fallbacks<L: HubLink>(
     if event.data.get("ok") == Some(&Value::Bool(false)) {
         return Ok(None);
     }
-    let Some(rows) = event.data.get("fallbacks").and_then(Value::as_array) else {
+    let Some(rows) = event.data.get("skills").and_then(Value::as_array) else {
         return Ok(None);
     };
-    let mut fallbacks: Vec<_> = rows
+    Ok(Some(fallbacks_from_skills(rows)))
+}
+
+/// The fallback skills in an `ovos.skills.list` answer, in skill id order.
+///
+/// Only the hub's own skills: a row in another session (`default` is where
+/// the runtime loads every installed skill) is somebody else's, and a row
+/// with no session is taken as the hub's, which is what the runtime means by
+/// leaving it out. A malformed row is skipped and the rest kept.
+fn fallbacks_from_skills(rows: &[Value]) -> Vec<HubFallback> {
+    let found: BTreeSet<String> = rows
         .iter()
         .filter_map(|row| {
             let row = row.as_object()?;
-            let skill_id = string_field(row, "skill_id");
+            let skill_id = row.get("skill_id")?.as_str()?.trim();
             if skill_id.is_empty() {
                 return None;
             }
-            let priority = match row.get("priority") {
-                Some(Value::Bool(value)) => i64::from(*value),
-                Some(Value::Number(value)) => match value.as_i64() {
-                    Some(value) => value,
-                    None => {
-                        let value = value.as_f64()?;
-                        // Skip ranks that cannot be represented instead of
-                        // silently saturating and changing handler order.
-                        if !value.is_finite()
-                            || !(-9223372036854775808.0..9223372036854775808.0).contains(&value)
-                        {
-                            return None;
-                        }
-                        value as i64
-                    }
-                },
-                _ => 0,
-            };
-            Some(HubFallback { skill_id, priority })
+            match row.get("session_id") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(session)) if session.is_empty() || session == "default" => {}
+                Some(_) => return None,
+            }
+            row.get("capabilities")?
+                .as_array()?
+                .iter()
+                .any(|capability| capability.as_str() == Some(FALLBACK_CAPABILITY))
+                .then(|| skill_id.to_string())
         })
         .collect();
-    fallbacks.sort_by(|a, b| (a.priority, &a.skill_id).cmp(&(b.priority, &b.skill_id)));
-    Ok(Some(fallbacks))
+    found
+        .into_iter()
+        .map(|skill_id| HubFallback {
+            skill_id,
+            priority: None,
+        })
+        .collect()
 }
 
 fn string_field(map: &Map<String, Value>, key: &str) -> String {
@@ -676,14 +740,18 @@ fn denied_type_of(event: &Event) -> Option<&str> {
     event.data.get("denied_type").and_then(Value::as_str)
 }
 
-fn query_context<L: HubLink>(link: &L, lang: &str, request_id: &str) -> Context {
+/// A query's context; `None` leaves the language out entirely, for a query
+/// that names none (the hub then answers in a session of its own language).
+fn query_context<L: HubLink>(link: &L, lang: Option<&str>, request_id: &str) -> Context {
     let mut base = Context::new();
-    base.insert("lang".to_string(), Value::String(lang.to_string()));
+    if let Some(lang) = lang {
+        base.insert("lang".to_string(), Value::String(lang.to_string()));
+    }
     context_with_correlation(
         Some(&base),
         None,
         link.site_id().as_deref(),
-        Some(lang),
+        lang,
         Some(request_id),
     )
 }
@@ -741,7 +809,7 @@ async fn request_reply<L: HubLink>(
     query_type: &str,
     reply_type: &str,
     data: Data,
-    lang: &str,
+    lang: Option<&str>,
     deadline: Duration,
 ) -> Result<Event> {
     let request_id = new_request_id();
@@ -826,7 +894,7 @@ pub(crate) async fn list_intents<L: HubLink>(
         EVENT_INTENT_LIST,
         EVENT_INTENT_LIST_RESPONSE,
         data,
-        lang,
+        Some(lang),
         opts.timeout.unwrap_or(DEFAULT_INTENT_TIMEOUT),
     )
     .await?;
@@ -865,7 +933,7 @@ pub(crate) async fn describe_intent<L: HubLink>(
         EVENT_INTENT_DESCRIBE,
         EVENT_INTENT_DESCRIBE_RESPONSE,
         describe_payload(skill_id, intent_name, lang),
-        lang,
+        Some(lang),
         deadline,
     )
     .await?;
@@ -956,7 +1024,7 @@ async fn describe_one_batch<L: HubLink>(
             link.emit_bus(
                 EVENT_INTENT_DESCRIBE,
                 describe_payload(skill_id, intent_name, lang),
-                query_context(link, lang, &request_id),
+                query_context(link, Some(lang), &request_id),
             ),
         )
         .await
@@ -1036,7 +1104,7 @@ pub(crate) async fn intent_names<L: HubLink>(
     ] {
         let mut data = Data::new();
         data.insert("lang".to_string(), Value::String(lang.to_string()));
-        let event = request_reply(link, query_type, reply_type, data, lang, deadline).await?;
+        let event = request_reply(link, query_type, reply_type, data, Some(lang), deadline).await?;
         let listed: Vec<String> = event
             .data
             .get("intents")
@@ -1105,6 +1173,136 @@ fn inventory_from_names(
 fn can_carry_sentences(rows: &[IntentRegistration]) -> bool {
     rows.iter()
         .any(|row| row.enabled && row.method == "template")
+}
+
+fn sentence_rows(rows: &[IntentRegistration]) -> usize {
+    rows.iter()
+        .filter(|row| row.enabled && row.method == "template")
+        .count()
+}
+
+/// The hub's whole manifest, by the language each row was registered in.
+///
+/// `by_lang` keeps the hub's own spelling and the order it listed them in.
+/// `session_lang` is the language the hub stamped on its reply's session: a
+/// request that names no language is answered in a session the hub opened in
+/// its default language, which is the nearest thing to "the hub's own
+/// language" the bus offers. It is a hint, not a promise -- a hub may keep a
+/// session's language from an earlier exchange -- so it only ever breaks a
+/// choice between languages the hub actually listed.
+struct HubLanguages {
+    by_lang: Vec<(String, Vec<IntentRegistration>)>,
+    session_lang: Option<String>,
+}
+
+/// `ovos.intent.list` with no `lang`: every language the hub loaded.
+///
+/// `None` when the hub refused, failed or did not answer: this is only ever
+/// asked to improve an answer, and an answer it cannot improve stands.
+async fn list_hub_languages<L: HubLink>(
+    link: &L,
+    deadline: Duration,
+    include_definitions: bool,
+) -> Result<Option<HubLanguages>> {
+    let mut data = Data::new();
+    if include_definitions {
+        data.insert("include_definitions".to_string(), Value::Bool(true));
+    }
+    let event = match request_reply(
+        link,
+        EVENT_INTENT_LIST,
+        EVENT_INTENT_LIST_RESPONSE,
+        data,
+        None,
+        deadline,
+    )
+    .await
+    {
+        Ok(event) => event,
+        Err(
+            ThalovantError::Timeout(_)
+            | ThalovantError::Runtime(_)
+            | ThalovantError::PolicyDenied { .. }
+            | ThalovantError::Unanswered { .. },
+        ) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if matches!(event.data.get("ok"), Some(Value::Bool(false))) {
+        return Ok(None);
+    }
+    let mut by_lang: Vec<(String, Vec<IntentRegistration>)> = Vec::new();
+    for row in registrations_of(&event) {
+        if row.lang.is_empty() {
+            continue;
+        }
+        match by_lang
+            .iter_mut()
+            .find(|(seen, _)| same_language(seen, &row.lang))
+        {
+            Some((_, rows)) => rows.push(row),
+            None => by_lang.push((row.lang.clone(), vec![row])),
+        }
+    }
+    let session_lang = event
+        .context
+        .get("session")
+        .and_then(Value::as_object)
+        .and_then(|session| session.get("lang"))
+        .and_then(Value::as_str)
+        .filter(|lang| !lang.trim().is_empty())
+        .map(str::to_string);
+    Ok(Some(HubLanguages {
+        by_lang,
+        session_lang,
+    }))
+}
+
+/// Which of the hub's languages to list in, for a person who asked in `asked`.
+///
+/// `listed` is the hub's manifest by language, in the order the hub listed
+/// them. Only a language with a sentence to show (an enabled `template` row)
+/// is a candidate. The same language first, by the matcher the rest of OVOS
+/// uses (`en-CA` takes `en-GB`, `de-AT` takes `de-DE`); then the hub's own
+/// language, `hub_lang`, when the hub listed it; then the language with the
+/// most sentences, the first listed on a tie. `None` when no language the hub
+/// listed carries a sentence.
+///
+/// The hub does not say which language is its own. A person asking in a
+/// language the hub never loaded is answered all the same -- in the hub's
+/// language, by its fallback or persona -- so the sentences worth showing
+/// them are the ones in that language, and the order above is the closest
+/// this can get to it without inventing a fact.
+pub fn nearest_hub_language<'a>(
+    asked: &str,
+    listed: &'a [(String, Vec<IntentRegistration>)],
+    hub_lang: Option<&str>,
+) -> Option<&'a str> {
+    let candidates: Vec<(&'a str, usize)> = listed
+        .iter()
+        .map(|(tag, rows)| (tag.as_str(), sentence_rows(rows)))
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let tags = || candidates.iter().map(|(tag, _)| *tag);
+    if let Some(found) = crate::language_matching::closest_language(asked, tags()) {
+        return Some(found);
+    }
+    if let Some(own) = hub_lang
+        .filter(|lang| !lang.trim().is_empty())
+        .and_then(|lang| crate::language_matching::closest_language(lang, tags()))
+    {
+        return Some(own);
+    }
+    // The first of the largest: `max_by_key` would keep the last on a tie.
+    let mut best = candidates[0];
+    for candidate in &candidates[1..] {
+        if candidate.1 > best.1 {
+            best = *candidate;
+        }
+    }
+    Some(best.0)
 }
 
 /// One language's listing, and the tag the hub listed it under.
@@ -1187,9 +1385,59 @@ where
     };
 
     let mut listed: Vec<(String, Vec<IntentRegistration>)> = Vec::new();
+    let mut listed_in: Vec<String> = Vec::with_capacity(asked.len());
+    // The hub's own listing, asked at most once per call and only when needed.
+    let mut hub_languages: Option<Option<HubLanguages>> = None;
     for lang in &asked {
         match listing(link, lang, &list_opts, opts.nearest).await {
-            Ok(answered) => listed.push(answered),
+            Ok((mut tag, mut rows)) => {
+                if opts.nearest && !can_carry_sentences(&rows) {
+                    // Still nothing a person can say: the hub did not load
+                    // this language. A hub loads its `lang` and
+                    // `secondary_langs` (en-US and fr-FR on most public hubs)
+                    // and lists nothing under any other tag, so a phone set to
+                    // Spanish, Japanese or German was shown an empty list --
+                    // by a hub that answered every one of those people, in its
+                    // own language. Measured on all 13 public hubs on
+                    // 2026-10-11.
+                    //
+                    // The listing without a language names every language the
+                    // hub loaded; list in the closest of them and say so in
+                    // `listed_in`. Taken only when it has sentences, so it
+                    // never replaces names with fewer names. A hub that cannot
+                    // answer it leaves the result exactly as it was.
+                    if hub_languages.is_none() {
+                        hub_languages =
+                            Some(list_hub_languages(link, deadline, opts.describe).await?);
+                    }
+                    if let Some(Some(hub)) = &hub_languages {
+                        if let Some(chosen) =
+                            nearest_hub_language(lang, &hub.by_lang, hub.session_lang.as_deref())
+                        {
+                            if let Some((found, found_rows)) =
+                                hub.by_lang.iter().find(|(seen, _)| seen == chosen)
+                            {
+                                tag = found.clone();
+                                rows = found_rows.clone();
+                            }
+                        }
+                    }
+                }
+                // One key per language: en-us asked and en-US chosen for
+                // another tag are the same listing, and two keys would split
+                // its phrases.
+                match listed
+                    .iter_mut()
+                    .find(|(seen, _)| same_language(seen, &tag))
+                {
+                    Some((seen, seen_rows)) => {
+                        tag = seen.clone();
+                        *seen_rows = rows;
+                    }
+                    None => listed.push((tag.clone(), rows)),
+                }
+                listed_in.push(tag);
+            }
             Err(error) => {
                 let listing_refused = matches!(
                     &error,
@@ -1275,7 +1523,6 @@ where
                 phrases: per_language,
             });
     }
-    let listed_in: Vec<String> = listed.iter().map(|(lang, _)| lang.clone()).collect();
     Ok(HubIntentInventory {
         languages: asked,
         listed_in,
@@ -1300,7 +1547,11 @@ mod tests {
     //! the skill's locale files wrote them, `hive.policy.denied` for a type the
     //! connection may not publish, and every reply delivered twice.
     use super::*;
-    use crate::{client::Client, identity::Identity};
+    use crate::{
+        client::Client,
+        constants::{EVENT_FALLBACK_LIST, EVENT_SKILLS_LIST},
+        identity::Identity,
+    };
     use std::sync::Mutex;
 
     const WEATHER: &str = "thalovant-skill-weather.thalovant";
@@ -1384,7 +1635,16 @@ mod tests {
         /// intent_name)`: listed, never described with sentences, exactly as
         /// ovos-core lists an IntentBuilder intent.
         keywords: Vec<(&'static str, Vec<(&'static str, &'static str)>)>,
-        fallback_response: Value,
+        /// What `ovos.skills.list` answers; `None` never answers, as a
+        /// runtime without the handler does. `ovos.skills.fallback.list` is
+        /// never answered: ovos-core added it in #951 and took it out again
+        /// in #988.
+        skills_response: Option<Value>,
+        /// The hub's default language, stamped on the session of a reply to
+        /// a listing that named none -- what a live hub does.
+        hub_lang: Option<&'static str>,
+        /// Answer the language-less listing `hive.policy.denied`.
+        deny_hub_listing: bool,
         blocked_send: bool,
         foreign_denial: bool,
         foreign_describes_only: bool,
@@ -1418,7 +1678,9 @@ mod tests {
                 list_silent_in: Vec::new(),
                 list_fails_in: Vec::new(),
                 keywords: Vec::new(),
-                fallback_response: json!({"fallbacks": []}),
+                skills_response: Some(json!({"ok": true, "skills": []})),
+                hub_lang: None,
+                deny_hub_listing: false,
                 blocked_send: false,
                 foreign_denial: false,
                 foreign_describes_only: false,
@@ -1441,7 +1703,7 @@ mod tests {
         fn registered(&self, lang: &str) -> Vec<Registration> {
             self.registrations
                 .iter()
-                .find(|(candidate, _)| *candidate == lang)
+                .find(|(candidate, _)| same_language(candidate, lang))
                 .map(|(_, rows)| rows.clone())
                 .unwrap_or_default()
         }
@@ -1508,7 +1770,7 @@ mod tests {
                 }
             }
             if self.foreign_denial {
-                let foreign = query_context(self, DEFAULT_LANG, "another-request");
+                let foreign = query_context(self, Some(DEFAULT_LANG), "another-request");
                 self.deliver(
                     EVENT_POLICY_DENIED,
                     json!({"denied_type":event_type}),
@@ -1516,7 +1778,7 @@ mod tests {
                 );
             }
             if self.foreign_describes_only && event_type == EVENT_INTENT_DESCRIBE {
-                let foreign = query_context(self, DEFAULT_LANG, "another-request");
+                let foreign = query_context(self, Some(DEFAULT_LANG), "another-request");
                 self.deliver(EVENT_INTENT_DESCRIBE_RESPONSE, json!({"ok":true,"definitions":[{"method":"template","definition":Self::definition(
                     data["lang"].as_str().unwrap(), data["skill_id"].as_str().unwrap(), data["intent_name"].as_str().unwrap(), &["foreign speech".into()])}]}), &foreign);
                 return Ok(());
@@ -1537,17 +1799,28 @@ mod tests {
             if self.silent.contains(&event_type) {
                 return Ok(());
             }
+            if self.deny_hub_listing
+                && event_type == EVENT_INTENT_LIST
+                && !data.contains_key("lang")
+            {
+                self.deliver(
+                    EVENT_POLICY_DENIED,
+                    json!({"denied_type": event_type}),
+                    &context,
+                );
+                return Ok(());
+            }
             let lang = data
                 .get("lang")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
             match event_type {
-                EVENT_FALLBACK_LIST => self.deliver(
-                    EVENT_FALLBACK_LIST_RESPONSE,
-                    self.fallback_response.clone(),
-                    &context,
-                ),
+                EVENT_SKILLS_LIST => {
+                    if let Some(response) = &self.skills_response {
+                        self.deliver(EVENT_SKILLS_LIST_RESPONSE, response.clone(), &context);
+                    }
+                }
                 EVENT_INTENT_LIST => {
                     if self.list_silent_in.contains(&lang.as_str()) {
                         return Ok(());
@@ -1570,6 +1843,54 @@ mod tests {
                     }
                     let attach = self.definitions_in_list
                         && data.get("include_definitions") == Some(&Value::Bool(true));
+                    if !data.contains_key("lang") {
+                        // Every language the hub loaded, in the hub's spelling.
+                        let rows: Vec<Value> = self
+                            .registrations
+                            .iter()
+                            .flat_map(|(tag, per_language)| {
+                                let spelled = match tag.split_once('-') {
+                                    Some((base, region)) => {
+                                        format!("{base}-{}", region.to_uppercase())
+                                    }
+                                    None => tag.to_string(),
+                                };
+                                per_language.iter().map(
+                                    move |((skill_id, intent_name), samples)| {
+                                        let mut row = json!({
+                                            "skill_id": skill_id,
+                                            "intent_name": intent_name,
+                                            "lang": spelled,
+                                            "method": "template",
+                                            "enabled": true,
+                                            "session_id": "default",
+                                        });
+                                        if attach {
+                                            row["definition"] = Self::definition(
+                                                &spelled,
+                                                skill_id,
+                                                intent_name,
+                                                samples,
+                                            );
+                                        }
+                                        row
+                                    },
+                                )
+                            })
+                            .collect();
+                        let mut reply_context = context.clone();
+                        if let (Some(hub_lang), Some(Value::Object(session))) =
+                            (self.hub_lang, reply_context.get_mut("session"))
+                        {
+                            session.insert("lang".to_string(), json!(hub_lang));
+                        }
+                        self.deliver(
+                            EVENT_INTENT_LIST_RESPONSE,
+                            json!({"ok": true, "intents": rows}),
+                            &reply_context,
+                        );
+                        return Ok(());
+                    }
                     let keywords = self
                         .keywords
                         .iter()
@@ -1705,8 +2026,24 @@ mod tests {
     fn listings(hub: &FakeHub) -> Vec<String> {
         hub.emitted(EVENT_INTENT_LIST)
             .iter()
-            .map(|(_, data, _)| data["lang"].as_str().unwrap().to_string())
+            .filter_map(|(_, data, _)| data.get("lang").and_then(Value::as_str))
+            .map(str::to_string)
             .collect()
+    }
+
+    /// How many times the hub's own listing, the one naming no language, was asked.
+    fn hub_listings(hub: &FakeHub) -> usize {
+        hub.emitted(EVENT_INTENT_LIST)
+            .iter()
+            .filter(|(_, data, context)| {
+                !data.contains_key("lang")
+                    && !context.contains_key("lang")
+                    && context
+                        .get("session")
+                        .and_then(|session| session.get("lang"))
+                        .is_none()
+            })
+            .count()
     }
 
     fn names(inventory: &HubIntentInventory) -> Vec<String> {
@@ -1777,8 +2114,17 @@ mod tests {
         for silent in [true, false] {
             let hub = FakeHub {
                 keywords: vec![("en-CA", SCOUT_KEYWORDS.to_vec())],
-                list_silent_in: if silent { vec!["en-us"] } else { Vec::new() },
-                list_fails_in: if silent { Vec::new() } else { vec!["en-us"] },
+                // "" is the hub's own listing, which fails the same way here.
+                list_silent_in: if silent {
+                    vec!["en-us", ""]
+                } else {
+                    Vec::new()
+                },
+                list_fails_in: if silent {
+                    Vec::new()
+                } else {
+                    vec!["en-us", ""]
+                },
                 ..Default::default()
             };
             let inventory = inventory(&hub, ["en-CA"], &options(Some(Duration::from_millis(200))))
@@ -1793,6 +2139,25 @@ mod tests {
                 ["SourceScoutRealPromptIntent", "SourceScoutTopicIntent"]
             );
             assert_eq!(listings(&hub), ["en-CA", "en-us"]);
+            assert_eq!(hub_listings(&hub), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_hubs_own_listing_answers_when_the_usual_form_fails() {
+        for silent in [true, false] {
+            let hub = FakeHub {
+                keywords: vec![("en-CA", SCOUT_KEYWORDS.to_vec())],
+                list_silent_in: if silent { vec!["en-us"] } else { Vec::new() },
+                list_fails_in: if silent { Vec::new() } else { vec!["en-us"] },
+                ..Default::default()
+            };
+            let inventory = inventory(&hub, ["en-CA"], &options(Some(Duration::from_millis(200))))
+                .await
+                .unwrap();
+
+            assert_eq!(inventory.listed_in, ["en-US"]);
+            assert!(inventory.has_phrases());
         }
     }
 
@@ -1826,6 +2191,279 @@ mod tests {
         assert_eq!(listings(&hub), ["en-CA"]);
         assert_eq!(inventory.listed_in, ["en-CA"]);
         assert!(inventory.has_phrases());
+    }
+
+    // A language the hub never loaded ------------------------------------------
+    //
+    // Measured on all 13 public hubs on 2026-10-11: a hub loads its `lang` and
+    // `secondary_langs` (en-US and fr-FR on most) and lists nothing under any
+    // other tag. A phone set to Spanish, Japanese or German asked in its own
+    // language, its usual form, got nothing twice and showed an empty list --
+    // while the hub answered those people in its own language.
+
+    /// The hub's own listing order on Daily Desk and Rewrite Forge: French first.
+    fn french_first() -> Vec<(&'static str, Vec<Registration>)> {
+        ["fr-fr", "en-us"]
+            .into_iter()
+            .map(|lang| (lang, registrations(lang)))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_language_the_hub_never_loaded_is_listed_in_the_hubs_own() {
+        for phone in ["es-ES", "ja-JP", "de-DE"] {
+            let hub = FakeHub {
+                registrations: french_first(),
+                hub_lang: Some("en-US"),
+                ..Default::default()
+            };
+            let inventory = inventory(&hub, [phone], &options(None)).await.unwrap();
+
+            assert_eq!(inventory.languages, [phone]);
+            assert_eq!(
+                inventory.listed_in,
+                ["en-US"],
+                "the language the hub answers that person in"
+            );
+            assert!(inventory.has_phrases());
+            assert_eq!(
+                inventory
+                    .skills
+                    .iter()
+                    .map(|skill| skill.skill_id.as_str())
+                    .collect::<Vec<_>>(),
+                [SHADOW, WEATHER]
+            );
+            let weather = &inventory.skills[1].intents[0];
+            assert_eq!(
+                weather.phrases_for(&inventory.listed_in[0])[0],
+                "what is the weather"
+            );
+            assert_eq!(hub_listings(&hub), 1, "the hub's own listing is asked once");
+        }
+    }
+
+    /// en-CA's usual form is en-us; a hub that loaded en-GB has neither.
+    #[tokio::test]
+    async fn the_same_language_in_another_region_comes_first() {
+        let hub = FakeHub {
+            registrations: vec![
+                ("fr-fr", registrations("fr-fr")),
+                ("en-gb", registrations("en-us")),
+            ],
+            hub_lang: Some("fr-FR"),
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-CA"], &options(None)).await.unwrap();
+
+        assert_eq!(
+            inventory.listed_in,
+            ["en-GB"],
+            "English before the hub's own French"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_session_hint_the_language_with_most_sentences_wins() {
+        let hub = FakeHub {
+            registrations: french_first(),
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["ja-JP"], &options(None)).await.unwrap();
+        assert_eq!(
+            inventory.listed_in,
+            ["en-US"],
+            "two intents in English, one in French"
+        );
+    }
+
+    #[test]
+    fn without_any_hint_a_tie_goes_to_the_first_language_listed() {
+        fn rows(lang: &str, method: &str) -> Vec<IntentRegistration> {
+            vec![IntentRegistration::from_value(&json!({
+                "skill_id": "s", "intent_name": "i", "lang": lang, "method": method,
+            }))
+            .unwrap()]
+        }
+        let listed = vec![
+            ("fr-FR".to_string(), rows("fr-FR", "template")),
+            ("en-US".to_string(), rows("en-US", "template")),
+        ];
+        assert_eq!(nearest_hub_language("ja-JP", &listed, None), Some("fr-FR"));
+        assert_eq!(
+            nearest_hub_language("ja-JP", &listed, Some("en-US")),
+            Some("en-US")
+        );
+        assert_eq!(
+            nearest_hub_language("ja-JP", &listed, Some("ko-KR")),
+            Some("fr-FR"),
+            "a hint the hub never listed is no hint"
+        );
+        assert_eq!(
+            nearest_hub_language("fr-CA", &listed, Some("en-US")),
+            Some("fr-FR")
+        );
+        let keyword_only = vec![("en-US".to_string(), rows("en-US", "keyword"))];
+        assert_eq!(nearest_hub_language("ja-JP", &keyword_only, None), None);
+        let mut disabled = rows("en-US", "template");
+        disabled[0].enabled = false;
+        let disabled = vec![("en-US".to_string(), disabled)];
+        assert_eq!(nearest_hub_language("en-US", &disabled, None), None);
+    }
+
+    #[tokio::test]
+    async fn a_language_the_hub_loaded_never_asks_the_whole_manifest() {
+        let hub = FakeHub {
+            hub_lang: Some("en-US"),
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["fr-fr", "en-us"], &options(None))
+            .await
+            .unwrap();
+
+        assert_eq!(inventory.listed_in, ["fr-fr", "en-us"]);
+        assert_eq!(hub_listings(&hub), 0);
+        assert_eq!(listings(&hub), ["fr-fr", "en-us"]);
+    }
+
+    #[tokio::test]
+    async fn two_languages_that_land_on_the_same_hub_language_share_one_listing() {
+        let hub = FakeHub {
+            hub_lang: Some("en-US"),
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-us", "ja-JP"], &options(None))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            inventory.listed_in,
+            ["en-us", "en-us"],
+            "one key per language, not en-us and en-US"
+        );
+        let weather = inventory
+            .intents()
+            .find(|intent| intent.skill_id == WEATHER)
+            .unwrap();
+        assert_eq!(weather.phrases.keys().collect::<Vec<_>>(), ["en-us"]);
+        assert!(!weather.phrases["en-us"].is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_cannot_list_its_languages_leaves_the_answer_as_it_was() {
+        for failure in ["silent", "refused", "denied"] {
+            let hub = FakeHub {
+                keywords: vec![("ja-JP", SCOUT_KEYWORDS.to_vec())],
+                list_silent_in: if failure == "silent" {
+                    vec![""]
+                } else {
+                    Vec::new()
+                },
+                list_fails_in: if failure == "refused" {
+                    vec![""]
+                } else {
+                    Vec::new()
+                },
+                deny_hub_listing: failure == "denied",
+                ..Default::default()
+            };
+            let inventory = inventory(&hub, ["ja-JP"], &options(Some(Duration::from_millis(200))))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                inventory.source,
+                IntentInventorySource::IntentManifest,
+                "{failure}"
+            );
+            assert!(inventory.denied.is_empty(), "{failure}");
+            assert_eq!(inventory.listed_in, ["ja-JP"], "{failure}");
+            assert_eq!(
+                names(&inventory),
+                ["SourceScoutRealPromptIntent", "SourceScoutTopicIntent"],
+                "{failure}"
+            );
+            assert_eq!(hub_listings(&hub), 1, "{failure}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_hub_stays_empty_rather_than_failing() {
+        let hub = FakeHub {
+            registrations: Vec::new(),
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["ja-JP"], &options(None)).await.unwrap();
+        assert!(inventory.skills.is_empty());
+        assert_eq!(inventory.listed_in, ["ja-JP"]);
+    }
+
+    #[tokio::test]
+    async fn the_hubs_own_listing_is_not_asked_when_nearest_is_off() {
+        let hub = FakeHub::default();
+        let opts = IntentInventoryOptions {
+            nearest: false,
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["ja-JP"], &opts).await.unwrap();
+        assert!(inventory.skills.is_empty());
+        assert_eq!(
+            hub.emitted(EVENT_INTENT_LIST)
+                .into_iter()
+                .map(|(_, data, _)| Value::Object(data))
+                .collect::<Vec<_>>(),
+            [json!({"lang": "ja-JP", "include_definitions": true})]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_hubs_own_listing_asks_definitions_only_when_describing() {
+        for describe in [true, false] {
+            let hub = FakeHub::default();
+            let opts = IntentInventoryOptions {
+                describe,
+                ..Default::default()
+            };
+            inventory(&hub, ["ja-JP"], &opts).await.unwrap();
+            let asked: Vec<Value> = hub
+                .emitted(EVENT_INTENT_LIST)
+                .into_iter()
+                .filter(|(_, data, _)| !data.contains_key("lang"))
+                .map(|(_, data, _)| Value::Object(data))
+                .collect();
+            let expected = if describe {
+                json!({"include_definitions": true})
+            } else {
+                json!({})
+            };
+            assert_eq!(asked, [expected]);
+        }
+    }
+
+    #[tokio::test]
+    async fn definitions_from_the_hubs_own_listing_need_no_describe() {
+        let hub = FakeHub {
+            definitions_in_list: true,
+            hub_lang: Some("en-US"),
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["es-ES"], &options(None)).await.unwrap();
+        assert!(inventory.has_phrases());
+        assert!(hub.emitted(EVENT_INTENT_DESCRIBE).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_serialised_inventory_says_which_language_it_listed_in() {
+        let hub = FakeHub {
+            hub_lang: Some("en-US"),
+            ..Default::default()
+        };
+        let value = inventory(&hub, ["es-ES"], &options(None))
+            .await
+            .unwrap()
+            .as_value();
+        assert_eq!(value["languages"], json!(["es-ES"]));
+        assert_eq!(value["listed_in"], json!(["en-US"]));
     }
 
     #[tokio::test]
@@ -2794,13 +3432,14 @@ mod tests {
     async fn capability_probe_distinguishes_unknown_empty_and_registered_fallbacks() {
         let opts = options(Some(Duration::from_millis(20)));
         for response in [
-            json!({}),
-            json!({"fallbacks":null}),
-            json!({"fallbacks":{}}),
-            json!({"ok":false,"fallbacks":[]}),
+            Some(json!({})),
+            Some(json!({"skills":null})),
+            Some(json!({"skills":{}})),
+            Some(json!({"ok":false,"skills":[]})),
+            None,
         ] {
             let hub = FakeHub {
-                fallback_response: response,
+                skills_response: response,
                 ..Default::default()
             };
             let result = inventory_with_capabilities(&hub, ["de-de"], &opts)
@@ -2810,8 +3449,8 @@ mod tests {
             assert!(result.may_answer("de-de"));
         }
         for (refuse, silent) in [
-            (vec![EVENT_FALLBACK_LIST], vec![]),
-            (vec![], vec![EVENT_FALLBACK_LIST]),
+            (vec![EVENT_SKILLS_LIST], vec![]),
+            (vec![], vec![EVENT_SKILLS_LIST]),
         ] {
             let hub = FakeHub {
                 refuse,
@@ -2821,13 +3460,14 @@ mod tests {
             let result = inventory_with_capabilities(&hub, ["de-de"], &opts)
                 .await
                 .unwrap();
-            assert!(!result.fallbacks_known);
+            assert!(!result.fallbacks_known, "denied is not the same as empty");
             assert!(result.may_answer("de-de"));
         }
         let mut result = inventory_with_capabilities(&FakeHub::default(), ["en-us"], &opts)
             .await
             .unwrap();
-        assert!(result.fallbacks_known);
+        assert!(result.fallbacks_known, "the hub said it has none");
+        assert!(result.fallbacks.is_empty());
         assert!(result.may_answer("en_US"));
         assert!(!result.may_answer("de-de"));
         for skill in &mut result.inventory.skills {
@@ -2836,30 +3476,67 @@ mod tests {
             }
         }
         assert!(!result.may_answer("en-us"));
+    }
+
+    /// `ovos.skills.list` names every skill the runtime loaded.
+    ///
+    /// A skill without the fallback capability answers through its intents
+    /// and is in the manifest already; one loaded in somebody else's session
+    /// is not this hub's; a malformed row is skipped rather than taking the
+    /// rest down.
+    #[tokio::test]
+    async fn only_the_hubs_own_fallback_skills_are_listed() {
         let hub = FakeHub {
-            fallback_response: json!({"fallbacks":[null, {}, {"skill_id":""}, {"skill_id":"z", "priority":12}, {"skill_id":"b", "priority":1.9}, {"skill_id":"a", "priority":1}, {"skill_id":"c", "priority":true}, {"skill_id":"d", "priority":false}, {"skill_id":"out-of-range", "priority":u64::MAX}]}),
+            skills_response: Some(json!({"ok": true, "skills": [
+                {"skill_id": "thalovant-skill-memory.thalovant", "session_id": "default",
+                 "capabilities": ["fallback", "converse"], "intents": 0},
+                {"skill_id": WEATHER, "session_id": "default", "capabilities": [], "intents": 16},
+                {"skill_id": "someone-elses.fallback", "session_id": "another-session",
+                 "capabilities": ["fallback"], "intents": 0},
+                {"skill_id": "custos-fallback.thalovant", "capabilities": ["fallback"]},
+                {"skill_id": "empty-session.thalovant", "session_id": "", "capabilities": ["fallback"]},
+                {"skill_id": "thalovant-skill-memory.thalovant", "session_id": "default",
+                 "capabilities": ["fallback"]},
+                {"skill_id": "", "session_id": "default", "capabilities": ["fallback"]},
+                {"skill_id": 7, "session_id": "default", "capabilities": ["fallback"]},
+                {"skill_id": "no-capabilities.thalovant", "session_id": "default", "capabilities": null},
+                {"skill_id": "string-capabilities.thalovant", "capabilities": "fallback"},
+                "not a row",
+                null,
+            ]})),
             ..Default::default()
         };
-        let result = inventory_with_capabilities(&hub, ["de-de"], &opts)
+        let result = inventory_with_capabilities(&hub, ["en-us"], &options(None))
             .await
             .unwrap();
+
+        assert!(result.fallbacks_known);
         assert_eq!(
-            result
-                .fallbacks
-                .iter()
-                .map(|row| row.skill_id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["d", "a", "b", "c", "z"]
+            result.fallbacks,
+            [
+                "custos-fallback.thalovant",
+                "empty-session.thalovant",
+                "thalovant-skill-memory.thalovant",
+            ]
+            .map(|skill_id| HubFallback {
+                skill_id: skill_id.to_string(),
+                priority: None,
+            }),
+            "skill id order, once each, and no priority: the hub does not serve one"
         );
+        assert!(
+            hub.emitted(EVENT_FALLBACK_LIST).is_empty(),
+            "no runtime answers it, and asking cost every listing a second and a half"
+        );
+        assert_eq!(hub.emitted(EVENT_SKILLS_LIST).len(), 1);
         assert_eq!(
-            result
-                .fallbacks
-                .iter()
-                .map(|row| row.priority)
-                .collect::<Vec<_>>(),
-            vec![0, 1, 1, 1, 12]
+            result.as_value()["fallbacks"],
+            json!([
+                {"skill_id": "custos-fallback.thalovant", "priority": null},
+                {"skill_id": "empty-session.thalovant", "priority": null},
+                {"skill_id": "thalovant-skill-memory.thalovant", "priority": null},
+            ])
         );
-        assert!(result.may_answer("de-de"));
         assert_eq!(result.as_value()["fallbacks_known"], true);
     }
 

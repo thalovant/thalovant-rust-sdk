@@ -56,10 +56,10 @@ pub use home::{
 };
 pub use identity::{default_config_path, Identity, MqttBrokerCredentials};
 pub use intents::{
-    HubFallback, HubIntent, HubIntentCapabilities, HubIntentInventory, HubSkillIntents,
-    IntentDefinition, IntentDescribeOptions, IntentInventoryOptions, IntentInventorySource,
-    IntentListOptions, IntentRegistration, DEFAULT_INTENT_TIMEOUT, DESCRIBE_BATCH,
-    FALLBACK_PROBE_TIMEOUT,
+    nearest_hub_language, HubFallback, HubIntent, HubIntentCapabilities, HubIntentInventory,
+    HubSkillIntents, IntentDefinition, IntentDescribeOptions, IntentInventoryOptions,
+    IntentInventorySource, IntentListOptions, IntentRegistration, DEFAULT_INTENT_TIMEOUT,
+    DESCRIBE_BATCH, FALLBACK_CAPABILITY, FALLBACK_PROBE_TIMEOUT,
 };
 pub use noise::{
     canonical_json, derive_psk, noise_protocol_name, select_noise_options, NoiseFrame,
