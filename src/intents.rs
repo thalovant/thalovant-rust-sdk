@@ -93,10 +93,13 @@ pub struct IntentInventoryOptions {
     /// instead and return names only, marked `engine-manifests`. Off, the
     /// refusal or silence is returned as [`ThalovantError::PolicyDenied`] or [`ThalovantError::Timeout`].
     pub fallback: bool,
-    /// Retry an empty listing once in the language's usual form. On by
-    /// default: a listing that returns nothing from a hub which demonstrably
-    /// answers in that language is a fault, not a preference. The usual form
-    /// is the crate's private `language_matching::usual_form`.
+    /// Retry a listing with no sentences once in the language's usual form:
+    /// an empty one, or one with no enabled template row. On by default: a
+    /// listing that returns nothing a person can say from a hub which
+    /// demonstrably answers in that language is a fault, not a preference.
+    /// The usual form's listing is taken when it has a template row, or when
+    /// the first was empty. The usual form is the crate's private
+    /// `language_matching::usual_form`.
     pub nearest: bool,
 }
 
@@ -430,8 +433,8 @@ pub struct HubIntentInventory {
     pub denied: Vec<String>,
     /// The tag the hub actually listed each requested language under, in
     /// `languages` order. Equal to `languages` unless a listing came back
-    /// empty and the language's usual form answered instead, which is the
-    /// only way the two differ. Callers rendering sentences must read them
+    /// with no sentences (empty, or keyword rows only) and the language's
+    /// usual form answered instead, which is the only way the two differ. Callers rendering sentences must read them
     /// from the tag that answered.
     pub listed_in: Vec<String>,
 }
@@ -1098,6 +1101,68 @@ fn inventory_from_names(
     }
 }
 
+/// Whether a listing has an enabled template row: the only kind with sentences.
+fn can_carry_sentences(rows: &[IntentRegistration]) -> bool {
+    rows.iter()
+        .any(|row| row.enabled && row.method == "template")
+}
+
+/// One language's listing, and the tag the hub listed it under.
+async fn listing<L: HubLink>(
+    link: &L,
+    lang: &str,
+    list_opts: &IntentListOptions,
+    nearest: bool,
+) -> Result<(String, Vec<IntentRegistration>)> {
+    let rows = list_intents(link, lang, list_opts).await?;
+    if !nearest || can_carry_sentences(&rows) {
+        return Ok((lang.to_string(), rows));
+    }
+    // Listing and asking do not agree about languages. The hub matches an
+    // utterance to the closest language it knows, so a phone set to en-CA is
+    // understood by skills registered under en-US; the manifest is keyed by
+    // exact tag, so the same hub lists nothing for en-CA and a person is shown
+    // an empty hub by the hub that is answering them.
+    //
+    // Not only on an empty listing: on a listing with no template row, which
+    // can never carry a sentence. The Pop Culture hub (2026-10-11) listed five
+    // keyword intents of one skill under en-CA -- that skill registers keyword
+    // vocabulary in 63 regional tags -- and 141 intents with sentences under
+    // en-US; five names is not an answer a person can use.
+    //
+    // Once only: a listing with a template row is never asked twice, a
+    // language whose usual form is itself has nothing to retry with, and the
+    // usual form's listing is taken only when it can carry sentences (or the
+    // first was empty), so keyword names are never traded for other names.
+    let Some(usual) = crate::language_matching::usual_form(lang) else {
+        return Ok((lang.to_string(), rows));
+    };
+    let retried = match list_intents(link, &usual, list_opts).await {
+        Ok(retried) => retried,
+        // A retry never makes the answer worse than the first listing. Names
+        // the hub already gave stand when the usual form times out, is
+        // refused or answers `ok: false`; only an empty first listing lets
+        // the failure through, to the engines' manifests when it is a refusal
+        // of the listing or silence, exactly as a failed first listing does.
+        Err(
+            error @ (ThalovantError::Timeout(_)
+            | ThalovantError::Runtime(_)
+            | ThalovantError::PolicyDenied { .. }
+            | ThalovantError::Unanswered { .. }),
+        ) => {
+            if rows.is_empty() {
+                return Err(error);
+            }
+            Vec::new()
+        }
+        Err(error) => return Err(error),
+    };
+    if can_carry_sentences(&retried) || (!retried.is_empty() && rows.is_empty()) {
+        return Ok((usual, retried));
+    }
+    Ok((lang.to_string(), rows))
+}
+
 /// Everything the hub can be asked, in each language, grouped by skill.
 ///
 /// Asks the intent manifest per language and, unless the runtime attached
@@ -1123,30 +1188,8 @@ where
 
     let mut listed: Vec<(String, Vec<IntentRegistration>)> = Vec::new();
     for lang in &asked {
-        match list_intents(link, lang, &list_opts).await {
-            Ok(rows) => {
-                // Listing and asking do not agree about languages. The hub
-                // matches an utterance to the closest language it knows, so a
-                // phone set to en-CA is understood by skills registered under
-                // en-US; the manifest is keyed by exact tag, so the same hub
-                // lists nothing for en-CA and a person is shown an empty hub
-                // by the hub that is answering them.
-                //
-                // Once only, and only on an empty listing: a hub that
-                // answered is never asked twice, and a language whose usual
-                // form is itself has nothing to retry with.
-                if rows.is_empty() && opts.nearest {
-                    if let Some(usual) = crate::language_matching::usual_form(lang) {
-                        if let Ok(retried) = list_intents(link, &usual, &list_opts).await {
-                            if !retried.is_empty() {
-                                listed.push((usual, retried));
-                                continue;
-                            }
-                        }
-                    }
-                }
-                listed.push((lang.clone(), rows));
-            }
+        match listing(link, lang, &list_opts, opts.nearest).await {
+            Ok(answered) => listed.push(answered),
             Err(error) => {
                 let listing_refused = matches!(
                     &error,
@@ -1334,6 +1377,13 @@ mod tests {
         silent: Vec<&'static str>,
         /// Answer the listing `{"ok": false, "error": ...}` instead of rows.
         listing_fails_with: Option<Value>,
+        /// Languages whose `ovos.intent.list` gets no answer, or `ok: false`.
+        list_silent_in: Vec<&'static str>,
+        list_fails_in: Vec<&'static str>,
+        /// Keyword (adapt) registrations per language, `(skill_id,
+        /// intent_name)`: listed, never described with sentences, exactly as
+        /// ovos-core lists an IntentBuilder intent.
+        keywords: Vec<(&'static str, Vec<(&'static str, &'static str)>)>,
         fallback_response: Value,
         blocked_send: bool,
         foreign_denial: bool,
@@ -1365,6 +1415,9 @@ mod tests {
                 refuse: Vec::new(),
                 silent: Vec::new(),
                 listing_fails_with: None,
+                list_silent_in: Vec::new(),
+                list_fails_in: Vec::new(),
+                keywords: Vec::new(),
                 fallback_response: json!({"fallbacks": []}),
                 blocked_send: false,
                 foreign_denial: false,
@@ -1496,6 +1549,17 @@ mod tests {
                     &context,
                 ),
                 EVENT_INTENT_LIST => {
+                    if self.list_silent_in.contains(&lang.as_str()) {
+                        return Ok(());
+                    }
+                    if self.list_fails_in.contains(&lang.as_str()) {
+                        self.deliver(
+                            EVENT_INTENT_LIST_RESPONSE,
+                            json!({"ok": false, "error": "listing failed"}),
+                            &context,
+                        );
+                        return Ok(());
+                    }
                     if let Some(error) = &self.listing_fails_with {
                         self.deliver(
                             EVENT_INTENT_LIST_RESPONSE,
@@ -1506,6 +1570,21 @@ mod tests {
                     }
                     let attach = self.definitions_in_list
                         && data.get("include_definitions") == Some(&Value::Bool(true));
+                    let keywords = self
+                        .keywords
+                        .iter()
+                        .filter(|(candidate, _)| *candidate == lang)
+                        .flat_map(|(_, rows)| rows.iter())
+                        .map(|(skill_id, intent_name)| {
+                            json!({
+                                "skill_id": skill_id,
+                                "intent_name": intent_name,
+                                "lang": lang,
+                                "method": "keyword",
+                                "enabled": true,
+                                "session_id": "default",
+                            })
+                        });
                     let rows: Vec<Value> = self
                         .registered(&lang)
                         .into_iter()
@@ -1538,6 +1617,7 @@ mod tests {
                                 KeywordRows::BeforeTemplate => vec![keyword, template],
                             }
                         })
+                        .chain(keywords)
                         .collect();
                     self.deliver(
                         EVENT_INTENT_LIST_RESPONSE,
@@ -1613,6 +1693,139 @@ mod tests {
 
     fn ids(inventory: &HubIntentInventory) -> Vec<String> {
         inventory.intents().map(HubIntent::id).collect()
+    }
+
+    const SCOUT: &str = "thalovant-skill-source-scout.thalovant";
+    const SCOUT_KEYWORDS: [(&str, &str); 2] = [
+        (SCOUT, "SourceScoutTopicIntent"),
+        (SCOUT, "SourceScoutRealPromptIntent"),
+    ];
+
+    /// The tags `ovos.intent.list` was asked for, in order.
+    fn listings(hub: &FakeHub) -> Vec<String> {
+        hub.emitted(EVENT_INTENT_LIST)
+            .iter()
+            .map(|(_, data, _)| data["lang"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn names(inventory: &HubIntentInventory) -> Vec<String> {
+        inventory
+            .intents()
+            .map(|intent| intent.name.clone())
+            .collect()
+    }
+
+    /// Not empty is not the same as answered.
+    ///
+    /// The Pop Culture hub on 2026-10-11: one skill registers its keyword
+    /// vocabulary in 63 regional tags, every other skill only in en-US. Its
+    /// en-CA listing was five keyword rows, which carry no sentences, so a
+    /// phone in Toronto was shown five names and nothing it could say -- the
+    /// retry in the usual form only ran on an empty listing.
+    #[tokio::test]
+    async fn a_tag_with_only_keyword_rows_is_listed_under_its_usual_form() {
+        let hub = FakeHub {
+            keywords: vec![
+                ("en-CA", SCOUT_KEYWORDS.to_vec()),
+                ("en-us", SCOUT_KEYWORDS.to_vec()),
+            ],
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-CA"], &options(None)).await.unwrap();
+
+        assert_eq!(
+            inventory.listed_in,
+            ["en-us"],
+            "the usual form has sentences, en-CA has none"
+        );
+        assert!(inventory.has_phrases());
+        assert_eq!(
+            inventory
+                .skills
+                .iter()
+                .map(|skill| skill.skill_id.as_str())
+                .collect::<Vec<_>>(),
+            [SHADOW, SCOUT, WEATHER]
+        );
+        assert_eq!(listings(&hub), ["en-CA", "en-us"]);
+    }
+
+    #[tokio::test]
+    async fn keyword_rows_are_kept_when_the_usual_form_has_no_sentences_either() {
+        let hub = FakeHub {
+            registrations: Vec::new(),
+            keywords: vec![
+                ("en-CA", SCOUT_KEYWORDS.to_vec()),
+                ("en-us", SCOUT_KEYWORDS[..1].to_vec()),
+            ],
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-CA"], &options(None)).await.unwrap();
+
+        assert_eq!(inventory.listed_in, ["en-CA"], "nothing better to take");
+        assert_eq!(
+            names(&inventory),
+            ["SourceScoutRealPromptIntent", "SourceScoutTopicIntent"]
+        );
+        assert_eq!(listings(&hub), ["en-CA", "en-us"]);
+    }
+
+    /// A retry never makes the answer worse than the first listing.
+    #[tokio::test]
+    async fn a_failed_retry_keeps_the_names_the_first_listing_gave() {
+        for silent in [true, false] {
+            let hub = FakeHub {
+                keywords: vec![("en-CA", SCOUT_KEYWORDS.to_vec())],
+                list_silent_in: if silent { vec!["en-us"] } else { Vec::new() },
+                list_fails_in: if silent { Vec::new() } else { vec!["en-us"] },
+                ..Default::default()
+            };
+            let inventory = inventory(&hub, ["en-CA"], &options(Some(Duration::from_millis(200))))
+                .await
+                .unwrap();
+
+            assert_eq!(inventory.source, IntentInventorySource::IntentManifest);
+            assert!(inventory.denied.is_empty());
+            assert_eq!(inventory.listed_in, ["en-CA"]);
+            assert_eq!(
+                names(&inventory),
+                ["SourceScoutRealPromptIntent", "SourceScoutTopicIntent"]
+            );
+            assert_eq!(listings(&hub), ["en-CA", "en-us"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_retry_after_an_empty_listing_still_fails_as_before() {
+        let hub = FakeHub {
+            registrations: Vec::new(),
+            list_fails_in: vec!["en-us"],
+            ..Default::default()
+        };
+        let error = inventory(&hub, ["en-CA"], &options(Some(Duration::from_millis(200))))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ThalovantError::Runtime(_)), "{error:?}");
+        assert_eq!(listings(&hub), ["en-CA", "en-us"]);
+    }
+
+    #[tokio::test]
+    async fn a_listing_with_sentences_is_not_retried_for_its_keyword_rows() {
+        let hub = FakeHub {
+            registrations: vec![
+                ("en-CA", registrations("en-us")),
+                ("en-us", registrations("en-us")),
+            ],
+            keywords: vec![("en-CA", SCOUT_KEYWORDS.to_vec())],
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-CA"], &options(None)).await.unwrap();
+
+        assert_eq!(listings(&hub), ["en-CA"]);
+        assert_eq!(inventory.listed_in, ["en-CA"]);
+        assert!(inventory.has_phrases());
     }
 
     #[tokio::test]

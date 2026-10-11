@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `Client::intents` asks the language's usual form when the first listing has no sentences, not only when it is empty. `IntentInventoryOptions::nearest` retried `en-CA` as `en-us` only on an empty listing, and a listing of keyword intents alone is not empty but has nothing a person can say: the Pop Culture hub lists five Source Scout keyword intents under `en-CA` (that skill registers keyword vocabulary in 63 regional tags) and 141 intents with sentences under `en-US`, so a phone in Toronto was shown five names. Now the usual form is asked whenever the first listing has no enabled `template` row, and its listing is taken when it has one, or when the first was empty. A listing with a template row is still asked once, and keyword names are never traded for other names. A retry that fails with `ThalovantError::Timeout`, `Runtime`, `PolicyDenied` or `Unanswered` keeps the names the first listing gave; after an empty first listing it fails as the first listing would, so a refused or silent retry reaches the engines' manifests when `fallback` is on. That last point is a change for this crate: a failed retry used to be dropped and the empty listing returned, where the Python reference always let it through. Takes the Python reference's change from thalovant-python-sdk#103.
+
 ## 0.14.5 — 2026-10-06
 
 The Python reference's 0.9.5 round (reference digest `3f37b7453397…`).
