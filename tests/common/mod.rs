@@ -79,22 +79,32 @@ fn target() -> Option<PathBuf> {
 ///
 /// Every file under `tests/` is its own test binary and its own process, so
 /// a run is not one process. `cargo test` (and `cargo nextest`) starts every
-/// one of them itself, so on Unix the parent process id names the run.
-/// `THALOVANT_CONFORMANCE_RUN` overrides it, for a runner that wants its own
-/// name or a platform with no parent id in `std`. Anything outside
-/// `[A-Za-z0-9_-]` is dropped, so the name is always one path component.
+/// one of them itself, so on Unix the parent process names the run: its id,
+/// and on Linux its start time too, so a later run that happens to get the
+/// same parent id is still another run. `THALOVANT_CONFORMANCE_RUN`
+/// overrides it, for a runner that wants its own name or a platform with no
+/// parent id in `std`. Anything outside `[A-Za-z0-9_-]` is percent-encoded,
+/// so two names stay two names and each is one path component.
 fn run_id() -> String {
     let named = std::env::var("THALOVANT_CONFORMANCE_RUN").unwrap_or_default();
-    let named: String = named
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
     if !named.is_empty() {
-        return named;
+        return run_name(&named);
     }
     #[cfg(unix)]
     {
-        format!("cargo-{}", std::os::unix::process::parent_id())
+        let parent = std::os::unix::process::parent_id();
+        // Field 22 of /proc/<pid>/stat, counted after the parenthesised
+        // command name, which may itself hold spaces.
+        let started = fs::read_to_string(format!("/proc/{parent}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, rest) = stat.rsplit_once(')')?;
+                rest.split_whitespace().nth(19).map(str::to_string)
+            });
+        match started {
+            Some(started) => format!("cargo-{parent}-{started}"),
+            None => format!("cargo-{parent}"),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -102,6 +112,18 @@ fn run_id() -> String {
         // begin a run, or set THALOVANT_CONFORMANCE_RUN.
         "run".to_string()
     }
+}
+
+/// A run's name as one path component: `[A-Za-z0-9_-]` kept, every other
+/// byte percent-encoded, so `feature/a` and `featurea` stay two runs.
+pub fn run_name(named: &str) -> String {
+    named
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => char::from(byte).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 /// Record what this SDK produced for one case of one vector file.
@@ -146,15 +168,17 @@ pub fn record_into(target: &Path, run: &str, vector_file: &str, case: &str, prod
     // there, so an earlier run's shards were merged into every later one.
     let run_dir = parts.join(format!("run-{run}"));
     if !run_dir.is_dir() || !target.exists() {
-        for entry in fs::read_dir(&parts).into_iter().flatten().flatten() {
-            let path = entry.path();
+        // A shard that cannot be removed would be merged anyway, so failing
+        // here is the only safe answer.
+        for entry in fs::read_dir(&parts).expect("shard directory") {
+            let path = entry.expect("shard directory entry").path();
             if path.file_name().is_some_and(|name| name == ".lock") {
                 continue;
             }
             if path.is_dir() {
-                let _ = fs::remove_dir_all(&path);
+                fs::remove_dir_all(&path).expect("remove an earlier run's shards");
             } else {
-                let _ = fs::remove_file(&path);
+                fs::remove_file(&path).expect("remove an earlier run's shard");
             }
         }
         fs::create_dir_all(&run_dir).expect("run shard directory");

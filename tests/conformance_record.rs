@@ -75,10 +75,20 @@ fn one_run_keeps_every_case_it_recorded() {
     common::record_into(&target, "this", "binary-frames.json", "first", &json!(1));
     common::record_into(&target, "this", "binary-frames.json", "second", &json!(2));
 
-    let names: Vec<String> = recorded(&target)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    assert_eq!(names, vec!["first".to_string(), "second".to_string()]);
+    assert_eq!(
+        recorded(&target),
+        vec![
+            ("first".to_string(), common::canonical_digest(&json!(1))),
+            ("second".to_string(), common::canonical_digest(&json!(2))),
+        ]
+    );
     fs::remove_dir_all(&dir).expect("clean up");
+}
+
+#[test]
+fn two_run_names_stay_two_runs() {
+    assert_ne!(common::run_name("feature/a"), common::run_name("featurea"));
+    assert_eq!(common::run_name("feature/a"), "feature%2Fa");
+    assert_eq!(common::run_name("ci-42_b"), "ci-42_b");
+    assert!(!common::run_name("../up").contains('/'));
 }
