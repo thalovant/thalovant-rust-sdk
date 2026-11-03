@@ -16,7 +16,7 @@ CodeRabbit's review bodies hold findings that are not review threads: nitpicks, 
 - **Not changed:** two.
   - The `ws://` scheme (#30), which every SDK accepts alike.
   - The retry test asked for on #66, a test-only addition that would cut a release.
-  - Also left: older single-`read()` test servers, outside #21's fixed scope. See AUDIT.md for all three.
+- **Recorded in AUDIT.md** with both of those: about ten older single-`read()` test servers. They are outside the provisioning tests that #21's item named, which are fixed.
 
 Verification: documentation only. No file `auto-release.yml` treats as a release path changes, and the parity contract hashes none of these files.
 
