@@ -1,5 +1,6 @@
 //! Rust SDK for direct Thalovant HiveMind HTTPS clients and agents.
 
+pub mod chat_apps;
 pub mod client;
 pub mod constants;
 pub mod context;
@@ -27,6 +28,15 @@ mod tls;
 pub mod transport;
 pub mod wire;
 
+pub use chat_apps::{
+    Bridge, BridgeAllowance, BridgeAllowedChat, BridgeAvatar, BridgeBot, BridgeChat,
+    BridgeChatList, BridgeConnectorRef, BridgeCreate, BridgeCredentials, BridgeHold,
+    BridgeHoldReason, BridgeInviteLinks, BridgeListOptions, BridgeNetworkOffer, BridgeNetworks,
+    BridgePhase, BridgeSessionScope, BridgeState, BridgeStatus, BridgeStatusReason,
+    BridgeStatusSource, BridgeTestResult, BridgeUpdate, ChatAppConnector, ChatAppHelper,
+    ChatAppOptions, ChatAppRelease, ChatAppSecretField, ChatAppStatus, ChatAppTargets,
+    LocalizedText, SecretValue,
+};
 pub use client::{
     ActionOptions, AskOptions, Client, CodeOptions, Conversation, ConversationOptions,
     QueryOptions, RequestOptions,

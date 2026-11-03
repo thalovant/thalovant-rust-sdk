@@ -1,3 +1,4 @@
+mod bridges;
 mod hub_skills;
 pub use hub_skills::HubSkillWaitOptions;
 
@@ -61,7 +62,7 @@ pub enum OperationStatus {
     TimedOut,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct OperationResource {
     pub id: String,
     pub kind: String,
@@ -2251,6 +2252,52 @@ impl ControlPlane {
         headers: Option<HeaderMap>,
         auth: bool,
     ) -> Result<(reqwest::StatusCode, String, Option<Duration>)> {
+        let response = self.send(method, path, body, headers, auth).await?;
+        let status = response.status();
+        let header_wait = header_retry_after(response.headers());
+        let body = if status.is_success() {
+            response.text().await.map_err(unreachable)?
+        } else {
+            error_body(response).await
+        };
+        Ok((status, body, header_wait))
+    }
+
+    /// An authenticated GET whose answer is bytes, not JSON: the body and
+    /// its `Content-Type`, or the error a failure status is, read from its
+    /// Problem+JSON body like any other.
+    async fn request_bytes(&self, path: &str, accept: &str) -> Result<(Vec<u8>, Option<String>)> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_str(accept).map_err(|err| ThalovantError::Api(err.to_string()))?,
+        );
+        let response = self.send("GET", path, None, Some(headers), true).await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(api_response_error(status, &error_body(response).await));
+        }
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let content = response.bytes().await.map_err(unreachable)?;
+        Ok((content.to_vec(), content_type))
+    }
+
+    /// Send one control-plane request and return its response, refusing a
+    /// redirect.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: Option<HeaderMap>,
+        auth: bool,
+    ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.api_url, path.trim_start_matches('/'));
         let url = validate_control_request_url(&url, auth || body.is_some())?;
         let mut request_headers = HeaderMap::new();
@@ -2289,7 +2336,6 @@ impl ControlPlane {
         }
         let response = request.send().await.map_err(unreachable)?;
         let status = response.status();
-        let header_wait = header_retry_after(response.headers());
         if status.is_redirection() {
             return Err(ThalovantError::ApiResponse {
                 status_code: status.as_u16(),
@@ -2297,18 +2343,18 @@ impl ControlPlane {
                 problem: None,
             });
         }
-        let body = if status.is_success() {
-            response.text().await.map_err(unreachable)?
-        } else {
-            // UTF-8 whatever the Content-Type says: the API sends
-            // `application/problem+json` with no charset, and every SDK has
-            // to read the same body the same way.
-            let bytes = response.bytes().await.unwrap_or_default();
-            let text = String::from_utf8_lossy(&bytes);
-            text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()
-        };
-        Ok((status, body, header_wait))
+        Ok(response)
     }
+}
+
+/// The body of a failure answer as text: UTF-8 whatever the Content-Type
+/// says, since the API sends `application/problem+json` with no charset and
+/// every SDK has to read the same body the same way; a leading byte-order
+/// mark dropped.
+async fn error_body(response: reqwest::Response) -> String {
+    let bytes = response.bytes().await.unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()
 }
 
 /// The error for a request the API never answered: an
