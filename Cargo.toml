@@ -42,7 +42,7 @@ argon2 = "0.6.0"
 cookie_store = { version = "=0.22.1", default-features = false }
 time = { version = "=0.3.55", default-features = false }
 idna_adapter = "=1.2.2"
-fancy-regex = "0.19.1"
+fancy-regex = "0.20.0"
 
 [dev-dependencies]
 # The conformance recorder locks its output: each file under tests/ is its
