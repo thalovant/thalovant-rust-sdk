@@ -17,7 +17,8 @@ pub type Result<T> = std::result::Result<T, ThalovantError>;
 /// here, including fields the API adds after this crate was released.
 ///
 /// [`code`](Self::code) and [`detail`](Self::detail) read the body's
-/// machine-readable code and its sentence. The rest is a
+/// machine-readable code and its sentence, and [`fields`](Self::fields) the
+/// names of the settings or secrets it refused. The rest is a
 /// [`serde_json::Map`]: [`get`](Self::get), or any `Map` method through
 /// `Deref`.
 ///
@@ -51,6 +52,21 @@ impl ApiProblem {
         problem_text(self.0.get("detail")).or_else(|| problem_text(self.nested()?.get("detail")))
     }
 
+    /// The names of the settings or secrets a refusal is about, such as
+    /// `["homeserver"]` on a 422 `bridge_url_not_public`: never their values.
+    ///
+    /// The string entries of `fields` when it is a list with at least one;
+    /// else, when `detail` is itself an object, that object's `fields` under
+    /// the same rule; else empty. Entries that are not strings are skipped.
+    pub fn fields(&self) -> Vec<&str> {
+        let top = field_names(Some(&self.0));
+        if top.is_empty() {
+            field_names(self.nested())
+        } else {
+            top
+        }
+    }
+
     /// One member of the body, for example `allowed_images`.
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.0.get(key)
@@ -69,6 +85,15 @@ impl ApiProblem {
     fn nested(&self) -> Option<&Map<String, Value>> {
         self.0.get("detail").and_then(Value::as_object)
     }
+}
+
+/// The string entries of a body's `fields` list, in order.
+fn field_names(source: Option<&Map<String, Value>>) -> Vec<&str> {
+    source
+        .and_then(|source| source.get("fields"))
+        .and_then(Value::as_array)
+        .map(|entries| entries.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default()
 }
 
 /// A string with something in it, exactly as sent; anything else is absent.
@@ -718,6 +743,15 @@ impl ThalovantError {
     /// [`ApiProblem::detail`].
     pub fn api_detail(&self) -> Option<&str> {
         self.api_problem().and_then(ApiProblem::detail)
+    }
+
+    /// The names of the settings or secrets the API refused, such as
+    /// `["access_token"]` on a 422 `bridge_secrets_invalid`; see
+    /// [`ApiProblem::fields`]. Empty for every other error.
+    pub fn api_fields(&self) -> Vec<&str> {
+        self.api_problem()
+            .map(ApiProblem::fields)
+            .unwrap_or_default()
     }
 }
 

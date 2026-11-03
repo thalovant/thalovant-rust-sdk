@@ -1,6 +1,6 @@
 [package]
 name = "thalovant"
-version = "0.15.2"
+version = "0.16.0"
 edition = "2021"
 description = "Rust SDK for direct Thalovant hub data-plane clients and agents"
 readme = "README.md"
@@ -11,6 +11,8 @@ documentation = "https://docs.rs/thalovant"
 keywords = ["thalovant", "sdk", "agent", "voice", "assistant"]
 categories = ["api-bindings", "network-programming"]
 rust-version = "1.88"
+# Repository notes for maintainers, not part of the crate.
+exclude = ["QUICK_FACTS.md", "FAQ.md", "MAINTENANCE_REPORT.md", "AUDIT.md", "SUGGESTIONS.md"]
 
 [dependencies]
 base64 = "0.23"
