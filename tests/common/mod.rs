@@ -75,15 +75,71 @@ fn target() -> Option<PathBuf> {
     std::env::var_os("THALOVANT_CONFORMANCE_OUT").map(PathBuf::from)
 }
 
+/// Which run of the suite this process belongs to.
+///
+/// Every file under `tests/` is its own test binary and its own process, so
+/// a run is not one process. `cargo test` (and `cargo nextest`) starts every
+/// one of them itself, so on Unix the parent process names the run: its id,
+/// and on Linux its start time too, so a later run that happens to get the
+/// same parent id is still another run. `THALOVANT_CONFORMANCE_RUN`
+/// overrides it, for a runner that wants its own name or a platform with no
+/// parent id in `std`. Anything outside `[A-Za-z0-9_-]` is percent-encoded,
+/// so two names stay two names and each is one path component.
+fn run_id() -> String {
+    let named = std::env::var("THALOVANT_CONFORMANCE_RUN").unwrap_or_default();
+    if !named.is_empty() {
+        return run_name(&named);
+    }
+    #[cfg(unix)]
+    {
+        let parent = std::os::unix::process::parent_id();
+        // Field 22 of /proc/<pid>/stat, counted after the parenthesised
+        // command name, which may itself hold spaces.
+        let started = fs::read_to_string(format!("/proc/{parent}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let (_, rest) = stat.rsplit_once(')')?;
+                rest.split_whitespace().nth(19).map(str::to_string)
+            });
+        match started {
+            Some(started) => format!("cargo-{parent}-{started}"),
+            None => format!("cargo-{parent}"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // No parent id to tell one run from the next: delete the target to
+        // begin a run, or set THALOVANT_CONFORMANCE_RUN.
+        "run".to_string()
+    }
+}
+
+/// A run's name as one path component: `[A-Za-z0-9_-]` kept, every other
+/// byte percent-encoded, so `feature/a` and `featurea` stay two runs.
+pub fn run_name(named: &str) -> String {
+    named
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => char::from(byte).to_string(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 /// Record what this SDK produced for one case of one vector file.
 ///
 /// Written through on every call rather than at exit: each file under
 /// `tests/` is its own test binary, so the binary cases and the conversation
 /// cases run in different processes and neither can see the other's results.
 /// Each writes its own shard and then rebuilds the whole file from every
-/// shard present, so whichever finishes last leaves it complete.
+/// shard of the same run, so whichever finishes last leaves it complete.
 pub fn record(vector_file: &str, case: &str, produced: &Value) {
     let Some(target) = target() else { return };
+    record_into(&target, &run_id(), vector_file, case, produced);
+}
+
+/// [`record`], into `target`, as part of the run named `run`.
+pub fn record_into(target: &Path, run: &str, vector_file: &str, case: &str, produced: &Value) {
     let parts = PathBuf::from(format!("{}.parts", target.display()));
     fs::create_dir_all(&parts).expect("shard directory");
 
@@ -101,23 +157,34 @@ pub fn record(vector_file: &str, case: &str, produced: &Value) {
     guard.lock_exclusive().expect("lock");
 
     // A shard left by an earlier run must not be counted as this one's
-    // output: it could contribute a case this run never executed, which is
-    // the hole the whole mechanism exists to close. The runner deletes the
-    // target to begin a run, so its absence is what marks the first process
-    // in -- and doing this under the lock means exactly one process clears.
-    if !target.exists() {
-        for entry in fs::read_dir(&parts).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "json")
-            {
-                let _ = fs::remove_file(path);
+    // output: it could contribute a case this run never executed, or replace
+    // a digest this run computed, which is the hole the whole mechanism
+    // exists to close. Shards live in a directory per run and only this run's
+    // are merged. The first process of a run -- no directory of its own yet,
+    // or a target someone deleted to begin afresh -- clears every other
+    // run's, under the lock, so exactly one process clears. Keying on the
+    // target's absence alone was not enough: the documented command writes
+    // over the committed contracts/conformance-results.json, which is always
+    // there, so an earlier run's shards were merged into every later one.
+    let run_dir = parts.join(format!("run-{run}"));
+    if !run_dir.is_dir() || !target.exists() {
+        // A shard that cannot be removed would be merged anyway, so failing
+        // here is the only safe answer.
+        for entry in fs::read_dir(&parts).expect("shard directory") {
+            let path = entry.expect("shard directory entry").path();
+            if path.file_name().is_some_and(|name| name == ".lock") {
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path).expect("remove an earlier run's shards");
+            } else {
+                fs::remove_file(&path).expect("remove an earlier run's shard");
             }
         }
+        fs::create_dir_all(&run_dir).expect("run shard directory");
     }
 
-    let shard = parts.join(format!("{}.json", std::process::id()));
+    let shard = run_dir.join(format!("{}.json", std::process::id()));
     let mut mine: BTreeMap<String, BTreeMap<String, String>> = fs::read_to_string(&shard)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -133,7 +200,7 @@ pub fn record(vector_file: &str, case: &str, produced: &Value) {
     entry.insert(case.to_string(), digest);
     fs::write(&shard, serde_json::to_string(&mine).expect("shard")).expect("write shard");
 
-    merge(&parts, &target);
+    merge(&run_dir, target);
     FileExt::unlock(&guard).expect("unlock");
 }
 
