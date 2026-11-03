@@ -88,7 +88,9 @@ Crate API reference: [docs.rs/thalovant](https://docs.rs/thalovant).
 A hub owner can connect a chat network to a hub, and the hub answers there.
 Telegram and Discord are offered; Matrix, Mattermost and Twitch are in beta.
 Each connection is a *bridge*, managed with `ControlPlane` methods (types in
-`thalovant::chat_apps`). Reads need `hubs:read`, changes `hubs:write`, and a
+`thalovant::chat_apps`). Reads need `hubs:read` and changes `hubs:write`, with
+one exception: `list_bridge_chats` needs `hubs:write`, since the API asks the
+network for the chats with the bot's own credentials. Creating a bridge needs a
 paid plan with room in its allowance.
 
 | Method | What it does |
@@ -100,7 +102,7 @@ paid plan with room in its allowance.
 | `get_bridge(id)` | One bridge with its status |
 | `update_bridge(id, &BridgeUpdate)` | Choose chats, mention rule, session scope, settings; pause or resume |
 | `replace_bridge_token(id, token)` / `replace_bridge_secrets(id, secrets)` | New credentials |
-| `list_bridge_chats(id)` | The chats the bot can answer in |
+| `list_bridge_chats(id)` | The chats the bot can answer in (`hubs:write`) |
 | `send_bridge_test_message(id, chat_id)` | Post a test message in an allowed chat |
 | `get_bridge_avatar(id)` | The bot's picture: bytes and media type |
 | `delete_bridge(id)` | Stop and remove a bridge and its stored credentials |
@@ -141,6 +143,10 @@ async fn main() -> thalovant::Result<()> {
         .filter(|chat| chat.selectable)
         .map(BridgeAllowedChat::from)
         .collect();
+    if allowed.is_empty() {
+        println!("no chat to choose yet: mention the bot in the group, then list again");
+        return Ok(());
+    }
 
     // Choosing the first chats starts the bridge.
     let bridge = control
@@ -153,9 +159,9 @@ async fn main() -> thalovant::Result<()> {
             },
         )
         .await?;
-    if let Some(chat) = allowed.first() {
-        control.send_bridge_test_message(&bridge.id, &chat.id).await?;
-    }
+    control
+        .send_bridge_test_message(&bridge.id, &allowed[0].id)
+        .await?;
     Ok(())
 }
 ```

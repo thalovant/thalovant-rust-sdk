@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Audit notes from adding chat apps (0.16.0), after a green full test run.
+Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Audit notes from adding chat apps (0.16.0) and its review, after a green full test run.
 
 # Audit
 
@@ -10,9 +10,11 @@ Written after `cargo test --all-features -- --test-threads=2` passed in full on 
 2. **Credentials are not wiped from memory.** `SecretValue` (`src/chat_apps.rs`) holds an ordinary `String`, and the request body built by `exposed_secrets` and `create_bridge` (`src/control/bridges.rs`) is a `serde_json::Value` dropped after sending. The crate has no `zeroize` dependency; this is documented on `SecretValue`.
 3. **The shared api-error vectors do not cover `fields` yet.** `produced` in `tests/api_errors.rs` records status, code, detail and problem only, as the Python reference's vectors define them. `ApiProblem::fields` and `ThalovantError::api_fields` (`src/errors.rs`) are covered by `tests/chat_apps.rs` instead.
 4. **Most control-plane reads are untyped.** `list_hubs`, `get_hub`, the memory and runtime-group calls in `src/control.rs` return `serde_json::Value`; chat apps (`src/chat_apps.rs`), `OperationResource` and `DeviceLoginRequest` are the typed exceptions.
-5. **The minimum Rust version was not built locally.** Only the current compiler was available; the `minimum-rust` CI job builds and tests on 1.88. The new code uses no feature newer than 1.88 (const `assert!` is 1.57).
+5. **Releases do not wait for the whole fleet's parity.** The consumer branch of `.github/workflows/sdk-parity.yml` runs `check-sdk-parity.py --consumer thalovant-rust-sdk` without `--release`, and `auto-release.yml` (`planned-parity`) and `publish.yml` reuse it, so a "not yet on par" state is reported but does not stop a release. See `SUGGESTIONS.md` item 5.
+6. **The minimum Rust version was not built locally.** Only the current compiler was available; the `minimum-rust` CI job builds and tests on 1.88. The new code uses no feature newer than 1.88 (const `assert!` is 1.57).
 
 ## Security notes
 
 - No credential reaches an error, `Debug` or JSON output: `SecretValue` has no `Display`, `Serialize` or `Deserialize` (checked at compile time by `NO_WAY_TO_PRINT_A_SECRET` in `tests/chat_apps.rs`), its `Debug` prints `<redacted>`, and `a_refused_create_never_prints_the_credentials_it_sent` checks an API that echoes the token.
-- `get_bridge_avatar` reads the image as bytes (`request_bytes` in `src/control.rs`), with the same HTTPS-only rule and redirect refusal as every control-plane request.
+- `get_bridge_avatar` reads the image as bytes (`request_bytes` in `src/control.rs`), with the same HTTPS-only rule and redirect refusal as every control-plane request, and refuses a body over 4 MiB by its `Content-Length` or while streaming (`a_picture_is_read_whole_and_never_past_its_cap`).
+- Test assertions about credentials name the printed form by position rather than printing it, so a failing test cannot write a credential to the CI log (code scanning flagged the first version).

@@ -62,6 +62,10 @@
 //!     .filter(|chat| chat.selectable)
 //!     .map(BridgeAllowedChat::from)
 //!     .collect();
+//! if allowed.is_empty() {
+//!     // Mention the bot in a group first, then list again.
+//!     return Ok(());
+//! }
 //! let bridge = control
 //!     .update_bridge(
 //!         &bridge.id,
@@ -72,9 +76,9 @@
 //!         },
 //!     )
 //!     .await?;
-//! if let Some(chat) = allowed.first() {
-//!     control.send_bridge_test_message(&bridge.id, &chat.id).await?;
-//! }
+//! control
+//!     .send_bridge_test_message(&bridge.id, &allowed[0].id)
+//!     .await?;
 //!
 //! // Matrix: a homeserver and a user id, with an access token. Its chats
 //! // are typed, not listed: room ids like `!abc:example.org`.

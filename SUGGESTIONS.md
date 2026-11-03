@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Created with suggestions from the chat apps change (0.16.0).
+Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Suggestions from the chat apps change (0.16.0) and its review, including the release-path parity gate.
 
 # Suggestions
 
@@ -25,3 +25,9 @@ Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Created with suggestions from 
 - **Problem:** credentials stay in freed memory until reused (`AUDIT.md` item 2).
 - **Proposed solution:** an optional `zeroize` feature that wipes `SecretValue` on drop.
 - **Impact:** defence in depth for long-running processes; one optional dependency.
+
+## 5. Gate releases on the whole-fleet parity check
+
+- **Problem:** the release paths (`auto-release.yml`, `publish.yml`) reuse `sdk-parity.yml`, which checks this SDK as one consumer without `--release`, so a "not yet on par" state (such as `chat-apps` before the Python reference declares it) reports but does not stop a release.
+- **Proposed solution:** on release paths, check out every sibling SDK and run the checker with `--workspace ... --release`, keeping the consumer check for pull requests; decide it fleet-wide, since every SDK reuses the same workflow shape.
+- **Impact:** a release cannot ship while the fleet is behind; a release then waits on every sibling SDK's acknowledgement.

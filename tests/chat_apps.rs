@@ -27,11 +27,14 @@ const FAKE_ACCESS_TOKEN: &str = "syt_FAKE_matrix_access_token";
 const FAKE_REFRESH_TOKEN: &str = "FAKE-twitch-refresh-token";
 const FAKE_CLIENT_SECRET: &str = "FAKE-twitch-client-secret";
 
-/// One scripted answer: a status line, a Content-Type and the body bytes.
+/// One scripted answer: a status line, a Content-Type and the body bytes,
+/// with a `Content-Length` unless `sized` is false (then the body runs to
+/// the end of the connection).
 struct Answer {
     status: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
+    sized: bool,
 }
 
 impl Answer {
@@ -40,6 +43,7 @@ impl Answer {
             status,
             content_type: "application/json",
             body: body.to_string().into_bytes(),
+            sized: true,
         }
     }
 
@@ -48,6 +52,16 @@ impl Answer {
             status,
             content_type: "application/problem+json",
             body: body.to_string().into_bytes(),
+            sized: true,
+        }
+    }
+
+    fn image(body: Vec<u8>, sized: bool) -> Self {
+        Self {
+            status: "200 OK",
+            content_type: "image/png",
+            body,
+            sized,
         }
     }
 
@@ -56,6 +70,7 @@ impl Answer {
             status,
             content_type: "application/json",
             body: Vec::new(),
+            sized: true,
         }
     }
 }
@@ -100,14 +115,19 @@ fn serve(
             let (mut stream, _) = listener.accept().expect("accept");
             let request = read_full_request(&mut stream);
             let answer = route(&request);
+            let length = if answer.sized {
+                format!("content-length: {}\r\n", answer.body.len())
+            } else {
+                String::new()
+            };
             let head = format!(
-                "HTTP/1.1 {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                answer.status,
-                answer.content_type,
-                answer.body.len()
+                "HTTP/1.1 {}\r\ncontent-type: {}\r\n{length}connection: close\r\n\r\n",
+                answer.status, answer.content_type,
             );
             stream.write_all(head.as_bytes()).expect("write head");
-            stream.write_all(&answer.body).expect("write body");
+            // A client that refuses a body may close before it is all
+            // written.
+            let _ = stream.write_all(&answer.body);
             requests.push(request);
         }
         requests
@@ -269,11 +289,7 @@ fn route(request: &str) -> Answer {
         ("POST", "/v1/bridges/b%2F1/test") => {
             Answer::json("200 OK", json!({"sent": true, "chat_id": "-1001234567890"}))
         }
-        ("GET", "/v1/bridges/b%2F1/avatar") => Answer {
-            status: "200 OK",
-            content_type: "image/png",
-            body: AVATAR.to_vec(),
-        },
+        ("GET", "/v1/bridges/b%2F1/avatar") => Answer::image(AVATAR.to_vec(), true),
         ("DELETE", "/v1/bridges/b%2F1") => Answer::empty("204 No Content"),
         _ => panic!("unexpected request: {line}"),
     }
@@ -697,17 +713,23 @@ fn a_secret_cannot_be_printed_or_serialised() {
         ],
     )
     .with_settings([("bot_login", "myhubbot"), ("client_id", "app-1")]);
-    for printed in [
+    // A failure names the form, never what it printed: that could be the
+    // credential itself.
+    let forms = [
         format!("{with_token:?}"),
         format!("{with_token:#?}"),
         format!("{with_secrets:?}"),
         format!("{with_secrets:#?}"),
         format!("{:?}", with_secrets.credentials),
-    ] {
+    ];
+    for (form, printed) in forms.iter().enumerate() {
         for fake in [FAKE_TOKEN, FAKE_REFRESH_TOKEN, FAKE_CLIENT_SECRET] {
-            assert!(!printed.contains(fake), "leaked: {printed}");
+            assert!(!printed.contains(fake), "form {form} printed a credential");
         }
-        assert!(printed.contains("<redacted>"), "{printed}");
+        assert!(
+            printed.contains("<redacted>"),
+            "form {form} shows no marker"
+        );
     }
     // The keys and the settings are not secret, and still show.
     let printed = format!("{with_secrets:?}");
@@ -755,13 +777,15 @@ async fn a_refused_create_never_prints_the_credentials_it_sent() {
     ] {
         assert_eq!(error.api_code(), Some("bridge_token_invalid"));
         let problem = error.api_problem().expect("problem");
-        for printed in [
+        let forms = [
             error.to_string(),
             format!("{error:?}"),
             format!("{error:#?}"),
             format!("{problem:?}"),
-        ] {
-            assert!(!printed.contains(fake), "leaked: {printed}");
+        ];
+        for (form, printed) in forms.iter().enumerate() {
+            // Named, not printed: the form could hold the credential.
+            assert!(!printed.contains(fake), "form {form} printed a credential");
         }
     }
 }
@@ -916,6 +940,22 @@ async fn bad_arguments_fail_before_any_request() {
             .expect_err("limit out of range"),
         );
     }
+    failures.push(
+        api.get_bridge_networks(Some(" "))
+            .await
+            .expect_err("blank hub"),
+    );
+    for (hub_id, owner_id) in [(Some(""), None), (None, Some(" "))] {
+        failures.push(
+            api.list_bridges(&BridgeListOptions {
+                hub_id: hub_id.map(str::to_string),
+                owner_id: owner_id.map(str::to_string),
+                limit: None,
+            })
+            .await
+            .expect_err("blank filter"),
+        );
+    }
     let empty: [(&str, &str); 0] = [];
     failures.push(
         api.create_bridge(BridgeCreate::with_secrets("h1", "matrix", empty))
@@ -967,16 +1007,60 @@ async fn bad_arguments_fail_before_any_request() {
             .expect_err("no chat"),
     );
     failures.push(api.get_bridge_avatar("").await.expect_err("no id"));
-    for failure in &failures {
-        assert!(matches!(failure, ThalovantError::Api(_)), "{failure}");
+    // Named by position, not printed: some were built with a credential.
+    for (case, failure) in failures.iter().enumerate() {
+        assert!(matches!(failure, ThalovantError::Api(_)), "case {case}");
         assert!(
             !failure.is_api_unreachable(),
-            "a request went out: {failure}"
+            "case {case}: a request went out"
         );
-        assert_eq!(failure.status_code(), None);
+        assert_eq!(failure.status_code(), None, "case {case}");
     }
     assert_eq!(
         failures[0].to_string(),
         "api error: limit must be from 1 to 500"
     );
+}
+
+#[tokio::test]
+async fn a_picture_is_read_whole_and_never_past_its_cap() {
+    // The API serves at most 1 MiB; the SDK reads at most 4 MiB.
+    const CAP: usize = 4 * 1024 * 1024;
+    let big = vec![0x5a_u8; CAP + 1];
+    let small = AVATAR.to_vec();
+    let answers = std::sync::Mutex::new(
+        vec![
+            // Read to the end of the connection: no Content-Length.
+            Answer::image(small.clone(), false),
+            Answer::image(vec![0xa5_u8; CAP], true),
+            // Refused by its Content-Length, before the body is read.
+            Answer::image(big.clone(), true),
+            // Refused while it is read.
+            Answer::image(big, false),
+        ]
+        .into_iter(),
+    );
+    let (api, peer) = serve(4, move |_| {
+        answers.lock().expect("answers").next().expect("an answer")
+    });
+    let unsized_picture = api.get_bridge_avatar("b1").await.expect("unsized picture");
+    assert_eq!(unsized_picture.content, small);
+    assert_eq!(unsized_picture.content_type, "image/png");
+    let at_cap = api
+        .get_bridge_avatar("b1")
+        .await
+        .expect("picture at the cap");
+    assert_eq!(at_cap.content.len(), CAP);
+    assert!(format!("{at_cap:?}").contains(&format!("[{CAP} bytes]")));
+    for case in ["announced", "streamed"] {
+        let error = api.get_bridge_avatar("b1").await.expect_err(case);
+        assert!(matches!(error, ThalovantError::Api(_)), "{case}");
+        assert!(!error.is_api_unreachable(), "{case}");
+        assert_eq!(
+            error.to_string(),
+            format!("api error: the answer is larger than {CAP} bytes"),
+            "{case}"
+        );
+    }
+    peer.join().expect("loopback API");
 }

@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Created with the chat apps change (0.16.0).
+Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Chat apps change (0.16.0) and its review round.
 
 # Maintenance report
 
@@ -10,9 +10,11 @@ Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Created with the chat apps cha
 
 **Verification.**
 - `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features -- --test-threads=2` (370 passed, 0 failed, including 3 doc tests), `cargo package --allow-dirty --list`, and `cargo doc --no-deps --all-features` with warnings denied, on the current stable compiler; CI also builds on Rust 1.88 and on macOS and Windows.
-- `tests/chat_apps.rs`: 10 tests covering every route (method, escaped path, query, exact body, `If-Match` only with an etag), parsing with unknown enum values and absent members, refusals with code and fields and the unchanged plan/auth classification, local refusals before any request, the avatar's bytes, and fake credentials absent from every printed form; the missing traits on `SecretValue` are checked at compile time.
+- `tests/chat_apps.rs`: 11 tests covering every route (method, escaped path, query, exact body, `If-Match` only with an etag), parsing with unknown enum values and absent members, refusals with code and fields and the unchanged plan/auth classification, local refusals before any request, the avatar's bytes, and fake credentials absent from every printed form; the missing traits on `SecretValue` are checked at compile time.
 - The shared api-error vectors (`tests/api_errors.rs`) still pass unchanged.
 - Parity checker run as a consumer: verified, with the expected rollout note that the reference does not know `chat-apps` yet.
+
+**Review round (same day).** Code scanning flagged three test assertions that printed a formatted request or error in their failure message; they now name the form by position. From the CodeRabbit review: a blank `Some` hub or owner filter is refused locally instead of being dropped (`get_bridge_networks`, `list_bridges`); `get_bridge_avatar` refuses a body over 4 MiB without reading the rest; the README states that `list_bridge_chats` needs `hubs:write` (as the API's route requires) and its example no longer sends an empty `allowed`. Declined: running the whole-fleet `--release` parity check on this repository's release paths, a fleet-wide gate change recorded in `SUGGESTIONS.md` item 5.
 
 ### Transparency report
 

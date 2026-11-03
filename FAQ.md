@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Created with chat apps questions (0.16.0).
+Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Chat apps questions (0.16.0), with the chat-listing scope.
 
 # FAQ
 
@@ -12,6 +12,9 @@ Matrix (`access_token`, settings `homeserver` and optional `user_id`) and Twitch
 
 **Why does `list_bridge_chats` return nothing for Matrix?**
 Connectors without the `discover` helper answer `manual_entry: true` with an empty list: type the ids (Matrix room ids like `!abc:example.org`), which must match `ChatAppTargets::pattern`.
+
+**Which token scope does `list_bridge_chats` need?**
+`hubs:write`, unlike the other reads (`hubs:read`): the API asks the network for the chats with the bot's credentials.
 
 **Why does `list_bridge_chats` fail with 409 `bridge_running` on Telegram?**
 Telegram lists chats only while the bridge is stopped. Pause it (`paused: Some(true)`), wait a minute, list again.

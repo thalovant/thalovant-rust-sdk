@@ -2265,14 +2265,21 @@ impl ControlPlane {
 
     /// An authenticated GET whose answer is bytes, not JSON: the body and
     /// its `Content-Type`, or the error a failure status is, read from its
-    /// Problem+JSON body like any other.
-    async fn request_bytes(&self, path: &str, accept: &str) -> Result<(Vec<u8>, Option<String>)> {
+    /// Problem+JSON body like any other. A body longer than `max` bytes is
+    /// refused with [`ThalovantError::Api`]: by its `Content-Length` before
+    /// any of it is read, else as soon as the bytes read pass `max`.
+    async fn request_bytes(
+        &self,
+        path: &str,
+        accept: &str,
+        max: usize,
+    ) -> Result<(Vec<u8>, Option<String>)> {
         let mut headers = HeaderMap::new();
         headers.insert(
             ACCEPT,
             HeaderValue::from_str(accept).map_err(|err| ThalovantError::Api(err.to_string()))?,
         );
-        let response = self.send("GET", path, None, Some(headers), true).await?;
+        let mut response = self.send("GET", path, None, Some(headers), true).await?;
         let status = response.status();
         if !status.is_success() {
             return Err(api_response_error(status, &error_body(response).await));
@@ -2284,8 +2291,21 @@ impl ControlPlane {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let content = response.bytes().await.map_err(unreachable)?;
-        Ok((content.to_vec(), content_type))
+        let too_large = || ThalovantError::Api(format!("the answer is larger than {max} bytes"));
+        // A length that does not fit a usize is larger than any `max`.
+        let announced =
+            usize::try_from(response.content_length().unwrap_or(0)).unwrap_or(usize::MAX);
+        if announced > max {
+            return Err(too_large());
+        }
+        let mut content = Vec::with_capacity(announced);
+        while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
+            if content.len() + chunk.len() > max {
+                return Err(too_large());
+            }
+            content.extend_from_slice(&chunk);
+        }
+        Ok((content, content_type))
     }
 
     /// Send one control-plane request and return its response, refusing a

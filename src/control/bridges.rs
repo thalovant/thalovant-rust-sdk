@@ -11,6 +11,10 @@ use crate::chat_apps::{
 /// The most bridges one list asks for.
 const MAX_BRIDGE_LIST_LIMIT: u32 = 500;
 
+/// The largest bot picture read: the API serves at most 1 MiB, so anything
+/// past this is not a picture from it.
+const MAX_AVATAR_BYTES: usize = 4 * 1024 * 1024;
+
 /// A `{data: [...]}` answer.
 #[derive(Deserialize)]
 struct DataEnvelope<T> {
@@ -30,6 +34,13 @@ fn required<'a>(name: &str, value: &'a str) -> Result<&'a str> {
         return Err(ThalovantError::Api(format!("{name} is required")));
     }
     Ok(value)
+}
+
+/// An optional filter, refused locally when given but blank: a blank hub
+/// would otherwise be dropped, and the answer would silently be about
+/// something else (the caller's allowance, every bridge they may see).
+fn optional<'a>(name: &str, value: Option<&'a str>) -> Result<Option<&'a str>> {
+    value.map(|value| required(name, value)).transpose()
 }
 
 /// A secrets map for a request, refused locally when it is empty.
@@ -60,10 +71,11 @@ impl ControlPlane {
     /// Read the allowance before creating a bridge: a Free plan allows none
     /// (`paid_plan` false, and creating answers 402). With `hub_id` it is the
     /// hub owner's allowance, since bridges count against the owner whoever
-    /// adds them; without it, the caller's own.
+    /// adds them; without it, the caller's own. A blank `Some` fails locally
+    /// with [`ThalovantError::Api`] before any request.
     pub async fn get_bridge_networks(&self, hub_id: Option<&str>) -> Result<BridgeNetworks> {
         let mut params = Vec::new();
-        push_query_param(&mut params, "hub_id", hub_id);
+        push_query_param(&mut params, "hub_id", optional("hub_id", hub_id)?);
         let path = if params.is_empty() {
             "/v1/bridges/networks".to_string()
         } else {
@@ -76,12 +88,20 @@ impl ControlPlane {
     /// List bridges (`GET /v1/bridges`, `hubs:read`): one hub's, or every
     /// bridge the caller may see, oldest first.
     ///
-    /// A `limit` outside 1 to 500 fails locally with
-    /// [`ThalovantError::Api`] before any request.
+    /// A blank `hub_id` or `owner_id`, or a `limit` outside 1 to 500, fails
+    /// locally with [`ThalovantError::Api`] before any request.
     pub async fn list_bridges(&self, opts: &BridgeListOptions) -> Result<Vec<Bridge>> {
         let mut params = Vec::new();
-        push_query_param(&mut params, "hub_id", opts.hub_id.as_deref());
-        push_query_param(&mut params, "owner_id", opts.owner_id.as_deref());
+        push_query_param(
+            &mut params,
+            "hub_id",
+            optional("hub_id", opts.hub_id.as_deref())?,
+        );
+        push_query_param(
+            &mut params,
+            "owner_id",
+            optional("owner_id", opts.owner_id.as_deref())?,
+        );
         if let Some(limit) = opts.limit {
             if !(1..=MAX_BRIDGE_LIST_LIMIT).contains(&limit) {
                 return Err(ThalovantError::Api(format!(
@@ -240,11 +260,13 @@ impl ControlPlane {
 
     /// The bot's picture (`GET /v1/bridges/{id}/avatar`, `hubs:read`): the
     /// image bytes and their media type. A bot without one is the API's
-    /// 404, returned as [`ThalovantError::ApiResponse`].
+    /// 404, returned as [`ThalovantError::ApiResponse`]. A body over 4 MiB
+    /// is refused with [`ThalovantError::Api`] without reading the rest (the
+    /// API serves at most 1 MiB).
     pub async fn get_bridge_avatar(&self, bridge_id: &str) -> Result<BridgeAvatar> {
         let path = bridge_path(bridge_id, "/avatar")?;
         let (content, content_type) = self
-            .request_bytes(&path, "image/*, application/problem+json")
+            .request_bytes(&path, "image/*, application/problem+json", MAX_AVATAR_BYTES)
             .await?;
         Ok(BridgeAvatar {
             content,
