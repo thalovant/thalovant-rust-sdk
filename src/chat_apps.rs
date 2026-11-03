@@ -33,52 +33,67 @@
 //!
 //! # Example
 //!
-//! Read the allowance first (a Free plan allows no bridges), connect a
-//! Telegram bot, choose its chats, which starts the bridge, and say hello.
+//! Take up a Telegram bridge an earlier run left in setup, or read the
+//! allowance (a Free plan allows no bridges) and connect a bot. Then answer
+//! in the one chat the owner picked, which starts the bridge, and say hello.
 //! Matrix and Twitch take named secrets and settings instead of one token.
 //!
 //! ```no_run
 //! use thalovant::{
-//!     BridgeAllowedChat, BridgeCreate, BridgeStatusReason, BridgeUpdate, ControlPlane,
-//!     SecretValue,
+//!     BridgeAllowedChat, BridgeCreate, BridgeListOptions, BridgeState, BridgeStatusReason,
+//!     BridgeUpdate, ControlPlane, SecretValue,
 //! };
 //!
 //! # async fn run() -> thalovant::Result<()> {
 //! let control = ControlPlane::with_access_token("api-token");
 //! let hub_id = "hub-id";
-//! let networks = control.get_bridge_networks(Some(hub_id)).await?;
-//! if !networks.allowance.can_create {
-//!     return Ok(());
-//! }
+//! let earlier = control
+//!     .list_bridges(&BridgeListOptions {
+//!         hub_id: Some(hub_id.into()),
+//!         ..Default::default()
+//!     })
+//!     .await?
+//!     .into_iter()
+//!     .find(|bridge| bridge.network == "telegram");
+//! let bridge = match earlier {
+//!     Some(bridge) if bridge.state == BridgeState::Setup => bridge,
+//!     // Already answering, or created elsewhere: nothing to set up.
+//!     Some(_) => return Ok(()),
+//!     None => {
+//!         let networks = control.get_bridge_networks(Some(hub_id)).await?;
+//!         if !networks.allowance.can_create {
+//!             return Ok(());
+//!         }
+//!         let token =
+//!             SecretValue::from(std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default());
+//!         control
+//!             .create_bridge(BridgeCreate::with_token(hub_id, "telegram", token))
+//!             .await?
+//!     }
+//! };
 //!
-//! let token = SecretValue::from(std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default());
-//! let bridge = control
-//!     .create_bridge(BridgeCreate::with_token(hub_id, "telegram", token))
-//!     .await?;
+//! // Answer only where the owner said: never every chat the bot can see.
 //! let chats = control.list_bridge_chats(&bridge.id).await?;
-//! let allowed: Vec<BridgeAllowedChat> = chats
+//! let wanted = std::env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
+//! let Some(chat) = chats
 //!     .data
 //!     .iter()
-//!     .filter(|chat| chat.selectable)
-//!     .map(BridgeAllowedChat::from)
-//!     .collect();
-//! if allowed.is_empty() {
-//!     // Mention the bot in a group first, then list again.
+//!     .find(|chat| chat.selectable && chat.id == wanted)
+//! else {
+//!     // Mention the bot in that chat first, then run again.
 //!     return Ok(());
-//! }
+//! };
 //! let bridge = control
 //!     .update_bridge(
 //!         &bridge.id,
 //!         &BridgeUpdate {
-//!             allowed: Some(allowed.clone()),
+//!             allowed: Some(vec![BridgeAllowedChat::from(chat)]),
 //!             etag: Some(bridge.etag.clone()),
 //!             ..Default::default()
 //!         },
 //!     )
 //!     .await?;
-//! control
-//!     .send_bridge_test_message(&bridge.id, &allowed[0].id)
-//!     .await?;
+//! control.send_bridge_test_message(&bridge.id, &chat.id).await?;
 //!
 //! // Matrix: a homeserver and a user id, with an access token. Its chats
 //! // are typed, not listed: room ids like `!abc:example.org`.
@@ -764,7 +779,11 @@ pub struct Bridge {
     /// When it last changed.
     pub updated_at: String,
     /// The platform operation this answer queued, when it queued one.
-    #[serde(default)]
+    ///
+    /// Also `None` when the API sent an operation this release cannot read,
+    /// such as one with a status [`OperationStatus`](crate::OperationStatus)
+    /// does not name: the bridge itself still parses.
+    #[serde(default, deserialize_with = "readable_operation")]
     pub operation: Option<OperationResource>,
 }
 
@@ -920,18 +939,19 @@ impl BridgeCreate {
     }
 
     /// Add non-secret settings, such as a Matrix homeserver. Each value is
-    /// anything that converts to JSON: a string, a number, a bool.
+    /// anything that converts to JSON: a string, a number, a bool. Calls add
+    /// up: a later call keeps the settings an earlier one added, and replaces
+    /// only a key it names again.
     pub fn with_settings<I, K, V>(mut self, settings: I) -> Self
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<Value>,
     {
-        self.settings = Some(
+        self.settings.get_or_insert_with(Map::new).extend(
             settings
                 .into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
+                .map(|(key, value)| (key.into(), value.into())),
         );
         self
     }
@@ -944,8 +964,9 @@ impl BridgeCreate {
 /// Its `Serialize` writes the request body, without `etag`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct BridgeUpdate {
-    /// The chats the bridge answers in; never empty. Setting it the first
-    /// time starts the bridge.
+    /// The chats the bridge answers in. Setting it the first time starts the
+    /// bridge. An empty list is sent as it is, and the API refuses it with
+    /// 422 `bridge_allowed_required`, as every Thalovant SDK reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<BridgeAllowedChat>>,
     /// Answer only what mentions the bot (always true on Discord).
@@ -1001,6 +1022,16 @@ pub(crate) fn exposed_secrets(secrets: &BTreeMap<String, SecretValue>) -> Value 
             .map(|(key, value)| (key.clone(), Value::from(value.expose())))
             .collect(),
     )
+}
+
+/// An operation, or `None` when it is absent, `null`, or a shape this
+/// release cannot read: an unreadable operation must not make the bridge
+/// that carries it unreadable.
+fn readable_operation<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<OperationResource>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 fn default_true() -> bool {

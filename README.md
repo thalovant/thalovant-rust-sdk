@@ -113,55 +113,77 @@ body, which never appears in an error.
 
 ### Telegram (and Discord): one bot token
 
-Read the allowance first: a Free plan allows no bridges.
+A run takes up the bridge an earlier run left in setup, so running it again
+neither adds a bridge nor trips over the first one. Otherwise it reads the
+allowance first (a Free plan allows no bridges) and connects the bot. The bridge
+then answers only in the chat the owner names in `TELEGRAM_CHAT_ID`, never in
+every chat the bot can see.
 
 ```rust
-use thalovant::{BridgeAllowedChat, BridgeCreate, BridgeUpdate, ControlPlane, SecretValue};
+use thalovant::{
+    BridgeAllowedChat, BridgeCreate, BridgeListOptions, BridgeState, BridgeUpdate,
+    ControlPlane, SecretValue,
+};
 
 #[tokio::main]
 async fn main() -> thalovant::Result<()> {
     let control = ControlPlane::with_access_token(std::env::var("THALOVANT_API_TOKEN").unwrap());
     let hub_id = "your-hub-id";
 
-    let networks = control.get_bridge_networks(Some(hub_id)).await?;
-    if !networks.allowance.can_create {
-        println!("no room: {} of {} bridges used", networks.allowance.used, networks.allowance.limit);
-        return Ok(());
-    }
+    let earlier = control
+        .list_bridges(&BridgeListOptions {
+            hub_id: Some(hub_id.into()),
+            ..Default::default()
+        })
+        .await?
+        .into_iter()
+        .find(|bridge| bridge.network == "telegram");
+    let bridge = match earlier {
+        Some(bridge) if bridge.state == BridgeState::Setup => bridge,
+        Some(bridge) => {
+            println!("bridge {} is already set up", bridge.id);
+            return Ok(());
+        }
+        None => {
+            let networks = control.get_bridge_networks(Some(hub_id)).await?;
+            if !networks.allowance.can_create {
+                println!("no room: {} of {} bridges used", networks.allowance.used, networks.allowance.limit);
+                return Ok(());
+            }
+            let token = SecretValue::from(std::env::var("TELEGRAM_BOT_TOKEN").unwrap());
+            control
+                .create_bridge(BridgeCreate::with_token(hub_id, "telegram", token))
+                .await?
+        }
+    };
 
-    let token = SecretValue::from(std::env::var("TELEGRAM_BOT_TOKEN").unwrap());
-    let bridge = control
-        .create_bridge(BridgeCreate::with_token(hub_id, "telegram", token))
-        .await?;
-
-    // Add the bot to a group with bridge.invite_links, mention it there,
-    // then list the chats it can see.
+    // Add the bot to the group with bridge.invite_links and mention it there:
+    // the chat list shows only chats with recent activity.
     let chats = control.list_bridge_chats(&bridge.id).await?;
-    let allowed: Vec<BridgeAllowedChat> = chats
-        .data
-        .iter()
-        .filter(|chat| chat.selectable)
-        .map(BridgeAllowedChat::from)
-        .collect();
-    if allowed.is_empty() {
-        println!("no chat to choose yet: mention the bot in the group, then list again");
+    let Ok(wanted) = std::env::var("TELEGRAM_CHAT_ID") else {
+        for chat in chats.data.iter().filter(|chat| chat.selectable) {
+            println!("{}  {}", chat.id, chat.title);
+        }
+        println!("set TELEGRAM_CHAT_ID to the chat the hub should answer in, then run again");
         return Ok(());
-    }
+    };
+    let Some(chat) = chats.data.iter().find(|chat| chat.selectable && chat.id == wanted) else {
+        println!("the bot cannot see chat {wanted} yet: mention it there, then run again");
+        return Ok(());
+    };
 
-    // Choosing the first chats starts the bridge.
+    // Choosing its first chat starts the bridge.
     let bridge = control
         .update_bridge(
             &bridge.id,
             &BridgeUpdate {
-                allowed: Some(allowed.clone()),
+                allowed: Some(vec![BridgeAllowedChat::from(chat)]),
                 etag: Some(bridge.etag.clone()),
                 ..Default::default()
             },
         )
         .await?;
-    control
-        .send_bridge_test_message(&bridge.id, &allowed[0].id)
-        .await?;
+    control.send_bridge_test_message(&bridge.id, &chat.id).await?;
     Ok(())
 }
 ```

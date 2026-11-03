@@ -2265,9 +2265,11 @@ impl ControlPlane {
 
     /// An authenticated GET whose answer is bytes, not JSON: the body and
     /// its `Content-Type`, or the error a failure status is, read from its
-    /// Problem+JSON body like any other. A body longer than `max` bytes is
-    /// refused with [`ThalovantError::Api`]: by its `Content-Length` before
-    /// any of it is read, else as soon as the bytes read pass `max`.
+    /// Problem+JSON body like any other. Neither body is read past `max`
+    /// bytes: by its `Content-Length` before any of it is read, else as soon
+    /// as the bytes read pass `max`. A longer success body is refused with
+    /// [`ThalovantError::Api`]; a longer failure body is the
+    /// [`ThalovantError::ApiResponse`] its status is, with no problem.
     async fn request_bytes(
         &self,
         path: &str,
@@ -2282,7 +2284,14 @@ impl ControlPlane {
         let mut response = self.send("GET", path, None, Some(headers), true).await?;
         let status = response.status();
         if !status.is_success() {
-            return Err(api_response_error(status, &error_body(response).await));
+            // A body that cannot be read, or is too long, is no body: the
+            // status still says what the refusal was.
+            let body = read_at_most(&mut response, max)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            return Err(api_response_error(status, &error_text(&body)));
         }
         let content_type = response
             .headers()
@@ -2291,20 +2300,9 @@ impl ControlPlane {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let too_large = || ThalovantError::Api(format!("the answer is larger than {max} bytes"));
-        // A length that does not fit a usize is larger than any `max`.
-        let announced =
-            usize::try_from(response.content_length().unwrap_or(0)).unwrap_or(usize::MAX);
-        if announced > max {
-            return Err(too_large());
-        }
-        let mut content = Vec::with_capacity(announced);
-        while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
-            if content.len() + chunk.len() > max {
-                return Err(too_large());
-            }
-            content.extend_from_slice(&chunk);
-        }
+        let content = read_at_most(&mut response, max)
+            .await?
+            .ok_or_else(|| ThalovantError::Api(format!("the answer is larger than {max} bytes")))?;
         Ok((content, content_type))
     }
 
@@ -2372,9 +2370,32 @@ impl ControlPlane {
 /// every SDK has to read the same body the same way; a leading byte-order
 /// mark dropped.
 async fn error_body(response: reqwest::Response) -> String {
-    let bytes = response.bytes().await.unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes);
+    error_text(&response.bytes().await.unwrap_or_default())
+}
+
+/// A failure body's bytes as the text [`error_body`] reads.
+fn error_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
     text.strip_prefix('\u{feff}').unwrap_or(&text).to_string()
+}
+
+/// A response's body, or `None` when it is longer than `max` bytes: refused
+/// by its `Content-Length` before any of it is read, else as soon as the
+/// bytes read pass `max`.
+async fn read_at_most(response: &mut reqwest::Response, max: usize) -> Result<Option<Vec<u8>>> {
+    // A length that does not fit a usize is longer than any `max`.
+    let announced = usize::try_from(response.content_length().unwrap_or(0)).unwrap_or(usize::MAX);
+    if announced > max {
+        return Ok(None);
+    }
+    let mut content = Vec::with_capacity(announced);
+    while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
+        if content.len() + chunk.len() > max {
+            return Ok(None);
+        }
+        content.extend_from_slice(&chunk);
+    }
+    Ok(Some(content))
 }
 
 /// The error for a request the API never answered: an

@@ -17,6 +17,8 @@ Written after `cargo test --all-features -- --test-threads=2` passed in full on 
 
 - No credential reaches an error, `Debug` or JSON output: `SecretValue` has no `Display`, `Serialize` or `Deserialize` (checked at compile time by `NO_WAY_TO_PRINT_A_SECRET` in `tests/chat_apps.rs`), its `Debug` prints `<redacted>`, and `a_refused_create_never_prints_the_credentials_it_sent` checks an API that echoes the token.
 - `get_bridge_avatar` reads the image as bytes (`request_bytes` in `src/control.rs`), with the same HTTPS-only rule and redirect refusal as every control-plane request, and refuses a body over 4 MiB by its `Content-Length` or while streaming (`a_picture_is_read_whole_and_never_past_its_cap`).
+- A refusal of the avatar route is read at most 4 MiB too; past that it is the `ApiResponse` of its status with no problem (`read_at_most` in `src/control.rs`, covered by `a_picture_is_read_whole_and_never_past_its_cap`).
+- `OperationStatus` (`src/control.rs`) is a closed public enum: an operation status the API adds later fails `ControlPlane::get_operation`. `Bridge::operation` reads such an operation as `None` (`readable_operation` in `src/chat_apps.rs`, `an_unreadable_operation_leaves_the_bridge_readable`) so the bridge stays readable; opening `OperationStatus` would break exhaustive matches and waits for a breaking release.
 - Test assertions about credentials name the printed form by position rather than printing it, so a failing test cannot write a credential to the CI log (code scanning flagged the first version).
 
 Known issues, technical debt and their status, from test runs and code reading. Each entry names the code it concerns.

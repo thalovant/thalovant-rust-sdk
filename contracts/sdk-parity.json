@@ -2,7 +2,7 @@
   "capabilities": {
     "api-errors": {
       "implementation": {
-        "src/control.rs": "57af9d9fcd8e4045195bddb68fb99741e9edbb59dacb0052a88645e269f15a17",
+        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f",
         "src/redact.rs": "e84cc12f06c3def1be5475486aa6da53288710bb5ab245beccb60787dfa7d1b8"
@@ -38,8 +38,8 @@
     },
     "chat-apps": {
       "implementation": {
-        "src/chat_apps.rs": "c8b5b61b622f5416fa375947f164a78c57ea188ef74997aaf6936f4b3644ebb7",
-        "src/control.rs": "57af9d9fcd8e4045195bddb68fb99741e9edbb59dacb0052a88645e269f15a17",
+        "src/chat_apps.rs": "68f3ed5dd0c313baf5d4e0297b24df6e95455e4b5a787a1e2eab4e876a6ec8b5",
+        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
         "src/control/bridges.rs": "07bb2ff6f8e53b1936b0d4bed03126ec4ee7dee7618b0794abb8e4969ba067b7",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f"
@@ -47,7 +47,7 @@
       "reason": "The owner routes under /v1/bridges are ControlPlane methods in src/control/bridges.rs (list_chat_app_connectors, get_bridge_networks, list_bridges, create_bridge, get_bridge, update_bridge, replace_bridge_token, replace_bridge_secrets, list_bridge_chats, send_bridge_test_message, get_bridge_avatar, delete_bridge), with the avatar read as bytes by request_bytes in src/control.rs. The models, open enums (an Other(String) variant keeps unknown values), request types and SecretValue (Debug prints <redacted>; no Display, Serialize or Deserialize; expose() is read only to build a request body) are in src/chat_apps.rs and re-exported from src/lib.rs. ApiProblem::fields and ThalovantError::api_fields in src/errors.rs read a refusal's fields, top-level or inside an object detail. tests/chat_apps.rs serves every route from a loopback HTTP peer and checks method, escaped path, query, exact body and If-Match only when an etag is set; parsing with unknown enum values and absent optional members; code, fields and the unchanged plan/auth classification of refusals; local refusals before any request; avatar bytes; and fake credentials absent from Debug, error Display/Debug and serialised output, with the missing traits checked at compile time.",
       "status": "required",
       "tests": {
-        "tests/chat_apps.rs": "865e75fd47f1f4f3103e0e9034619c766bc0f4c9ac53b2e0cc5028c044ca3287"
+        "tests/chat_apps.rs": "d7a75870a338c851953d904e49630427248ff5c29c1db8e245823baff1eedc66"
       }
     },
     "cli": {
@@ -56,7 +56,7 @@
     },
     "connection-admission": {
       "implementation": {
-        "src/control.rs": "57af9d9fcd8e4045195bddb68fb99741e9edbb59dacb0052a88645e269f15a17",
+        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f"
       },
@@ -73,7 +73,7 @@
     },
     "connection-kinds": {
       "implementation": {
-        "src/control.rs": "57af9d9fcd8e4045195bddb68fb99741e9edbb59dacb0052a88645e269f15a17",
+        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f"
       },
@@ -96,7 +96,7 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "57af9d9fcd8e4045195bddb68fb99741e9edbb59dacb0052a88645e269f15a17",
+        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
         "src/native_auth.rs": "3672a473b3388e41db298b5c1661eba581d06d8e487dc226dd162c2c8053f49d"
       }
@@ -118,7 +118,7 @@
     },
     "device-login": {
       "implementation": {
-        "src/control.rs": "57af9d9fcd8e4045195bddb68fb99741e9edbb59dacb0052a88645e269f15a17",
+        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f"
       },

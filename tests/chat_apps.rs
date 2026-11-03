@@ -1037,10 +1037,19 @@ async fn a_picture_is_read_whole_and_never_past_its_cap() {
             Answer::image(big.clone(), true),
             // Refused while it is read.
             Answer::image(big, false),
+            // A refusal's body is capped the same way, by its length or
+            // while it is read; were it read whole, its code would show.
+            oversized_refusal("403 Forbidden", true),
+            oversized_refusal("402 Payment Required", false),
+            // Within the cap, a refusal reads as any other.
+            Answer::problem(
+                "404 Not Found",
+                json!({"detail": "This bot has no picture"}),
+            ),
         ]
         .into_iter(),
     );
-    let (api, peer) = serve(4, move |_| {
+    let (api, peer) = serve(7, move |_| {
         answers.lock().expect("answers").next().expect("an answer")
     });
     let unsized_picture = api.get_bridge_avatar("b1").await.expect("unsized picture");
@@ -1062,5 +1071,93 @@ async fn a_picture_is_read_whole_and_never_past_its_cap() {
             "{case}"
         );
     }
+    for (status, refusal) in [(403, None), (402, Some(ApiRefusal::Plan))] {
+        let error = api.get_bridge_avatar("b1").await.expect_err("refused");
+        assert!(
+            matches!(error, ThalovantError::ApiResponse { .. }),
+            "{status}"
+        );
+        assert_eq!(error.status_code(), Some(status));
+        assert!(error.api_problem().is_none(), "{status}: the body was read");
+        assert_eq!(error.api_code(), None, "{status}");
+        assert_eq!(error.api_refusal(), refusal, "{status}");
+    }
+    let missing = api.get_bridge_avatar("b1").await.expect_err("no picture");
+    assert_eq!(missing.status_code(), Some(404));
+    assert_eq!(missing.api_detail(), Some("This bot has no picture"));
     peer.join().expect("loopback API");
+}
+
+/// A refusal whose Problem+JSON body is one byte past the 4 MiB cap.
+fn oversized_refusal(status: &'static str, sized: bool) -> Answer {
+    let mut body = br#"{"code":"plan_limit","detail":""#.to_vec();
+    let end = br#""}"#;
+    body.resize(4 * 1024 * 1024 + 1 - end.len(), b'x');
+    body.extend_from_slice(end);
+    Answer {
+        status,
+        content_type: "application/problem+json",
+        body,
+        sized,
+    }
+}
+
+#[test]
+fn an_unreadable_operation_leaves_the_bridge_readable() {
+    let with = |operation: Option<Value>| -> Bridge {
+        let mut value = bridge();
+        match operation {
+            Some(operation) => value["operation"] = operation,
+            None => {
+                value.as_object_mut().expect("object").remove("operation");
+            }
+        }
+        serde_json::from_value(value).expect("the bridge parses")
+    };
+    let known = with(Some(bridge()["operation"].clone()));
+    assert_eq!(
+        known
+            .operation
+            .as_ref()
+            .map(|operation| operation.id.as_str()),
+        Some("op-1")
+    );
+    // A status this release does not name, a shape it cannot read, null
+    // and absence: the bridge parses, and the operation is None.
+    let mut unknown_status = bridge()["operation"].clone();
+    unknown_status["status"] = json!("superseded");
+    let mut no_id = bridge()["operation"].clone();
+    no_id.as_object_mut().expect("object").remove("id");
+    for operation in [
+        Some(unknown_status),
+        Some(no_id),
+        Some(json!("op-1")),
+        Some(Value::Null),
+        None,
+    ] {
+        let parsed = with(operation.clone());
+        assert_eq!(parsed.operation, None, "{operation:?}");
+        assert_eq!(parsed.etag, "etag-1");
+        assert_eq!(parsed.status.phase, BridgePhase::Ready);
+    }
+}
+
+#[test]
+fn settings_added_twice_keep_the_first() {
+    let create = BridgeCreate::with_secrets("h1", "matrix", [("access_token", FAKE_ACCESS_TOKEN)])
+        .with_settings([("homeserver", "https://old.example.org")])
+        .with_settings([("user_id", "@hub:example.org")])
+        .with_settings([("homeserver", "https://matrix.example.org")]);
+    assert_eq!(
+        create.settings.map(Value::Object),
+        Some(json!({
+            "homeserver": "https://matrix.example.org",
+            "user_id": "@hub:example.org",
+        }))
+    );
+    assert_eq!(
+        BridgeCreate::with_token("h1", "telegram", FAKE_TOKEN).settings,
+        None,
+        "no settings are sent unless some were added"
+    );
 }
