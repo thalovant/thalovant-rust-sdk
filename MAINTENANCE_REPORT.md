@@ -1,6 +1,30 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Record the CodeRabbit follow-ups to #64 and #66.
+Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Record the CodeRabbit review-body items checked on older PRs.
 
 # Maintenance Report
+
+## 2026-11-03 — CodeRabbit review-body items on older PRs
+
+CodeRabbit's review bodies hold findings that are not review threads: nitpicks, and comments outside the diff. Fourteen of them, on #21, #23, #30, #37, #40 and #66, were checked against `main` (a81ec4a). Each old PR has a comment that lists them and says how each was handled.
+
+- **Already fixed:** eleven.
+  - In `8a27279` (#42): empty-etag guard, full request reads in the provisioning tests, order-free install body.
+  - In `2939de5` (#37): `Notified` registered before the WSS read task.
+  - In `922d140` (#39): one `NoiseChannel` for every transport, and the PSK cache with it.
+  - In `5156879` (#40): Argon2 off the async workers, staging collisions, bounded readiness loops, one describe deadline.
+  - In `3a9bed5` (#70): close verdict before the disconnect wakes `connect()`.
+- **Fixed here:** CHANGELOG.md had no entry for the breaking MQTT change in #23, which shipped in 0.2.24. It now has one, with migration steps. Its section, still headed "Unreleased" although 0.2.23 to 0.2.27 shipped it, now says so.
+- **Not changed:** two.
+  - The `ws://` scheme (#30), which every SDK accepts alike.
+  - The retry test asked for on #66, a test-only addition that would cut a release.
+- **Recorded in AUDIT.md** with both of those: about ten older single-`read()` test servers. They are outside the provisioning tests that #21's item named, which are fixed.
+
+Verification: documentation only. No file `auto-release.yml` treats as a release path changes, and the parity contract hashes none of these files.
+
+## Transparency Report
+
+- **AI Model**: Claude Opus 5.5.
+- **Actions Taken**: Read every CodeRabbit review-body item on this repo's merged PRs and checked each against `main` and its history. Ran an uncommitted test of the usual-form retry. Wrote the CHANGELOG entry and the AUDIT.md notes, and posted the old-PR comments.
+- **Oversight**: Pull-request CI. No human reviewed this before the pull request was opened.
 
 ## 2026-11-03 — CodeRabbit follow-ups (#64, #66)
 
