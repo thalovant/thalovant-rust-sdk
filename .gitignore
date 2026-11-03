@@ -3,3 +3,5 @@ Cargo.lock
 *.rs.bk
 .env
 _identity.json
+# Shards a conformance run leaves beside its record (tests/common/mod.rs).
+*.parts/

@@ -75,15 +75,49 @@ fn target() -> Option<PathBuf> {
     std::env::var_os("THALOVANT_CONFORMANCE_OUT").map(PathBuf::from)
 }
 
+/// Which run of the suite this process belongs to.
+///
+/// Every file under `tests/` is its own test binary and its own process, so
+/// a run is not one process. `cargo test` (and `cargo nextest`) starts every
+/// one of them itself, so on Unix the parent process id names the run.
+/// `THALOVANT_CONFORMANCE_RUN` overrides it, for a runner that wants its own
+/// name or a platform with no parent id in `std`. Anything outside
+/// `[A-Za-z0-9_-]` is dropped, so the name is always one path component.
+fn run_id() -> String {
+    let named = std::env::var("THALOVANT_CONFORMANCE_RUN").unwrap_or_default();
+    let named: String = named
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if !named.is_empty() {
+        return named;
+    }
+    #[cfg(unix)]
+    {
+        format!("cargo-{}", std::os::unix::process::parent_id())
+    }
+    #[cfg(not(unix))]
+    {
+        // No parent id to tell one run from the next: delete the target to
+        // begin a run, or set THALOVANT_CONFORMANCE_RUN.
+        "run".to_string()
+    }
+}
+
 /// Record what this SDK produced for one case of one vector file.
 ///
 /// Written through on every call rather than at exit: each file under
 /// `tests/` is its own test binary, so the binary cases and the conversation
 /// cases run in different processes and neither can see the other's results.
 /// Each writes its own shard and then rebuilds the whole file from every
-/// shard present, so whichever finishes last leaves it complete.
+/// shard of the same run, so whichever finishes last leaves it complete.
 pub fn record(vector_file: &str, case: &str, produced: &Value) {
     let Some(target) = target() else { return };
+    record_into(&target, &run_id(), vector_file, case, produced);
+}
+
+/// [`record`], into `target`, as part of the run named `run`.
+pub fn record_into(target: &Path, run: &str, vector_file: &str, case: &str, produced: &Value) {
     let parts = PathBuf::from(format!("{}.parts", target.display()));
     fs::create_dir_all(&parts).expect("shard directory");
 
@@ -101,23 +135,32 @@ pub fn record(vector_file: &str, case: &str, produced: &Value) {
     guard.lock_exclusive().expect("lock");
 
     // A shard left by an earlier run must not be counted as this one's
-    // output: it could contribute a case this run never executed, which is
-    // the hole the whole mechanism exists to close. The runner deletes the
-    // target to begin a run, so its absence is what marks the first process
-    // in -- and doing this under the lock means exactly one process clears.
-    if !target.exists() {
+    // output: it could contribute a case this run never executed, or replace
+    // a digest this run computed, which is the hole the whole mechanism
+    // exists to close. Shards live in a directory per run and only this run's
+    // are merged. The first process of a run -- no directory of its own yet,
+    // or a target someone deleted to begin afresh -- clears every other
+    // run's, under the lock, so exactly one process clears. Keying on the
+    // target's absence alone was not enough: the documented command writes
+    // over the committed contracts/conformance-results.json, which is always
+    // there, so an earlier run's shards were merged into every later one.
+    let run_dir = parts.join(format!("run-{run}"));
+    if !run_dir.is_dir() || !target.exists() {
         for entry in fs::read_dir(&parts).into_iter().flatten().flatten() {
             let path = entry.path();
-            if path
-                .extension()
-                .is_some_and(|extension| extension == "json")
-            {
-                let _ = fs::remove_file(path);
+            if path.file_name().is_some_and(|name| name == ".lock") {
+                continue;
+            }
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
             }
         }
+        fs::create_dir_all(&run_dir).expect("run shard directory");
     }
 
-    let shard = parts.join(format!("{}.json", std::process::id()));
+    let shard = run_dir.join(format!("{}.json", std::process::id()));
     let mut mine: BTreeMap<String, BTreeMap<String, String>> = fs::read_to_string(&shard)
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
@@ -133,7 +176,7 @@ pub fn record(vector_file: &str, case: &str, produced: &Value) {
     entry.insert(case.to_string(), digest);
     fs::write(&shard, serde_json::to_string(&mine).expect("shard")).expect("write shard");
 
-    merge(&parts, &target);
+    merge(&run_dir, target);
     FileExt::unlock(&guard).expect("unlock");
 }
 
