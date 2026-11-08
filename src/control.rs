@@ -3203,9 +3203,7 @@ mod tests {
         let server = thread::spawn(move || {
             for turn in 0..2 {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut buffer = [0_u8; 8192];
-                let size = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request = read_full_request(&mut stream);
                 assert!(
                     request.starts_with("POST /v1/auth/token "),
                     "unexpected request: {request}"
@@ -3299,9 +3297,7 @@ mod tests {
         thread::spawn(move || {
             for turn in 0..=token_responses.len() {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut buffer = [0_u8; 8192];
-                let size = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request = read_full_request(&mut stream);
                 assert!(
                     !request.to_ascii_lowercase().contains("\r\nauthorization:"),
                     "device flow requests must not send Authorization: {request}"
@@ -3335,9 +3331,7 @@ mod tests {
         let server = thread::spawn(move || {
             for turn in 0..4 {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut buffer = [0_u8; 8192];
-                let size = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request = read_full_request(&mut stream);
                 assert!(
                     !request.to_ascii_lowercase().contains("\r\nauthorization:"),
                     "device flow requests must not send Authorization: {request}"
@@ -3419,9 +3413,7 @@ mod tests {
             ];
             for (status, body) in responses {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut buffer = [0_u8; 8192];
-                let size = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request = read_full_request(&mut stream);
                 assert!(
                     request.starts_with("POST /v1/auth/device/token "),
                     "unexpected request: {request}"
@@ -3519,9 +3511,7 @@ mod tests {
         let server = thread::spawn(move || {
             for _ in 0..3 {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut buffer = [0_u8; 8192];
-                let size = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request = read_full_request(&mut stream);
                 assert!(
                     request.starts_with("POST /v1/auth/device/token "),
                     "unexpected request: {request}"
@@ -3565,9 +3555,7 @@ mod tests {
         let server = thread::spawn(move || {
             for _ in 0..2 {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut buffer = [0_u8; 4096];
-                let size = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request = read_full_request(&mut stream);
                 assert!(
                     !request.to_ascii_lowercase().contains("\r\nauthorization:"),
                     "public hub requests must not send Authorization"
@@ -3610,9 +3598,7 @@ mod tests {
         let address = listener.local_addr().expect("test server address");
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
-            let mut buffer = [0_u8; 4096];
-            let size = stream.read(&mut buffer).expect("read request");
-            let request = String::from_utf8_lossy(&buffer[..size]);
+            let request = read_full_request(&mut stream);
             assert!(request.starts_with("GET /v1/operations/operation-1 "));
             assert!(
                 request
@@ -3649,9 +3635,7 @@ mod tests {
         let server = thread::spawn(move || {
             for _ in 0..6 {
                 let (mut stream, _) = listener.accept().expect("accept request");
-                let mut buffer = [0_u8; 8192];
-                let size = stream.read(&mut buffer).expect("read request");
-                let request = String::from_utf8_lossy(&buffer[..size]);
+                let request = read_full_request(&mut stream);
                 assert!(
                     request
                         .to_ascii_lowercase()
@@ -3779,9 +3763,7 @@ mod tests {
         let address = listener.local_addr().expect("test server address");
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
-            let mut buffer = [0_u8; 4096];
-            let size = stream.read(&mut buffer).expect("read request");
-            let request = String::from_utf8_lossy(&buffer[..size]);
+            let request = read_full_request(&mut stream);
             assert!(
                 request.starts_with("GET /v1/analytics/overview?"),
                 "unexpected request: {request}"
