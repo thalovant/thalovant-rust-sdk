@@ -201,6 +201,24 @@ async fn sign_in(
     (url, task)
 }
 
+/// `%2B` as `%2b`: the escapes' hex in lowercase, the rest as it is.
+fn lowercase_escapes(encoded: &str) -> String {
+    let mut lowered = String::with_capacity(encoded.len());
+    let mut hex_left = 0;
+    for character in encoded.chars() {
+        if hex_left > 0 {
+            lowered.push(character.to_ascii_lowercase());
+            hex_left -= 1;
+        } else {
+            if character == '%' {
+                hex_left = 2;
+            }
+            lowered.push(character);
+        }
+    }
+    lowered
+}
+
 fn shown(error: &ThalovantError) -> String {
     let mut shown = format!("{error}\n{error:?}\n{error:#?}");
     if let Some(problem) = error.api_problem() {
@@ -474,12 +492,20 @@ fn a_secret_is_also_hidden_as_a_url_or_a_form_writes_it() {
     // A form writes `~` as `%7E`, so that is hidden too.
     assert!(hidden_forms(&["a~b"]).contains(&"a%7Eb".to_string()));
     let forms = hidden_forms(&["a+b/c=", ""]);
-    for written in ["a+b/c=", "a%2Bb%2Fc%3D", "a%2bb%2fc%3d"] {
-        assert!(
-            forms.contains(&written.to_string()),
-            "{written} is not hidden: {forms:?}"
+    let hidden: Vec<&str> = forms.iter().map(String::as_str).collect();
+    // Upper, lower and mixed escapes alike; the rest of a value exactly.
+    for written in ["a+b/c=", "a%2Bb%2Fc%3D", "a%2bb%2fc%3d", "a%2bb%2Fc%3D"] {
+        assert_eq!(
+            scrub_text(&format!("<{written}>"), &hidden),
+            "<[redacted]>",
+            "{written}"
         );
     }
+    assert_eq!(
+        scrub_text("A%2Bb%2Fc%3D", &hidden),
+        "A%2Bb%2Fc%3D",
+        "a letter is not an escape"
+    );
     assert_eq!(lowercase_escapes("Ab%2Bc%3D"), "Ab%2bc%3d");
 }
 
@@ -493,10 +519,14 @@ async fn an_echo_of_the_code_encoded_or_as_a_number_never_reaches_the_error() {
                     let sent: Value = serde_json::from_str(body).expect("JSON");
                     let code = sent["code"].as_str().unwrap_or_default().to_string();
                     let encoded = urlencoding::encode(&code).into_owned();
+                    let lower = lowercase_escapes(&encoded);
+                    // One escape in lowercase, the others as they were.
+                    let mixed = encoded.replacen("%2B", "%2b", 1);
                     let mut problem = json!({
                         "detail": "invalid_grant",
                         "encoded": encoded,
-                        "lower": lowercase_escapes(&encoded),
+                        "lower": lower,
+                        "mixed": mixed,
                         "unrelated": 7,
                     });
                     if let Ok(number) = code.parse::<u64>() {
@@ -514,7 +544,11 @@ async fn an_echo_of_the_code_encoded_or_as_a_number_never_reaches_the_error() {
         let error = outcome.expect_err("refused");
         assert_eq!(error.status_code(), Some(400));
         let shown = shown(&error);
-        for written in hidden_forms(&[code]) {
+        let encoded = urlencoding::encode(code).into_owned();
+        let mut echoes = hidden_forms(&[code]);
+        echoes.push(lowercase_escapes(&encoded));
+        echoes.push(encoded.replacen("%2B", "%2b", 1));
+        for written in echoes {
             assert!(
                 !shown.contains(&written),
                 "an echo of the code reached the error"

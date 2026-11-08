@@ -551,32 +551,15 @@ fn hidden_forms(secrets: &[&str]) -> Vec<String> {
     for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
         let percent = urlencoding::encode(secret).into_owned();
         let form: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
-        let lower = lowercase_escapes(&percent);
-        for written in [secret.to_string(), percent, lower, form] {
+        // The escapes' hex is matched in any case (`written_at`), so `%2B`,
+        // `%2b` and a mix of them are all this one form.
+        for written in [secret.to_string(), percent, form] {
             if !forms.contains(&written) {
                 forms.push(written);
             }
         }
     }
     forms
-}
-
-/// `%2B` as `%2b`: the escapes' hex in lowercase, the rest as it is.
-fn lowercase_escapes(encoded: &str) -> String {
-    let mut lowered = String::with_capacity(encoded.len());
-    let mut hex_left = 0;
-    for character in encoded.chars() {
-        if hex_left > 0 {
-            lowered.push(character.to_ascii_lowercase());
-            hex_left -= 1;
-        } else {
-            if character == '%' {
-                hex_left = 2;
-            }
-            lowered.push(character);
-        }
-    }
-    lowered
 }
 
 /// A refusal's body with `hidden` taken out, before any message is made of
@@ -609,7 +592,7 @@ fn scrub_text(text: &str, hidden: &[&str]) -> String {
             let mut scrubbed = String::with_capacity(part.len());
             let mut rest = part;
             while let Some(next) = rest.chars().next() {
-                match secrets.iter().find(|secret| rest.starts_with(**secret)) {
+                match secrets.iter().find(|secret| written_at(rest, secret)) {
                     Some(secret) => {
                         scrubbed.push_str(REDACTED_SECRET);
                         rest = &rest[secret.len()..];
@@ -624,6 +607,28 @@ fn scrub_text(text: &str, hidden: &[&str]) -> String {
         })
         .collect::<Vec<_>>()
         .join(REDACTED_SECRET)
+}
+
+/// Whether `text` begins with `secret`, a percent-escape's two hex digits
+/// in either case (`%2b` is `%2B`); every other character exactly.
+fn written_at(text: &str, secret: &str) -> bool {
+    let (text, secret) = (text.as_bytes(), secret.as_bytes());
+    if text.len() < secret.len() {
+        return false;
+    }
+    let mut hex_left = 0;
+    secret.iter().zip(text).all(|(wanted, seen)| {
+        let same = if hex_left > 0 {
+            hex_left -= 1;
+            wanted.eq_ignore_ascii_case(seen)
+        } else {
+            wanted == seen
+        };
+        if *wanted == b'%' && hex_left == 0 && same {
+            hex_left = 2;
+        }
+        same
+    })
 }
 
 fn scrub_map(map: Map<String, Value>, hidden: &[&str]) -> Map<String, Value> {
