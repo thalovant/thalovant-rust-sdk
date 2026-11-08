@@ -1,4 +1,12 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Add the chat apps section (connectors, networks and the /v1/bridges owner routes) for 0.16.0.
+Last Edit: Codex - 2026-11-07 - Motive: Add the canonical Thalovant logo with light and dark theme support.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/thalovant/.github/main/profile/assets/thalovant-logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/thalovant/.github/main/profile/assets/thalovant-logo-light.png">
+    <img src="https://raw.githubusercontent.com/thalovant/.github/main/profile/assets/thalovant-logo-light.png" alt="Thalovant" width="320">
+  </picture>
+</p>
 
 # Thalovant Rust SDK
 
