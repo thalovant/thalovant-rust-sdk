@@ -425,13 +425,15 @@ async fn a_transport_failure_during_the_exchange_carries_nothing_of_the_request(
 #[tokio::test]
 async fn a_message_cut_to_length_keeps_no_part_of_a_secret() {
     // The verifier starts ten characters before the display line's
-    // 200-character cut, so a scrub after the cut could not find it whole.
+    // 200-character cut, so a scrub after the cut could not find it whole:
+    // the line is the problem as JSON, `{"detail":"` (11 characters), then
+    // the 179-character padding.
     let api = Api::start(Arc::new(|method: &str, _: &str, body: &str| match method {
         "GET" => Reply::Answer(200, CONFIG.into()),
         _ => {
             let sent: Value = serde_json::from_str(body).expect("JSON");
             let verifier = sent["code_verifier"].as_str().unwrap_or_default();
-            let detail = format!("{}{verifier}", "a".repeat(190));
+            let detail = format!("{}{verifier}", "a".repeat(179));
             Reply::Answer(400, json!({ "detail": detail }).to_string())
         }
     }))
@@ -454,9 +456,14 @@ async fn a_message_cut_to_length_keeps_no_part_of_a_secret() {
         !shown(&error).contains(&prefix),
         "part of the verifier reached the error"
     );
+    let line = error.to_string();
+    assert!(
+        line.contains(&"a".repeat(179)),
+        "the display line reaches the cut: {line}"
+    );
     assert_eq!(
         error.api_detail(),
-        Some(format!("{}[redacted]", "a".repeat(190)).as_str())
+        Some(format!("{}[redacted]", "a".repeat(179)).as_str())
     );
 }
 
