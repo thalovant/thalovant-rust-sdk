@@ -1,6 +1,6 @@
 [package]
 name = "thalovant"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 description = "Rust SDK for direct Thalovant hub data-plane clients and agents"
 readme = "README.md"
@@ -29,8 +29,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.11"
+# Constant-time comparison of a browser sign-in's state; already in the tree
+# through snow and digest.
+subtle = "2"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+# `net` and `io-util` for the loopback listener a browser sign-in waits on.
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 urlencoding = "2"
@@ -45,6 +49,11 @@ cookie_store = { version = "=0.22.1", default-features = false }
 time = { version = "=0.3.55", default-features = false }
 idna_adapter = "=1.2.2"
 fancy-regex = "0.20.0"
+
+# Exclusive address use for the browser sign-in's loopback port on Windows,
+# so that no other socket can share it. Already in the Windows tree (tokio).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 # The conformance recorder locks its output: each file under tests/ is its

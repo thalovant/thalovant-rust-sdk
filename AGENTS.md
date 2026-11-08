@@ -11,6 +11,7 @@ Rules:
 - Do not create a release for internal platform changes with no Rust SDK impact; record `no SDK impact` in the coordinated change instead.
 - Validate package contents and an install from crates.io before declaring a release complete.
 - Update affected `docs.thalovant.com` SDK pages in the same release train.
+- Sign-in: keep device login (`login_with_browser`, `login_with_browser_as`, `begin_device_login`, `poll_device_login`, `describe_device_login`) unchanged; `interactive_login` prefers browser sign-in and falls back to device login only before the browser is opened. Never log or return the authorization code, the PKCE verifier, the state or a token in an error. `tests/conformance/browser-login-vectors.json` is the shared contract, vendored byte for byte from the Python reference (its `docs/browser-login-porting.md`); `tests/browser_login.rs` and `src/loopback_tests.rs` run it.
 
 Validate with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, and `cargo package --allow-dirty --list`. A published release also requires a clean crate to resolve `thalovant@<version>` from crates.io and pass `cargo check`.
 

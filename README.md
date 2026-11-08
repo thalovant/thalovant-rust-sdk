@@ -1,4 +1,4 @@
-Last Edit: Codex - 2026-11-07 - Motive: Add the canonical Thalovant logo with light and dark theme support.
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Sign-in section for browser sign-in (0.17.0), with the final reference's wording; the quick start signs in with interactive_login().
 
 <p align="center">
   <picture>
@@ -33,15 +33,18 @@ cargo add thalovant
 
 ```rust
 use thalovant::{
-    BootstrapIdentityOptions, Client, ControlPlane, HubProtocol, RequestOptions,
+    BootstrapIdentityOptions, Client, ControlPlane, HubProtocol, InteractiveLoginOptions,
+    RequestOptions,
 };
 
 #[tokio::main]
 async fn main() -> thalovant::Result<()> {
     let mut control = ControlPlane::default();
 
-    // Auth is required when creating a client identity.
-    control.login("you@example.com", "password", None).await?;
+    // Auth is required when creating a client identity. This opens the browser
+    // on this machine, or prints a code to approve from any browser where there
+    // is none.
+    control.interactive_login(InteractiveLoginOptions::default()).await?;
 
     let result = control
         .create_client_identity_for_hub_id(
@@ -74,6 +77,65 @@ Keep `result.identity` secret: it holds the client credentials the hub uses.
 `result.as_value(true)` embeds the real credentials and the raw `hub` and
 `client` bodies, so never log it or write it anywhere world-readable. For
 diagnostics use `result.as_value(false)`, which redacts them.
+
+## Sign in
+
+```rust
+use thalovant::{ControlPlane, InteractiveLoginOptions, LoginMethod};
+
+let mut control = ControlPlane::default();
+// The browser on this machine, or a device code where there is none.
+control.interactive_login(InteractiveLoginOptions::default()).await?;
+
+// LoginMethod::Browser or LoginMethod::Device forces one.
+let forced = InteractiveLoginOptions {
+    method: LoginMethod::Device,
+    ..Default::default()
+};
+control.interactive_login(forced).await?;
+```
+
+`interactive_login` opens your browser at the Thalovant consent page and
+listens on `127.0.0.1` for the answer (OAuth with PKCE on a loopback redirect,
+RFC 8252). It always prints the address too, in case the browser does not
+open. The browser that approves hands the code to this computer's
+`127.0.0.1`, so a link or code sent to someone on another computer delivers
+nothing to the sender. That is all it promises: a forwarded callback port
+(`ssh -L`, a port-forwarding tool) or another user of the same computer can
+still complete a sign-in.
+
+On a machine that cannot show a browser, it prints a code to enter at
+`thalovant.com/activate` from any browser instead (device login): over SSH
+(`SSH_CONNECTION` or `SSH_TTY` set to a non-empty value), in CI (`CI`, any
+non-empty value), or on Linux and the BSDs with
+neither `DISPLAY` nor `WAYLAND_DISPLAY`. It does the same against an API that
+does not offer browser sign-in yet. Once the browser has been opened, its
+outcome stands: a denial or a timeout is returned, never turned into a device
+login.
+
+`browser_login(BrowserLoginOptions)` is the browser sign-in on its own. Its
+options are `scopes` (none asks for the API's default, `hubs:read` and
+`clients:write`), `device_name` (what the consent page and the token show;
+`thalovant-rust-sdk on <hostname>` when `None`, nothing when empty, at most
+120 characters),
+`open_browser`, `timeout` (300 seconds), `prompt` (present the URL yourself)
+and `opener` (open it yourself). Both calls return the token answer and keep
+the token exactly as a device login does, so `revoke_api_token(None)` revokes
+it. Dropping the future cancels the sign-in and closes the port.
+
+| Outcome | Error |
+| :-- | :-- |
+| Denied in the browser | `ThalovantError::DeviceAuthorizationDenied` |
+| No answer within the timeout | `ThalovantError::DeviceAuthorizationExpired` |
+| Another error from the consent page, or no code | `ThalovantError::BrowserLoginFailed` (`api_code()` names it) |
+| A code the API will not exchange | `ThalovantError::ApiResponse`, HTTP 400, `api_detail()` `invalid_grant` |
+| An API without browser sign-in | `ThalovantError::ApiResponse`, HTTP 404 (`interactive_login` uses device login) |
+
+The code, the PKCE verifier, the state and the token never appear in an
+error. Device login (`login_with_browser`, `begin_device_login`,
+`poll_device_login`) is unchanged. The building blocks (`browser_authorization_url`,
+`loopback_redirect_uri`, `can_open_browser`, `NativeSignInConfig`, ...) are in
+`thalovant::native_auth`.
 
 ## Documentation
 

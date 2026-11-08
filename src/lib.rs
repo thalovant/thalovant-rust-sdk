@@ -16,6 +16,7 @@ pub mod home;
 pub mod hubs;
 pub mod identity;
 pub mod intents;
+mod loopback;
 pub mod native_auth;
 pub mod noise;
 pub mod noise_store;
@@ -45,9 +46,10 @@ pub use constants::*;
 pub use context::{build_client_context, ClientContextOptions};
 pub use control::{
     AnalyticsOverviewOptions, ApiToken, BootstrapIdentityOptions, BootstrapIdentityResult,
-    ControlPlane, DeviceAuthorization, DeviceLoginOptions, DeviceLoginRequest, DevicePrompt,
-    HubSkillWaitOptions, LoginOptions, MarketplaceSkillsOptions, MemoryListOptions,
-    OperationResource, OperationStatus, ReleaseOptions, SkillInstallOptions,
+    BrowserLoginOptions, BrowserOpener, BrowserPrompt, ControlPlane, DeviceAuthorization,
+    DeviceLoginOptions, DeviceLoginRequest, DevicePrompt, HubSkillWaitOptions,
+    InteractiveLoginOptions, LoginMethod, LoginOptions, MarketplaceSkillsOptions,
+    MemoryListOptions, OperationResource, OperationStatus, ReleaseOptions, SkillInstallOptions,
     CONNECTION_TYPE_HOME_ASSISTANT, DEFAULT_ADMISSION_TIMEOUT, DEFAULT_CONTROL_API_URL,
     DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_OPERATION_POLL_INTERVAL, DEFAULT_SKILL_SOURCE_TYPE,
     HOME_ASSISTANT_CLIENT_ID, HOME_ASSISTANT_SCOPES,
