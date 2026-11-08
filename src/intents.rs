@@ -2193,6 +2193,47 @@ mod tests {
         assert!(inventory.has_phrases());
     }
 
+    /// The retry contract on an empty listing: the language asked is kept,
+    /// and `listed_in` names the tag that answered.
+    #[tokio::test]
+    async fn an_empty_listing_is_answered_by_its_usual_form() {
+        let hub = FakeHub::default();
+        let inventory = inventory(&hub, ["en-CA"], &options(None)).await.unwrap();
+
+        assert_eq!(inventory.languages, ["en-CA"], "what was asked");
+        assert_eq!(inventory.listed_in, ["en-us"], "the tag that answered");
+        assert!(inventory.has_phrases());
+        assert_eq!(listings(&hub), ["en-CA", "en-us"]);
+        assert_eq!(hub_listings(&hub), 0, "the usual form answered");
+        let weather = inventory
+            .skills
+            .iter()
+            .find(|skill| skill.skill_id == WEATHER)
+            .expect("weather skill");
+        assert_eq!(
+            weather.intents[0].phrases_for(&inventory.listed_in[0])[0],
+            "what is the weather"
+        );
+    }
+
+    /// With `nearest` off an empty listing is the answer: listed once, and
+    /// `listed_in` is the tag asked.
+    #[tokio::test]
+    async fn an_empty_listing_is_not_retried_when_nearest_is_off() {
+        let hub = FakeHub::default();
+        let opts = IntentInventoryOptions {
+            nearest: false,
+            ..Default::default()
+        };
+        let inventory = inventory(&hub, ["en-CA"], &opts).await.unwrap();
+
+        assert_eq!(inventory.languages, ["en-CA"]);
+        assert_eq!(inventory.listed_in, ["en-CA"]);
+        assert!(inventory.skills.is_empty());
+        assert_eq!(listings(&hub), ["en-CA"]);
+        assert_eq!(hub_listings(&hub), 0);
+    }
+
     // A language the hub never loaded ------------------------------------------
     //
     // Measured on all 13 public hubs on 2026-10-11: a hub loads its `lang` and

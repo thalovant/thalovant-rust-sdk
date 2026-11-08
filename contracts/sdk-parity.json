@@ -2,7 +2,7 @@
   "capabilities": {
     "api-errors": {
       "implementation": {
-        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
+        "src/control.rs": "f2740939c59acd088621c4f88508947e809cc52f27a9d9222b621b93e5b57d24",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f",
         "src/redact.rs": "e84cc12f06c3def1be5475486aa6da53288710bb5ab245beccb60787dfa7d1b8"
@@ -39,7 +39,7 @@
     "chat-apps": {
       "implementation": {
         "src/chat_apps.rs": "68f3ed5dd0c313baf5d4e0297b24df6e95455e4b5a787a1e2eab4e876a6ec8b5",
-        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
+        "src/control.rs": "f2740939c59acd088621c4f88508947e809cc52f27a9d9222b621b93e5b57d24",
         "src/control/bridges.rs": "07bb2ff6f8e53b1936b0d4bed03126ec4ee7dee7618b0794abb8e4969ba067b7",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f"
@@ -56,7 +56,7 @@
     },
     "connection-admission": {
       "implementation": {
-        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
+        "src/control.rs": "f2740939c59acd088621c4f88508947e809cc52f27a9d9222b621b93e5b57d24",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f"
       },
@@ -73,7 +73,7 @@
     },
     "connection-kinds": {
       "implementation": {
-        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
+        "src/control.rs": "f2740939c59acd088621c4f88508947e809cc52f27a9d9222b621b93e5b57d24",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f"
       },
@@ -96,7 +96,7 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
+        "src/control.rs": "f2740939c59acd088621c4f88508947e809cc52f27a9d9222b621b93e5b57d24",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
         "src/native_auth.rs": "3672a473b3388e41db298b5c1661eba581d06d8e487dc226dd162c2c8053f49d"
       }
@@ -118,7 +118,7 @@
     },
     "device-login": {
       "implementation": {
-        "src/control.rs": "c798ac76cabb45162032128756fe601a20ef9489a12c07e6797caa8e77609cac",
+        "src/control.rs": "f2740939c59acd088621c4f88508947e809cc52f27a9d9222b621b93e5b57d24",
         "src/errors.rs": "7a72f70864f577c471576ffbb21396784f785c1cbd4a8f0db7ac10bea802a3ad",
         "src/lib.rs": "1a33e3a4a27d944c4698dc186aa03d1d13a9b481ce60ca0dcb0205fc783f773f"
       },
@@ -208,7 +208,7 @@
     },
     "listing": {
       "implementation": {
-        "src/intents.rs": "804da098753f0cf9634c01f67d5df69ce38c70d9c91cf06483c9a9daef4cdbeb",
+        "src/intents.rs": "ce0493615aa453bd9b76cfb231b4fe8e5a6524fdb3d480c52495433fe2d1c606",
         "src/listing.rs": "96e2981d0c37168ef3e98c1946241754b77d628350d1e94078046a4b351d2a38"
       },
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence.",
