@@ -13,10 +13,12 @@ Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Browser sign-in (0.17.0, brows
 **Verification** (current stable compiler, rustc 1.99.1, Linux):
 - `cargo fmt --check`: clean.
 - `cargo clippy --all-targets --all-features -- -D warnings`: clean.
-- `THALOVANT_CONFORMANCE_OUT=contracts/conformance-results.json cargo test --all-features -- --test-threads=2`: 411 passed, 0 failed (318 library unit tests including the 12 in `src/loopback_tests.rs`, 89 in the integration binaries including the 21 in `tests/browser_login.rs`, and 4 doc tests). The two new suites were run three more times: stable.
+- `THALOVANT_CONFORMANCE_OUT=contracts/conformance-results.json cargo test --all-features -- --test-threads=2`: 412 passed, 0 failed after the CI round below (319 library unit tests including the 13 in `src/loopback_tests.rs`, 89 in the integration binaries including the 21 in `tests/browser_login.rs`, and 4 doc tests; 411 before it). The two new suites were run three more times: stable.
 - `cargo package --allow-dirty --list`: succeeds and lists the new files. `cargo doc --no-deps --all-features`: no warnings.
 - `check-sdk-parity.py --workspace <ws> --consumer thalovant-rust-sdk` against the Python PR head (`e3999cb`): verified, conformance results compared. Against Python `main` (44b6e2b): verified, with the expected rollout note that the reference does not know `browser-login` yet.
 - Not run here: the Windows build (no Windows target installed; `exclusive_address_use` is `#[cfg(windows)]`), macOS, and the Rust 1.88 job. CI's `windows-latest`, `macos-latest` and `minimum-rust` jobs cover them.
+
+**CI round (same day).** `test (macos-latest)` failed one listener test: a request head over 16 KiB got a connection reset instead of its 400, because the listener closed with the rest of the head unread and macOS discards an answer once the reset arrives. Each answered connection now drains what is left (at most 2 s and 1 MiB) before it closes, and a new test sends large bodies and heads. Linux keeps the answer readable after a reset, so the new test passes there with or without the fix (checked by disabling the drain); the macOS job is what proves it. The full suite was re-run with the recorder after the fix (see the counts above, updated), and the evidence hashes of `src/loopback.rs` and `src/loopback_tests.rs` in `browser-login` were recomputed from the new files.
 
 ### Transparency report
 

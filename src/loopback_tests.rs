@@ -253,6 +253,52 @@ async fn an_oversized_head_or_one_that_is_not_a_request_is_400_and_the_wait_goes
 }
 
 #[tokio::test]
+async fn an_answer_is_read_whole_although_the_browser_sent_more_than_was_read() {
+    // Unread bytes at close would reset the connection, and a reset can
+    // throw away the answer before it is read: on macOS it did, for the
+    // oversized head above, until the listener drained what was left. Linux
+    // keeps an answer that arrived readable after a reset, so this case only
+    // fails there (the CI macOS job runs it).
+    let spec = browser_vectors();
+    let mut listener = LoopbackListener::bind(STATE.to_string())
+        .await
+        .expect("bind");
+    let port = listener.port();
+    let tabs = tokio::spawn(async move {
+        let mut answers = Vec::new();
+        for size in [1, 64 * 1024, 300 * 1024] {
+            let body = "b".repeat(size);
+            let request = format!(
+                "POST /callback?code=c&state={STATE} HTTP/1.1\r\nContent-Length: {size}\r\n\r\n{body}"
+            );
+            answers.push(send(port, request.into_bytes()).await);
+        }
+        let mut huge = format!("GET /callback?state={STATE} HTTP/1.1\r\nX-Padding: ").into_bytes();
+        huge.extend(std::iter::repeat_n(b'a', 200 * 1024));
+        huge.extend_from_slice(b"\r\n\r\n");
+        answers.push(send(port, huge).await);
+        answers
+    });
+    let answers = tokio::select! {
+        accepted = listener.wait(Duration::from_secs(10)) => {
+            panic!("no request here may be accepted: {accepted:?}")
+        }
+        answers = tabs => answers.expect("the tabs"),
+    };
+    assert_eq!(
+        answers
+            .iter()
+            .map(|answer| answer.status)
+            .collect::<Vec<_>>(),
+        vec![404, 404, 404, 400]
+    );
+    for answer in &answers {
+        check_page(answer, &spec);
+    }
+    listener.close().await;
+}
+
+#[tokio::test]
 async fn a_connection_that_sends_nothing_does_not_hold_the_close() {
     let mut listener = LoopbackListener::bind(STATE.to_string())
         .await

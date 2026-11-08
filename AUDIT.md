@@ -31,6 +31,8 @@ Known issues, technical debt and their status, from test runs and code reading. 
 
 ## Fixed
 
+- **An oversized request was answered with a reset on macOS** (found by CI on #90 before merge). `serve` in `src/loopback.rs` answered a request head over 16 KiB with its 400 and closed the socket with the rest of the head unread; the kernel then reset the connection, and macOS dropped the answer before the client read it (`an_oversized_head_or_one_that_is_not_a_request_is_400_and_the_wait_goes_on` failed on `macos-latest` with ECONNRESET; Linux keeps an answer that arrived readable). Every answered connection now drains what the browser still sends, for at most 2 s and 1 MiB (`linger`), before it is closed; `an_answer_is_read_whole_although_the_browser_sent_more_than_was_read` sends bodies of up to 300 KiB and a 200 KiB head.
+
 - **Conformance record could carry an earlier run's cases** (CodeRabbit on #64). `record()` in `tests/common/mod.rs` cleared stale shards only when `THALOVANT_CONFORMANCE_OUT` did not exist yet. The documented target, `contracts/conformance-results.json`, is committed, so it always exists. Shards are now scoped to a run, and `tests/conformance_record.rs` fails if an earlier run's shard reaches the record.
 
 - **The 0.11.0 changelog gave the wrong quota-count ceiling** (CodeRabbit on #65, outside the diff). It said counts stop at the signed 64-bit maximum. `whole_count` in `src/refusal.rs` keeps a count only up to `MAX_COUNT`, 2^53 − 1, and reads anything larger as 0. The entry now says so. The `## 0.15.0` heading, replaced by mistake when the 0.16.0 entry was added (13d9640), is back.

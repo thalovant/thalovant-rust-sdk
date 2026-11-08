@@ -63,6 +63,11 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long closing waits for an accepted tab's page to be written.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
+/// How long, and how much, an answered connection is read for before it is
+/// closed, so that what the browser still sends cannot reset the connection
+/// before the browser has read its answer.
+const LINGER: Duration = Duration::from_secs(2);
+const LINGER_BYTES: usize = 1024 * 1024;
 /// How many connections may wait to be accepted.
 const BACKLOG: u32 = 64;
 
@@ -272,6 +277,7 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
         Ok(Ok(Head::Complete(head))) => head,
         Ok(Ok(Head::TooLarge)) => {
             reply(&mut stream, 400, WRONG_STATE_TEXT).await;
+            linger(&mut stream).await;
             return;
         }
         // Closed, broken or too slow: that connection's alone.
@@ -279,6 +285,7 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
     };
     let Some((method, target)) = request_line(&head) else {
         reply(&mut stream, 400, WRONG_STATE_TEXT).await;
+        linger(&mut stream).await;
         return;
     };
     let (status, callback) = classify_request(&method, &target, &shared.state);
@@ -289,6 +296,7 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
             WRONG_STATE_TEXT
         };
         reply(&mut stream, status, text).await;
+        linger(&mut stream).await;
         return;
     };
     let first = shared
@@ -300,6 +308,7 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
         // A second answer with the right state, after the first was
         // accepted, is not this sign-in's any more either.
         reply(&mut stream, 400, WRONG_STATE_TEXT).await;
+        linger(&mut stream).await;
         return;
     };
     let signed_in = if first.send(callback).is_ok() {
@@ -329,6 +338,7 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
     if let Some(done) = done {
         let _ = done.send(());
     }
+    linger(&mut stream).await;
 }
 
 /// Write one answer and close the connection; a tab that went away changes
@@ -337,6 +347,27 @@ async fn reply(stream: &mut TcpStream, status: u16, text: &str) {
     let _ = stream.write_all(&response_bytes(status, text)).await;
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
+}
+
+/// Read and drop what the browser still sends after its answer -- the rest
+/// of an oversized head, a body nobody asked for -- until it closes its side,
+/// for at most [`LINGER`] and [`LINGER_BYTES`].
+///
+/// Closing a socket that still holds unread data resets the connection, and
+/// a reset can throw away the answer before the browser has read it (macOS
+/// does). Closing the listener aborts a connection that is still lingering.
+async fn linger(stream: &mut TcpStream) {
+    let mut sink = [0_u8; 8192];
+    let mut left = LINGER_BYTES;
+    let drain = async {
+        while left > 0 {
+            match stream.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => left = left.saturating_sub(read),
+            }
+        }
+    };
+    let _ = tokio::time::timeout(LINGER, drain).await;
 }
 
 /// No other socket may share the port: on Windows a socket bound without
