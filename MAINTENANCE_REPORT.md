@@ -27,9 +27,11 @@ CodeRabbit's review bodies on merged PRs hold 16 items that are not review threa
 
 Also fixed here: the `## 0.15.0 — 2026-10-11` heading, replaced by mistake when the 0.16.0 entry was added (13d9640).
 
-**Held, not merged: #88.** It adds `an_empty_listing_is_answered_by_its_usual_form` and `an_empty_listing_is_not_retried_when_nearest_is_off` to `src/intents.rs`, and moves the nine single-`read()` test servers in `src/control.rs` to `read_full_request`. It changes only test code, but `auto-release.yml` publishes a patch for any change under `src/`, so merging it alone would ship a crate with no code change. It waits for the next `src/` change (`SUGGESTIONS.md` item 7).
+**Held, not merged: #88.** It adds `an_empty_listing_is_answered_by_its_usual_form` and `an_empty_listing_is_not_retried_when_nearest_is_off` to `src/intents.rs`, and moves the nine single-`read()` test servers in `src/control.rs` to `read_full_request`. It changes only test code, but `auto-release.yml` cuts a release for any change under `src/` since the latest tag, so merging it alone would ship a crate with no code change. It waits for the next `src/` change (`SUGGESTIONS.md` item 7).
 
 **Verification.** This change touches only `CHANGELOG.md` and the notes files, none of them a release path. On the branch of #88, on the current stable compiler: `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` are clean, and `cargo test --all-features -- --test-threads=2` passes (378 passed, 0 failed, doc tests included); `cargo package --allow-dirty --list` succeeds; `check-sdk-parity.py --consumer thalovant-rust-sdk` against the Python reference verifies.
+
+**Review round (#89).** CodeRabbit's ten comments on this change were all about wording, and nine are taken. The release rule now names both cases: the untagged `Cargo.toml` version, or the next patch, plus a release when no tag exists. The hard-link workaround names a filesystem with hard links, since a local exFAT disk has none. 2^53 − 1 is the binary64 limit, not every decoder's. The `ws://` advice is about the endpoint, not where the hub runs. The `ws://` suggestion checks the address actually connected to, not the name `localhost`, and only limits cleartext to loopback. The proposed release rule leaves `*_tests.rs` files out rather than skipping a push. The tenth asks for the cross-SDK `ws://` change itself, which stays `SUGGESTIONS.md` item 6.
 
 ### Transparency report
 

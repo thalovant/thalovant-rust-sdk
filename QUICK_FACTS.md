@@ -10,7 +10,7 @@ Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: Release row names the paths th
 | Licence | MIT |
 | Binaries | none: a library crate |
 | Default control API | `https://api.thalovant.com` (`DEFAULT_CONTROL_API_URL`) |
-| Release | `auto-release.yml`, on every push to `main` that changes `src/` (tests included), `Cargo.toml` or `LICENSE` since the last tag: publishes the version in `Cargo.toml` when its tag does not exist yet, else bumps the patch and publishes that |
+| Release | `auto-release.yml`, on a push to `main`, when `src/` (tests included), `Cargo.toml` or `LICENSE` changed since the latest `v*` tag, or when no such tag exists: publishes the version in `Cargo.toml` when its tag does not exist yet, else bumps the patch and publishes that |
 | Parity contract | `contracts/sdk-parity.json`, checked by the Python SDK's `scripts/check-sdk-parity.py` |
 
 ## Entry points
