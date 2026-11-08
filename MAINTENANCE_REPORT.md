@@ -1,6 +1,28 @@
-Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: CodeRabbit review-body close-out on #21, #23, #30, #37, #40, #65 and #66.
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Browser sign-in (0.17.0, browser-login) and its verification.
 
 # Maintenance report
+
+## 2026-11-08: browser sign-in (0.17.0)
+
+**Change.** Ported browser sign-in from the Python reference (thalovant-python-sdk#113, `e3999cb`, porting brief `docs/browser-login-porting.md`): `ControlPlane::browser_login` and `ControlPlane::interactive_login` with `BrowserLoginOptions`, `InteractiveLoginOptions`, `LoginMethod`, `BrowserPrompt` and `BrowserOpener` (`src/control/browser_login.rs`, re-exported from `src/control.rs` and `src/lib.rs`); the loopback listener and callback classifier (`src/loopback.rs`, private, with its suite in `src/loopback_tests.rs`); the URL builder, redirect, state, device name, browser rule and configuration parser (`src/native_auth.rs`); and `ThalovantError::BrowserLoginFailed` (`src/errors.rs`). `login_with_browser_as` now delegates to a private `device_login`, which the chooser calls with its opener; device login's behaviour is unchanged. `random_url_safe` reads the OS random source directly (`SysRng`). Dependencies: `subtle` 2, `windows-sys` 0.61 on Windows, tokio `net` and `io-util`, all already in the tree. Version 0.17.0. README "Sign in" section (and the quick start now uses `interactive_login`), CHANGELOG, `AGENTS.md`, `QUICK_FACTS.md`, `FAQ.md`, `AUDIT.md` and `SUGGESTIONS.md`.
+
+**Parity.** `tests/conformance/browser-login-vectors.json` vendored byte for byte (sha256 `9058adf2ad30fd8b7f255882ce718865170d0d4b84d36f8fbfa23bde51d1651e`, 98 cases). `contracts/sdk-parity.json`: `reference_digests` keeps `57c7e71f6456…` and adds `49744ee385bf…` (both recomputed here with `check-sdk-parity.py --snapshot` on Python `main` 44b6e2b and on `e3999cb`); a new `browser-login` entry binds the six implementation files and the four test files (the colocated `src/loopback_tests.rs` as test evidence, as `contracts/README.md` in the reference asks); the hashes of `src/control.rs`, `src/errors.rs`, `src/lib.rs` and `src/native_auth.rs` were refreshed in the 12 other capabilities that name them (api-errors, chat-apps, connection-admission, connection-kinds, control, device-login, home-link, identity, link-carriers, refusal, runtime, session), because this change edits those files, after the full suite re-ran. `contracts/conformance-results.json` was rewritten by that run: the nine existing vector files' results are byte-identical to before, and all 98 browser-login case digests equal the reference's.
+
+**Rationale.** A device code can be relayed to somebody else; a loopback redirect cannot, so a machine with a browser signs in through it and device login stays the fallback. Every SDK the reference marks `required` ports the same contract.
+
+**Verification** (current stable compiler, rustc 1.99.1, Linux):
+- `cargo fmt --check`: clean.
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- `THALOVANT_CONFORMANCE_OUT=contracts/conformance-results.json cargo test --all-features -- --test-threads=2`: 411 passed, 0 failed (318 library unit tests including the 12 in `src/loopback_tests.rs`, 89 in the integration binaries including the 21 in `tests/browser_login.rs`, and 4 doc tests). The two new suites were run three more times: stable.
+- `cargo package --allow-dirty --list`: succeeds and lists the new files. `cargo doc --no-deps --all-features`: no warnings.
+- `check-sdk-parity.py --workspace <ws> --consumer thalovant-rust-sdk` against the Python PR head (`e3999cb`): verified, conformance results compared. Against Python `main` (44b6e2b): verified, with the expected rollout note that the reference does not know `browser-login` yet.
+- Not run here: the Windows build (no Windows target installed; `exclusive_address_use` is `#[cfg(windows)]`), macOS, and the Rust 1.88 job. CI's `windows-latest`, `macos-latest` and `minimum-rust` jobs cover them.
+
+### Transparency report
+
+- **AI model:** Claude Opus 5.5 (`claude-opus-5-5`).
+- **Actions taken:** read the contract, the Python reference and its brief, vectors and parity tooling; wrote the browser sign-in, the listener, the chooser, the new error variant, both test suites and the vendored vectors; updated the parity record (new entry, both digests, refreshed hashes for the files changed) and the conformance record from a full run; wrote the README, CHANGELOG and these notes; ran the checks above.
+- **Oversight:** automated tests, the parity checker and CI. No human reviewed this change before the pull request was opened; it is not merged, tagged or released by the agent.
 
 ## 2026-11-07: CodeRabbit review-body close-out
 

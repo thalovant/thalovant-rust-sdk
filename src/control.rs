@@ -1,5 +1,9 @@
 mod bridges;
+mod browser_login;
 mod hub_skills;
+pub use browser_login::{
+    BrowserLoginOptions, BrowserOpener, BrowserPrompt, InteractiveLoginOptions, LoginMethod,
+};
 pub use hub_skills::HubSkillWaitOptions;
 
 use crate::{
@@ -658,6 +662,18 @@ impl ControlPlane {
         options: DeviceLoginOptions,
         client_id: Option<&str>,
     ) -> Result<Value> {
+        self.device_login(options, client_id, None).await
+    }
+
+    /// The whole device login, opening the verification page with `opener`
+    /// when [`ControlPlane::interactive_login`] was given one, and with the
+    /// platform default otherwise.
+    async fn device_login(
+        &mut self,
+        options: DeviceLoginOptions,
+        client_id: Option<&str>,
+        opener: Option<&BrowserOpener>,
+    ) -> Result<Value> {
         let DeviceLoginOptions {
             scopes,
             client_name,
@@ -678,7 +694,7 @@ impl ControlPlane {
         }
         if open_browser {
             if let Some(uri) = grant.verification_uri_complete.as_deref() {
-                open_url_in_browser(uri);
+                browser_login::open_in_browser(uri, opener);
             }
         }
         let token = self

@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Item 7 now cites #88 in the past tense.
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Browser sign-in follow-ups (items 8 to 11).
 
 # Suggestions
 
@@ -43,3 +43,27 @@ Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Item 7 now cites #88 in the pa
 - **Problem:** `auto-release.yml` treats any change under `src/` since the latest tag as release-relevant. A change to a `#[cfg(test)]` module therefore publishes a crate whose code did not change. The contract tests and full-request test servers asked for on #66 and #21 waited in #88 for that reason.
 - **Proposed solution:** move unit-test modules into `src/**/*_tests.rs` files included with `#[cfg(test)] #[path = ...]`, as `src/transport_noise_tests.rs` already is, and have the planner in `auto-release.yml` (and `release_guard.py`) leave `*_tests.rs` files out when it looks for release-relevant changes since the latest tag. Every other file under `src/`, `Cargo.toml` and `LICENSE` stays release-relevant, so a push that changes a test file and the manifest still releases.
 - **Impact:** test-only fixes merge when they are written. It costs a one-time move of the test modules and one more rule in the release planner.
+
+## 8. Browser-neutral messages for the reused sign-in outcomes
+
+- **Problem:** `browser_login` returns `DeviceAuthorizationExpired` for a browser that did not come back, and its message tells the person to call `login_with_browser` again for a new code (`AUDIT.md` item 7).
+- **Proposed solution:** in the next minor release, reword both unit variants' messages so that they fit either flow ("the sign-in was not approved in time; start a new sign-in"), recorded in the changelog as a message change, with every SDK's wording checked at once.
+- **Impact:** clearer errors for the person signing in; any caller that matched on the message text (not the variant) would notice.
+
+## 9. One copy of the conformance recorder in the library's test binary
+
+- **Problem:** `src/transport_noise_tests.rs` and `src/loopback_tests.rs` each load `tests/common/mod.rs` with `#[path]`, so the second needs `#[allow(clippy::duplicate_mod)]`.
+- **Proposed solution:** declare it once, as a crate-level `#[cfg(test)] mod` in `src/lib.rs`, and `use` it from both suites; refresh the evidence of every capability whose files that touches, after re-running the suite.
+- **Impact:** one recorder per binary, no lint exception; a hash refresh across several capabilities.
+
+## 10. Drop the old reference digest after the Python merge
+
+- **Problem:** `reference_digests` in `contracts/sdk-parity.json` carries both `57c7e71f6456…` and `49744ee385bf…` for the browser-login rollout.
+- **Proposed solution:** once thalovant-python-sdk `main` carries `49744ee385bf…` (#113 merged), remove `57c7e71f6456…` in a follow-up, as the porting brief says.
+- **Impact:** the acceptance names only references that are still current.
+
+## 11. Let a test shorten the accepted tab's 60-second bound
+
+- **Problem:** `ANSWER_TIMEOUT` in `src/loopback.rs` is a constant, so no test proves that a tab whose sign-in never ends is told `Sign-in was not completed.` (`AUDIT.md` item 10).
+- **Proposed solution:** keep the bound on `LoopbackListener` (set from the constant by `bind`), and have `src/loopback_tests.rs` set it to a few milliseconds.
+- **Impact:** one more edge proved; no public change.

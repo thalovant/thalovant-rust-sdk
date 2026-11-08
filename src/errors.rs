@@ -307,10 +307,39 @@ pub enum ThalovantError {
         /// `Result` in this crate carries this enum.
         problem: Option<Box<ApiProblem>>,
     },
+    /// The person declined the sign-in. What
+    /// [`ControlPlane::login_with_browser`](crate::ControlPlane::login_with_browser)
+    /// returns for a denied device login, and what
+    /// [`ControlPlane::browser_login`](crate::ControlPlane::browser_login)
+    /// returns when the browser comes back with `error=access_denied`. No
+    /// status: the API did not answer it.
     #[error("device authorization denied: the sign-in request was denied in the browser")]
     DeviceAuthorizationDenied,
+    /// Nobody approved the sign-in in time. What
+    /// [`ControlPlane::login_with_browser`](crate::ControlPlane::login_with_browser)
+    /// returns for an expired device code, and what
+    /// [`ControlPlane::browser_login`](crate::ControlPlane::browser_login)
+    /// returns when the browser does not come back within its timeout. No
+    /// status: the API did not answer it.
     #[error("device authorization expired: the code expired before it was approved; call login_with_browser again to request a new code")]
     DeviceAuthorizationExpired,
+    /// A browser sign-in whose browser came back without a sign-in code.
+    ///
+    /// [`ControlPlane::browser_login`](crate::ControlPlane::browser_login)
+    /// returns it when the browser brings this sign-in's `state` back with an
+    /// OAuth `error` other than `access_denied` (a denial is
+    /// [`ThalovantError::DeviceAuthorizationDenied`]), or with no single
+    /// code. The code was never exchanged, so there is no status;
+    /// [`ThalovantError::api_code`] reads `code`.
+    #[error(
+        "browser sign-in failed: the browser came back without a sign-in code{}",
+        .code.as_deref().map(|code| format!(" ({code})")).unwrap_or_default()
+    )]
+    BrowserLoginFailed {
+        /// The `error` the consent page sent, when it is a plain code (1 to
+        /// 80 of `A-Z a-z 0-9 _ . : -`), such as `server_error`.
+        code: Option<String>,
+    },
     /// One [`ControlPlane::poll_device_login`](crate::ControlPlane::poll_device_login)
     /// while nobody has approved the sign-in yet.
     ///
@@ -734,9 +763,14 @@ impl ThalovantError {
     }
 
     /// The API's machine-readable code, such as `platform_image_required` or
-    /// `plan_limit`; see [`ApiProblem::code`].
+    /// `plan_limit`; see [`ApiProblem::code`]. For
+    /// [`ThalovantError::BrowserLoginFailed`], the OAuth error the consent
+    /// page sent back, such as `server_error`.
     pub fn api_code(&self) -> Option<&str> {
-        self.api_problem().and_then(ApiProblem::code)
+        match self {
+            Self::BrowserLoginFailed { code } => code.as_deref(),
+            _ => self.api_problem().and_then(ApiProblem::code),
+        }
     }
 
     /// The API's own sentence, whole and exactly as sent; see

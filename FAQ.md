@@ -1,6 +1,38 @@
-Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: Release-path, ws:// and hard-link questions from the CodeRabbit review-body close-out.
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Browser sign-in questions (0.17.0, browser-login).
 
 # FAQ
+
+## Sign-in
+
+**How does a program sign somebody in?**
+`ControlPlane::interactive_login(InteractiveLoginOptions::default())`. It opens the browser at the consent page and listens on `127.0.0.1:<port>/callback` for the answer (OAuth authorization code with PKCE, RFC 8252), or prints a device code where the machine has no browser. Both paths keep the token on the control plane (`access_token`, `token_id()`), and `revoke_api_token(None)` revokes it. See `src/control/browser_login.rs`.
+
+**Why did `interactive_login` print a code instead of opening my browser?**
+`native_auth::can_open_browser` said this machine cannot show one: `CI`, `SSH_CONNECTION` or `SSH_TTY` is set (to anything, `CI=false` included), or it is Linux or a BSD with neither `DISPLAY` nor `WAYLAND_DISPLAY`. Or the API answered `GET /v1/auth/native/config` with a 404 (an API before thalovant-api#501), another failure or an answer the SDK cannot use, or the API URL is cleartext. Force the browser with `method: LoginMethod::Browser`; that never falls back to a device login.
+
+**Why browser sign-in at all, when device login works?**
+A device code can be read off one screen and typed in anywhere, so it can be relayed to somebody else (device-code phishing). A loopback redirect cannot: the browser that approves delivers the code to its own computer, so a link sent to somebody else gives them nothing.
+
+**What happens if somebody else's tab, or an old attempt's, hits the port?**
+A request to any other path is a 404, and a callback with a missing, repeated or wrong `state` is a 400. Neither ends the sign-in, and neither restarts its timeout. Only the first callback with the right state is accepted (`src/loopback.rs`, `classify_request`).
+
+**What does the person see after approving?**
+The tab shows `Signed in to Thalovant. You can close this tab.` once the token is stored, or `Sign-in was not completed.` for a denial, another error, a refused exchange or a timeout. The page loads nothing and is sent `no-store` and `no-referrer`.
+
+**The person clicked Deny and nothing happened until the timeout. Why?**
+The dashboard sends `error=access_denied` back only from the same release train as thalovant-api#501. Before it ships, a deny never calls back, so the 300-second timeout applies and the result is `DeviceAuthorizationExpired`.
+
+**Which errors can `browser_login` return?**
+`DeviceAuthorizationDenied` (denied), `DeviceAuthorizationExpired` (timeout), `BrowserLoginFailed { code }` (another OAuth error, or no code), `ApiResponse` 400 `invalid_grant` (a refused exchange; never retried, because a code presented twice revokes the token), `ApiResponse` 404 (no browser sign-in on this API), and `Api` with no status for an unusable configuration or token answer, or a cleartext API URL.
+
+**How do I test code that calls `browser_login` without a real browser?**
+Set `prompt` (it receives the URL) and `open_browser: false`, or set `opener` (it receives every URL the SDK would open, on its own thread). For `interactive_login`, `environment` and `platform` decide the browser rule for another machine. `tests/browser_login.rs` plays the browser with raw HTTP requests to the port in the URL's `redirect_uri`.
+
+**Can I cancel a sign-in?**
+Drop its future (or abort its task). The port closes at once and every connection the listener was serving is closed.
+
+**Why is there a new error variant, `BrowserLoginFailed`?**
+The contract reports a consent-page error such as `server_error` as an error with no status that still carries the code. `ThalovantError::Api(String)` cannot carry a code, and `ApiResponse` always has a status, so a variant of the existing (`#[non_exhaustive]`) enum carries it; `api_code()` reads it.
 
 ## Chat apps
 
