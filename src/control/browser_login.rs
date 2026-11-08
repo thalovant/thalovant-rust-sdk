@@ -18,8 +18,8 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 
 use super::{
-    access_token_value, api_response_error, open_url_in_browser, token_id_value, ControlPlane,
-    DeviceLoginOptions, DEFAULT_DEVICE_LOGIN_TIMEOUT,
+    access_token_value, api_response_error, error_text, open_url_in_browser, read_at_most,
+    token_id_value, ControlPlane, DeviceLoginOptions, DEFAULT_DEVICE_LOGIN_TIMEOUT,
 };
 
 /// How long each request of a browser sign-in may take, headers and body:
@@ -29,6 +29,9 @@ use super::{
 pub(super) const BROWSER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// What a secret is replaced with in an error.
 const REDACTED_SECRET: &str = "[redacted]";
+/// The largest answer a browser sign-in reads, configuration or exchange,
+/// success or refusal: either is a few hundred bytes.
+const MAX_BROWSER_ANSWER: usize = 64 * 1024;
 use crate::errors::{ApiProblem, Result, ThalovantError};
 use crate::loopback::{prompt_text, CallbackOutcome, LoopbackListener};
 use crate::native_auth::{
@@ -416,7 +419,8 @@ impl ControlPlane {
         };
         // A code is single-use: retrying the exchange would only revoke the
         // token a first exchange minted (RFC 9700), so a failure is final.
-        let hidden = [code.as_str(), verifier, state];
+        let hidden = hidden_forms(&[code.as_str(), verifier, state]);
+        let hidden: Vec<&str> = hidden.iter().map(String::as_str).collect();
         self.exchange_browser_code(config, &code, verifier, &redirect_uri, &hidden)
             .await
             .map_err(|error| without_secrets(error, &hidden))
@@ -470,15 +474,28 @@ impl ControlPlane {
     }
 
     /// One request of a browser sign-in, bounded whole -- headers and body --
-    /// by [`BROWSER_REQUEST_TIMEOUT`]. Running out of time is the API out of
-    /// reach, with no status, as a request that never got an answer is.
+    /// by [`BROWSER_REQUEST_TIMEOUT`], and its answer by
+    /// [`MAX_BROWSER_ANSWER`]. Running out of time is the API out of reach,
+    /// with no status, as a request that never got an answer is. A success
+    /// longer than the bound is [`ThalovantError::Api`] with no status; a
+    /// refusal longer than it is read as its status alone.
     async fn bounded_request(
         &self,
         method: &str,
         path: &str,
         body: Option<Value>,
     ) -> Result<(reqwest::StatusCode, String)> {
-        let request = self.send_request(method, path, body, None, false);
+        let request = async {
+            let mut response = self.send(method, path, body, None, false).await?;
+            let status = response.status();
+            match read_at_most(&mut response, MAX_BROWSER_ANSWER).await? {
+                Some(bytes) => Ok((status, error_text(&bytes))),
+                None if status.is_success() => Err(ThalovantError::Api(format!(
+                    "the answer is larger than {MAX_BROWSER_ANSWER} bytes"
+                ))),
+                None => Ok((status, String::new())),
+            }
+        };
         match tokio::time::timeout(self.browser_request_timeout, request).await {
             Ok(answer) => answer,
             Err(_) => Err(ThalovantError::api_unreachable("the request timed out")),
@@ -523,6 +540,43 @@ fn without_secrets(error: ThalovantError, hidden: &[&str]) -> ThalovantError {
         ThalovantError::Api(message) => ThalovantError::Api(scrub_text(&message, hidden)),
         other => other,
     }
+}
+
+/// Each secret as it is, and as a URL or a form would write it when that
+/// differs. The verifier and the state are base64url, and the API mints codes
+/// the same way, so none needs encoding; a code the browser brought back can
+/// still be anything, and an API that echoes it may echo it encoded.
+fn hidden_forms(secrets: &[&str]) -> Vec<String> {
+    let mut forms: Vec<String> = Vec::new();
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        let percent = urlencoding::encode(secret).into_owned();
+        let form: String = url::form_urlencoded::byte_serialize(secret.as_bytes()).collect();
+        let lower = lowercase_escapes(&percent);
+        for written in [secret.to_string(), percent, lower, form] {
+            if !forms.contains(&written) {
+                forms.push(written);
+            }
+        }
+    }
+    forms
+}
+
+/// `%2B` as `%2b`: the escapes' hex in lowercase, the rest as it is.
+fn lowercase_escapes(encoded: &str) -> String {
+    let mut lowered = String::with_capacity(encoded.len());
+    let mut hex_left = 0;
+    for character in encoded.chars() {
+        if hex_left > 0 {
+            lowered.push(character.to_ascii_lowercase());
+            hex_left -= 1;
+        } else {
+            if character == '%' {
+                hex_left = 2;
+            }
+            lowered.push(character);
+        }
+    }
+    lowered
 }
 
 /// A refusal's body with `hidden` taken out, before any message is made of
@@ -588,6 +642,11 @@ fn scrub_value(value: Value, hidden: &[&str]) -> Value {
                 .collect(),
         ),
         Value::Object(map) => Value::Object(scrub_map(map, hidden)),
+        // A number that is one of them, as an API that parses what it echoes
+        // might send a code made of digits.
+        Value::Number(number) if hidden.contains(&number.to_string().as_str()) => {
+            Value::String(REDACTED_SECRET.into())
+        }
         other => other,
     }
 }

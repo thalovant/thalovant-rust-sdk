@@ -650,6 +650,13 @@ fn usable_authorization_endpoint(value: &str) -> bool {
     let Some(host) = authority_host(authority) else {
         return false;
     };
+    // And one the browser's own URL parser takes: it reads a last label such
+    // as `0x10` as a number too, and `example.0x10` is then no address, so
+    // the default opener would refuse it and the sign-in would wait for a
+    // callback that cannot come.
+    if Url::parse(value).is_err() {
+        return false;
+    }
     match scheme.to_ascii_lowercase().as_str() {
         "https" => true,
         "http" => matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"),

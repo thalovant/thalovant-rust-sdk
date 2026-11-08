@@ -611,3 +611,28 @@ async fn connections_are_bounded_and_the_callback_still_gets_through() {
     assert!(tab.await.expect("the tab").body.contains(SIGNED_IN_TEXT));
     listener.close().await;
 }
+
+#[tokio::test]
+async fn an_oversized_head_request_gets_its_400_without_a_body() {
+    let mut listener = LoopbackListener::bind(STATE.to_string())
+        .await
+        .expect("bind");
+    let port = listener.port();
+    let tab = tokio::spawn(async move {
+        let request = format!(
+            "HEAD /callback?state={STATE} HTTP/1.1\r\nX-Padding: {}\r\n\r\n",
+            "a".repeat(20 * 1024)
+        );
+        send(port, request.into_bytes()).await
+    });
+    let answer = tokio::select! {
+        accepted = listener.wait(Duration::from_secs(5)) => {
+            panic!("an oversized head is never accepted: {accepted:?}")
+        }
+        answer = tab => answer.expect("the tab"),
+    };
+    assert_eq!(answer.status, 400);
+    assert!(answer.body.is_empty(), "a HEAD answer carries no body");
+    assert!(answer.headers.contains_key("Content-Length"));
+    listener.close().await;
+}

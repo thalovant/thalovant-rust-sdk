@@ -100,7 +100,9 @@ listens on `127.0.0.1` for the answer (OAuth with PKCE on a loopback redirect,
 RFC 8252). It always prints the address too, in case the browser does not
 open. The browser that approves hands the code to this computer's
 `127.0.0.1`, so a link or code sent to someone on another computer delivers
-nothing to the sender.
+nothing to the sender. That is all it promises: a forwarded callback port
+(`ssh -L`, a port-forwarding tool) or another user of the same computer can
+still complete a sign-in.
 
 On a machine that cannot show a browser, it prints a code to enter at
 `thalovant.com/activate` from any browser instead (device login): over SSH

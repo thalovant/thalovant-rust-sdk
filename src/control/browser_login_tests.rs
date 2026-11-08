@@ -459,3 +459,122 @@ async fn a_message_cut_to_length_keeps_no_part_of_a_secret() {
         Some(format!("{}[redacted]", "a".repeat(190)).as_str())
     );
 }
+
+#[test]
+fn a_secret_is_also_hidden_as_a_url_or_a_form_writes_it() {
+    // A base64url secret -- every real verifier, state and code -- is only itself.
+    assert_eq!(hidden_forms(&["Ab0-_"]), vec!["Ab0-_".to_string()]);
+    // A form writes `~` as `%7E`, so that is hidden too.
+    assert!(hidden_forms(&["a~b"]).contains(&"a%7Eb".to_string()));
+    let forms = hidden_forms(&["a+b/c=", ""]);
+    for written in ["a+b/c=", "a%2Bb%2Fc%3D", "a%2bb%2fc%3d"] {
+        assert!(
+            forms.contains(&written.to_string()),
+            "{written} is not hidden: {forms:?}"
+        );
+    }
+    assert_eq!(lowercase_escapes("Ab%2Bc%3D"), "Ab%2bc%3d");
+}
+
+#[tokio::test]
+async fn an_echo_of_the_code_encoded_or_as_a_number_never_reaches_the_error() {
+    for (code, query) in [("a+b/c=", "a%2Bb%2Fc%3D"), ("123456", "123456")] {
+        let api = Api::start(Arc::new(
+            move |method: &str, _: &str, body: &str| match method {
+                "GET" => Reply::Answer(200, CONFIG.into()),
+                _ => {
+                    let sent: Value = serde_json::from_str(body).expect("JSON");
+                    let code = sent["code"].as_str().unwrap_or_default().to_string();
+                    let encoded = urlencoding::encode(&code).into_owned();
+                    let mut problem = json!({
+                        "detail": "invalid_grant",
+                        "encoded": encoded,
+                        "lower": lowercase_escapes(&encoded),
+                        "unrelated": 7,
+                    });
+                    if let Ok(number) = code.parse::<u64>() {
+                        problem["number"] = json!(number);
+                    }
+                    Reply::Answer(400, problem.to_string())
+                }
+            },
+        ))
+        .await;
+        let (url, task) = sign_in(plane(&api)).await;
+        let (port, state) = read_url(&url);
+        browse(port, &format!("/callback?code={query}&state={state}")).await;
+        let (_, outcome) = task.await.expect("the sign-in task");
+        let error = outcome.expect_err("refused");
+        assert_eq!(error.status_code(), Some(400));
+        let shown = shown(&error);
+        for written in hidden_forms(&[code]) {
+            assert!(
+                !shown.contains(&written),
+                "an echo of the code reached the error"
+            );
+        }
+        let problem = error.api_problem().expect("a problem");
+        assert_eq!(
+            problem.get("unrelated"),
+            Some(&json!(7)),
+            "other numbers stay"
+        );
+        if code == "123456" {
+            assert_eq!(problem.get("number"), Some(&json!("[redacted]")));
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_answer_is_refused_without_reading_it_and_auto_falls_back() {
+    let huge = format!("{{\"padding\":\"{}\"}}", "x".repeat(2 * 1024 * 1024));
+    let api = Api::start(Arc::new(move |method: &str, path: &str, _: &str| {
+        match (method, path) {
+            ("GET", "/v1/auth/native/config") => Reply::Answer(200, huge.clone()),
+            ("POST", "/v1/auth/device/authorize") => Reply::Answer(200, GRANT.into()),
+            ("POST", "/v1/auth/device/token") => Reply::Answer(200, DEVICE_TOKEN.into()),
+            _ => Reply::Answer(404, "{}".into()),
+        }
+    }))
+    .await;
+    let mut control = plane(&api);
+    let error = control
+        .browser_login(BrowserLoginOptions {
+            open_browser: false,
+            prompt: Some(Box::new(|_: &str| panic!("nothing is shown"))),
+            ..Default::default()
+        })
+        .await
+        .expect_err("an oversized configuration");
+    assert!(matches!(&error, ThalovantError::Api(message) if message.contains("larger than")));
+    assert!(error.status_code().is_none());
+    let token = control
+        .interactive_login(InteractiveLoginOptions {
+            opener: Some(Arc::new(|_: &str| {})),
+            environment: Some(HashMap::new()),
+            platform: Some("windows".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("a device login stands in");
+    assert_eq!(token["token_id"], "d-1");
+}
+
+#[tokio::test]
+async fn an_oversized_refusal_is_read_as_its_status_alone() {
+    let huge = format!("{{\"detail\":\"{}\"}}", "x".repeat(2 * 1024 * 1024));
+    let api = Api::start(Arc::new(
+        move |method: &str, _: &str, _: &str| match method {
+            "GET" => Reply::Answer(200, CONFIG.into()),
+            _ => Reply::Answer(400, huge.clone()),
+        },
+    ))
+    .await;
+    let (url, task) = sign_in(plane(&api)).await;
+    let (port, state) = read_url(&url);
+    browse(port, &format!("/callback?code=c&state={state}")).await;
+    let (_, outcome) = task.await.expect("the sign-in task");
+    let error = outcome.expect_err("refused");
+    assert_eq!(error.status_code(), Some(400));
+    assert!(error.api_problem().is_none(), "the body was not read");
+}

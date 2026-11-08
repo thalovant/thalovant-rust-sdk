@@ -247,8 +247,8 @@ fn request_line(head: &[u8]) -> Option<(String, String)> {
 enum Head {
     /// The head, terminator included.
     Complete(Vec<u8>),
-    /// Larger than [`MAX_REQUEST_HEAD`].
-    TooLarge,
+    /// Larger than [`MAX_REQUEST_HEAD`]; whether it began as a `HEAD`.
+    TooLarge { head_only: bool },
     /// The connection closed first.
     Closed,
 }
@@ -270,13 +270,17 @@ async fn read_head(stream: &mut TcpStream) -> io::Result<Head> {
         {
             let end = from + at + 4;
             if end > MAX_REQUEST_HEAD {
-                return Ok(Head::TooLarge);
+                return Ok(Head::TooLarge {
+                    head_only: head.starts_with(b"HEAD "),
+                });
             }
             head.truncate(end);
             return Ok(Head::Complete(head));
         }
         if head.len() >= MAX_REQUEST_HEAD {
-            return Ok(Head::TooLarge);
+            return Ok(Head::TooLarge {
+                head_only: head.starts_with(b"HEAD "),
+            });
         }
     }
 }
@@ -298,8 +302,8 @@ struct Shared {
 async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
     let head = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_head(&mut stream)).await {
         Ok(Ok(Head::Complete(head))) => head,
-        Ok(Ok(Head::TooLarge)) => {
-            answer(&mut stream, 400, WRONG_STATE_TEXT, false).await;
+        Ok(Ok(Head::TooLarge { head_only })) => {
+            answer(&mut stream, 400, WRONG_STATE_TEXT, head_only).await;
             return;
         }
         // Closed, broken or too slow: that connection's alone.

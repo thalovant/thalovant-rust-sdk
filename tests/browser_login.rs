@@ -946,6 +946,8 @@ fn an_authorization_endpoint_no_browser_can_open_is_unusable() {
         "https://-dash.thalovant.com/authorize",
         "https://1.2.3/authorize",
         "https://[127.0.0.1]/authorize",
+        "https://example.0x10/authorize",
+        "https://127.1/authorize",
     ] {
         assert!(
             NativeSignInConfig::from_value(&config(endpoint)).is_err(),
