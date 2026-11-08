@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: CodeRabbit review-body close-out: ws:// for loopback only, and test-only changes without a release.
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Item 7 now cites #88 in the past tense.
 
 # Suggestions
 
@@ -40,6 +40,6 @@ Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: CodeRabbit review-body close-o
 
 ## 7. Let test-only changes under `src/` merge without a release
 
-- **Problem:** `auto-release.yml` treats any change under `src/` since the latest tag as release-relevant. A change to a `#[cfg(test)]` module therefore publishes a crate whose code did not change. The contract tests and full-request test servers asked for on #66 and #21 wait in draft #88 for that reason (`AUDIT.md`, Open).
+- **Problem:** `auto-release.yml` treats any change under `src/` since the latest tag as release-relevant. A change to a `#[cfg(test)]` module therefore publishes a crate whose code did not change. The contract tests and full-request test servers asked for on #66 and #21 waited in #88 for that reason.
 - **Proposed solution:** move unit-test modules into `src/**/*_tests.rs` files included with `#[cfg(test)] #[path = ...]`, as `src/transport_noise_tests.rs` already is, and have the planner in `auto-release.yml` (and `release_guard.py`) leave `*_tests.rs` files out when it looks for release-relevant changes since the latest tag. Every other file under `src/`, `Cargo.toml` and `LICENSE` stays release-relevant, so a push that changes a test file and the manifest still releases.
 - **Impact:** test-only fixes merge when they are written. It costs a one-time move of the test modules and one more rule in the release planner.

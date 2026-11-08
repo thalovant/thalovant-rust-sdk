@@ -1,9 +1,10 @@
-Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: CodeRabbit follow-up on #65 (quota-count ceiling) and the lost 0.15.0 heading.
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Test-only follow-ups to CodeRabbit on #66 and #21 (#88).
 
 # Changelog
 
 ## Unreleased
 
+- Tests only, no change to the published API or behaviour. `an_empty_listing_is_answered_by_its_usual_form` and `an_empty_listing_is_not_retried_when_nearest_is_off` in `src/intents.rs` pin the usual-form retry contract: the language asked stays in `languages`, and `listed_in` names the tag that answered (CodeRabbit on #66). Nine control-plane test servers in `src/control.rs` read the whole request before asserting on its body (CodeRabbit on #21).
 - Changelog only, no code change. The 0.11.0 entry said quota counts stop at the signed 64-bit maximum; they stop at 2^53 − 1, as `whole_count` in `src/refusal.rs` has done since 0.11.0, and the entry now says so (CodeRabbit on #65). The `0.15.0 — 2026-10-11` heading, replaced by mistake when the 0.16.0 entry was added, is back.
 
 ## 0.16.0 — 2026-11-03
