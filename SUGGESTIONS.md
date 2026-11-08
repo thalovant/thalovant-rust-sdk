@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Browser sign-in follow-ups (items 8 to 11).
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Final reference digest; item 11 is now a client-wide request timeout.
 
 # Suggestions
 
@@ -58,12 +58,12 @@ Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Browser sign-in follow-ups (it
 
 ## 10. Drop the old reference digest after the Python merge
 
-- **Problem:** `reference_digests` in `contracts/sdk-parity.json` carries both `57c7e71f6456…` and `49744ee385bf…` for the browser-login rollout.
-- **Proposed solution:** once thalovant-python-sdk `main` carries `49744ee385bf…` (#113 merged), remove `57c7e71f6456…` in a follow-up, as the porting brief says.
+- **Problem:** `reference_digests` in `contracts/sdk-parity.json` carries both `57c7e71f6456…` and `6dfb3bb31ac7…` for the browser-login rollout.
+- **Proposed solution:** once thalovant-python-sdk `main` carries `6dfb3bb31ac7…` (#113 merged), remove `57c7e71f6456…` in a follow-up, as the porting brief says.
 - **Impact:** the acceptance names only references that are still current.
 
-## 11. Let a test shorten the accepted tab's 60-second bound
+## 11. A timeout for every control-plane request
 
-- **Problem:** `ANSWER_TIMEOUT` in `src/loopback.rs` is a constant, so no test proves that a tab whose sign-in never ends is told `Sign-in was not completed.` (`AUDIT.md` item 10).
-- **Proposed solution:** keep the bound on `LoopbackListener` (set from the constant by `bind`), and have `src/loopback_tests.rs` set it to a few milliseconds.
-- **Impact:** one more edge proved; no public change.
+- **Problem:** only a browser sign-in's two requests are bounded (10 s); every other `ControlPlane` call waits as long as the API takes (`AUDIT.md` item 10), where the Python reference bounds every request at 10 s.
+- **Proposed solution:** a client-wide default request timeout on the reqwest client built in `ControlPlane::new`, with a way to change it, noted in the changelog as a behaviour change, alongside the other SDKs.
+- **Impact:** a stalled API cannot hold any call for good; a call that legitimately takes longer (a large inventory) would need the knob.

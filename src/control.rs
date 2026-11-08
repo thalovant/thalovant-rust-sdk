@@ -101,6 +101,9 @@ pub struct ControlPlane {
     /// and forgotten, so that revoking it again is the no-op it should be.
     /// Every sign-in clears it.
     revoked_own: bool,
+    /// How long each request of a browser sign-in may take
+    /// (`browser_login::BROWSER_REQUEST_TIMEOUT`; shorter in tests).
+    browser_request_timeout: Duration,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -502,6 +505,7 @@ impl ControlPlane {
             token_id: None,
             device_intervals: HashMap::new(),
             revoked_own: false,
+            browser_request_timeout: browser_login::BROWSER_REQUEST_TIMEOUT,
         }
     }
 
@@ -2334,6 +2338,15 @@ impl ControlPlane {
     ) -> Result<reqwest::Response> {
         let url = format!("{}{}", self.api_url, path.trim_start_matches('/'));
         let url = validate_control_request_url(&url, auth || body.is_some())?;
+        // Every request, and the token on it, stays on the API's origin
+        // (scheme, host, port). A path is appended to the API's address, so
+        // it cannot name another today; this keeps it so whatever builds it.
+        let home = url::Url::parse(&self.api_url).map(|api| api.origin());
+        if home.ok().as_ref() != Some(&url.origin()) {
+            return Err(ThalovantError::Api(
+                "refusing a request off the Thalovant API's origin".into(),
+            ));
+        }
         let mut request_headers = HeaderMap::new();
         request_headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         request_headers.insert(

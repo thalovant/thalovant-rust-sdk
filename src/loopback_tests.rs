@@ -436,11 +436,178 @@ fn a_callback_never_prints_its_code() {
 #[test]
 fn every_answer_is_a_whole_http_answer() {
     for (status, reason) in [(200, "OK"), (400, "Bad Request"), (404, "Not Found")] {
-        let raw = String::from_utf8(response_bytes(status, "x")).expect("ASCII");
+        let raw = String::from_utf8(response_bytes(status, "x", false)).expect("ASCII");
         let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
         assert!(head.starts_with(&format!("HTTP/1.1 {status} {reason}\r\n")));
         assert!(head.contains(&format!("Content-Length: {}", body.len())));
         assert!(head.ends_with("Connection: close"));
         assert!(body.contains("<p>x</p>"));
     }
+}
+
+#[test]
+fn a_head_answer_has_the_headers_and_no_body() {
+    let whole = String::from_utf8(response_bytes(404, "x", false)).expect("ASCII");
+    let head = String::from_utf8(response_bytes(404, "x", true)).expect("ASCII");
+    let (whole_head, body) = whole.split_once("\r\n\r\n").expect("a head");
+    // The same head, Content-Length included: what the page would have been.
+    assert_eq!(head, format!("{whole_head}\r\n\r\n"));
+    assert!(head.contains(&format!("Content-Length: {}", body.len())));
+}
+
+#[tokio::test]
+async fn a_head_request_gets_the_headers_and_no_body() {
+    let spec = browser_vectors();
+    let mut listener = LoopbackListener::bind(STATE.to_string())
+        .await
+        .expect("bind");
+    let port = listener.port();
+    let tab = tokio::spawn(async move {
+        send(
+            port,
+            format!("HEAD /callback?code=c&state={STATE} HTTP/1.1\r\n\r\n").into_bytes(),
+        )
+        .await
+    });
+    let answer = tokio::select! {
+        accepted = listener.wait(Duration::from_secs(5)) => {
+            panic!("a HEAD is never accepted: {accepted:?}")
+        }
+        answer = tab => answer.expect("the tab"),
+    };
+    assert_eq!(answer.status, 404);
+    assert!(answer.body.is_empty(), "a HEAD answer carries no body");
+    let length: usize = answer.headers["Content-Length"]
+        .as_str()
+        .and_then(|length| length.parse().ok())
+        .expect("a Content-Length");
+    assert!(length > 0, "the length a GET would have carried");
+    for (name, value) in spec["page_headers"].as_object().expect("page_headers") {
+        assert_eq!(answer.headers.get(name), Some(value), "{name}");
+    }
+    listener.close().await;
+}
+
+#[tokio::test]
+async fn the_accepted_tab_waits_as_long_as_the_sign_in_takes() {
+    // No deadline of its own: the page says how the sign-in ended, so it is
+    // written once it has, however long the exchange took.
+    let mut listener = LoopbackListener::bind(STATE.to_string())
+        .await
+        .expect("bind");
+    let port = listener.port();
+    let started = std::time::Instant::now();
+    let mut tab =
+        tokio::spawn(
+            async move { get(port, "GET", &format!("/callback?code=c&state={STATE}")).await },
+        );
+    assert!(listener.wait(Duration::from_secs(5)).await.is_some());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1), &mut tab)
+            .await
+            .is_err(),
+        "the tab was answered before the sign-in ended"
+    );
+    listener.finish(true);
+    let answer = tab.await.expect("the tab");
+    assert!(answer.body.contains(SIGNED_IN_TEXT));
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    listener.close().await;
+}
+
+#[tokio::test]
+async fn closing_the_listener_answers_a_tab_that_is_still_waiting() {
+    let mut listener = LoopbackListener::bind(STATE.to_string())
+        .await
+        .expect("bind");
+    let port = listener.port();
+    let tab =
+        tokio::spawn(
+            async move { get(port, "GET", &format!("/callback?code=c&state={STATE}")).await },
+        );
+    assert!(listener.wait(Duration::from_secs(5)).await.is_some());
+    let started = std::time::Instant::now();
+    listener.close().await;
+    let answer = tab.await.expect("the tab");
+    assert!(answer.body.contains(NOT_COMPLETED_TEXT));
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "closing answered the tab at once"
+    );
+}
+
+#[tokio::test]
+async fn draining_a_connection_is_bounded() {
+    // A browser that never closes its side cannot keep a connection's task,
+    // or its slot, alive past the drain's bound.
+    let mut listener = LoopbackListener::bind(STATE.to_string())
+        .await
+        .expect("bind");
+    let port = listener.port();
+    let tab = tokio::spawn(async move {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        stream
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n")
+            .await
+            .expect("send");
+        let mut raw = Vec::new();
+        // The answer ends (our side is shut) while this side stays open.
+        stream.read_to_end(&mut raw).await.expect("read");
+        (stream, raw)
+    });
+    assert!(listener.wait(Duration::from_millis(300)).await.is_none());
+    let (open, raw) = tab.await.expect("the tab");
+    assert!(raw.starts_with(b"HTTP/1.1 404 "));
+    let started = std::time::Instant::now();
+    // The wait reaps finished tasks as it goes.
+    while !listener.connections.is_empty() {
+        assert!(
+            started.elapsed() < DRAIN_TIMEOUT + Duration::from_secs(2),
+            "a connection that never closes kept its task"
+        );
+        let _ = listener.wait(Duration::from_millis(100)).await;
+    }
+    assert!(started.elapsed() >= DRAIN_TIMEOUT - Duration::from_millis(400));
+    drop(open);
+    listener.close().await;
+}
+
+#[tokio::test]
+async fn connections_are_bounded_and_the_callback_still_gets_through() {
+    // More idle connections than are served at once: the rest wait in the
+    // backlog, take no descriptor of the listener's, and the callback is
+    // served as soon as a slot frees.
+    let mut listener = LoopbackListener::bind(STATE.to_string())
+        .await
+        .expect("bind");
+    let port = listener.port();
+    let mut idle = Vec::new();
+    for _ in 0..MAX_CONNECTIONS + 8 {
+        idle.push(
+            TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect"),
+        );
+    }
+    assert!(listener.wait(Duration::from_millis(300)).await.is_none());
+    assert_eq!(listener.connections.len(), MAX_CONNECTIONS);
+    assert_eq!(listener.slots.available_permits(), 0);
+    let tab =
+        tokio::spawn(
+            async move { get(port, "GET", &format!("/callback?code=c&state={STATE}")).await },
+        );
+    // Closing the idle connections frees their slots; their tasks end and
+    // are reaped, and the backlog -- the callback with it -- is served.
+    idle.clear();
+    let callback = listener
+        .wait(Duration::from_secs(5))
+        .await
+        .expect("the callback got through");
+    assert_eq!(callback.code.as_deref(), Some("c"));
+    listener.finish(true);
+    assert!(tab.await.expect("the tab").body.contains(SIGNED_IN_TEXT));
+    listener.close().await;
 }

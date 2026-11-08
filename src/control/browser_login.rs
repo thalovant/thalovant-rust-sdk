@@ -2,12 +2,13 @@
 //! PKCE (S256 only, RFC 7636) on a loopback redirect (RFC 8252 section 7.3),
 //! and the chooser between it and device login.
 //!
-//! A device code can be read off one screen and typed in anywhere, so it can
-//! be relayed to somebody else. A loopback redirect cannot: the browser that
-//! approves hands the code to its own computer, so a sign-in link sent to
-//! somebody else delivers nothing to the sender. On a machine with a browser
-//! a program signs in this way; device login stays the way in for a machine
-//! with none.
+//! A device code can be read off one screen and typed in anywhere. With a
+//! loopback redirect the browser that approves hands the code to its own
+//! computer's `127.0.0.1`, so a link or code sent to someone on another
+//! computer delivers nothing to the sender. (A forwarded callback port, or
+//! another user of the same computer, is another matter.) On a machine with a
+//! browser a program signs in this way; device login stays the way in for a
+//! machine with none.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -20,6 +21,14 @@ use super::{
     access_token_value, api_response_error, open_url_in_browser, token_id_value, ControlPlane,
     DeviceLoginOptions, DEFAULT_DEVICE_LOGIN_TIMEOUT,
 };
+
+/// How long each request of a browser sign-in may take, headers and body:
+/// the configuration and the exchange. What the Python reference gives every
+/// request. Without it a stalled API would hold the sign-in, and the tab
+/// waiting on it, for good.
+pub(super) const BROWSER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// What a secret is replaced with in an error.
+const REDACTED_SECRET: &str = "[redacted]";
 use crate::errors::{ApiProblem, Result, ThalovantError};
 use crate::loopback::{prompt_text, CallbackOutcome, LoopbackListener};
 use crate::native_auth::{
@@ -64,8 +73,9 @@ pub struct BrowserLoginOptions {
     /// may be asked for; the API refuses admin or unknown ones when the
     /// person approves.
     pub scopes: Vec<String>,
-    /// What the consent page and the token show, at most 120 code points;
-    /// `None` or an empty name is [`default_device_name`].
+    /// What the consent page and the token show, at most 120 code points.
+    /// `None` is [`default_device_name`]; an empty name sends none, and keeps
+    /// the hostname off the consent page.
     pub device_name: Option<String>,
     /// Open the browser; with `false` the URL is only shown.
     pub open_browser: bool,
@@ -114,8 +124,8 @@ pub struct InteractiveLoginOptions {
     /// What the token carries, for either method.
     pub scopes: Vec<String>,
     /// Names this machine on the consent page: a browser sign-in's
-    /// `device_name`, a device login's `client_name`. `None` or empty is
-    /// [`default_device_name`].
+    /// `device_name`, a device login's `client_name`. `None` is
+    /// [`default_device_name`]; an empty name sends neither.
     pub device_name: Option<String>,
     /// Open the browser (the consent page, or the device login's
     /// verification page).
@@ -173,9 +183,9 @@ impl ControlPlane {
     /// `127.0.0.1` on a port the system picks, opens the browser at the
     /// dashboard's consent page, and waits for the browser to come back to
     /// `http://127.0.0.1:<port>/callback`. The browser that approves hands
-    /// the code to its own computer, so a sign-in link sent to somebody else
-    /// delivers nothing to the sender -- which a device code, read off one
-    /// screen and typed into another, cannot promise.
+    /// the code to its own computer, so a sign-in link sent to somebody
+    /// on another computer delivers nothing to the sender -- which a device
+    /// code, read off one screen and typed in anywhere, cannot promise.
     ///
     /// The URL is always shown as well as opened (`Opening your browser to
     /// sign in to Thalovant. If it does not open, visit:` and the URL on
@@ -257,9 +267,9 @@ impl ControlPlane {
             environment,
             platform,
         } = options;
-        let name = device_name
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(default_device_name);
+        // Only None asks for the default: an empty name is the caller's way
+        // of sending none, and keeps the hostname out.
+        let name = device_name.unwrap_or_else(default_device_name);
         let config = match method {
             LoginMethod::Device => None,
             LoginMethod::Browser => {
@@ -307,7 +317,7 @@ impl ControlPlane {
     /// exchange the code.
     async fn native_sign_in_config(&self) -> Result<NativeSignInConfig> {
         let (status, body) = self
-            .send_request("GET", "/v1/auth/native/config", None, None, false)
+            .bounded_request("GET", "/v1/auth/native/config", None)
             .await?;
         if status == reqwest::StatusCode::NOT_FOUND {
             let problem = match serde_json::from_str::<Value>(&body) {
@@ -373,9 +383,7 @@ impl ControlPlane {
             opener,
         } = options;
         let redirect_uri = loopback_redirect_uri(u32::from(listener.port()))?;
-        let name = device_name
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(default_device_name);
+        let name = device_name.unwrap_or_else(default_device_name);
         let url = browser_authorization_url(
             &config.authorization_endpoint,
             &config.sdk_client_id,
@@ -399,18 +407,19 @@ impl ControlPlane {
             (CallbackOutcome::Denied, _) => return Err(ThalovantError::DeviceAuthorizationDenied),
             (CallbackOutcome::Code, Some(code)) => code,
             _ => {
-                // A plain OAuth code, and never one of this sign-in's secrets.
-                let code = callback.error.filter(|error| {
-                    plain_code(error) && !error.contains(state) && !error.contains(verifier)
+                // One of RFC 6749's codes or nothing (classify_request): a
+                // value the page chose could be the state or a code.
+                return Err(ThalovantError::BrowserLoginFailed {
+                    code: callback.error,
                 });
-                return Err(ThalovantError::BrowserLoginFailed { code });
             }
         };
         // A code is single-use: retrying the exchange would only revoke the
         // token a first exchange minted (RFC 9700), so a failure is final.
-        self.exchange_browser_code(config, &code, verifier, &redirect_uri)
+        let hidden = [code.as_str(), verifier, state];
+        self.exchange_browser_code(config, &code, verifier, &redirect_uri, &hidden)
             .await
-            .map_err(|error| without_secrets(error, &[&code, verifier, state]))
+            .map_err(|error| without_secrets(error, &hidden))
     }
 
     /// `POST {token_endpoint}` with exactly the four fields, and keep the
@@ -420,13 +429,16 @@ impl ControlPlane {
     /// JSON object, or has no `access_token`, is an error with no status --
     /// the API did not refuse, its answer could not be used -- and any other
     /// failure carries the api-errors fields (`invalid_grant` for every way
-    /// an exchange fails).
+    /// an exchange fails). A refusal has every value in `hidden` taken out of
+    /// its body before the error is made of it, so a message cut to length
+    /// cannot keep part of one.
     async fn exchange_browser_code(
         &mut self,
         config: &NativeSignInConfig,
         code: &str,
         verifier: &str,
         redirect_uri: &str,
+        hidden: &[&str],
     ) -> Result<Value> {
         require_secure_token_exchange(&self.api_url)?;
         let body = json!({
@@ -435,11 +447,14 @@ impl ControlPlane {
             "client_id": config.sdk_client_id,
             "redirect_uri": redirect_uri,
         });
+        // The configuration refuses a token endpoint that could leave the
+        // API, and send() refuses any request off the API's origin: the code
+        // and the verifier go nowhere else.
         let (status, text) = self
-            .send_request("POST", &config.token_endpoint, Some(body), None, false)
+            .bounded_request("POST", &config.token_endpoint, Some(body))
             .await?;
         if !status.is_success() {
-            return Err(api_response_error(status, &text));
+            return Err(api_response_error(status, &redacted_body(&text, hidden)));
         }
         let token = serde_json::from_str::<Value>(&text)
             .ok()
@@ -452,6 +467,22 @@ impl ControlPlane {
         })?;
         self.accept_token(access_token, token_id_value(&token));
         Ok(token)
+    }
+
+    /// One request of a browser sign-in, bounded whole -- headers and body --
+    /// by [`BROWSER_REQUEST_TIMEOUT`]. Running out of time is the API out of
+    /// reach, with no status, as a request that never got an answer is.
+    async fn bounded_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let request = self.send_request(method, path, body, None, false);
+        match tokio::time::timeout(self.browser_request_timeout, request).await {
+            Ok(answer) => answer,
+            Err(_) => Err(ThalovantError::api_unreachable("the request timed out")),
+        }
     }
 }
 
@@ -470,31 +501,14 @@ pub(super) fn open_in_browser(url: &str, opener: Option<&BrowserOpener>) {
     }
 }
 
-/// An OAuth error code as the API's problems spell codes: 1 to 80 of
-/// `A-Z a-z 0-9 _ . : -`.
-fn plain_code(value: &str) -> bool {
-    (1..=80).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b':' | b'-'))
-}
-
-/// `error`, with every value in `hidden` taken out of its message and its
-/// problem, keys included.
+/// `error`, rebuilt with every value in `hidden` taken out of its message
+/// and its problem, keys included.
 ///
 /// An API that echoes a request back (a 422 lists each field's `input`)
 /// would otherwise hand the code and the verifier to whoever logs the error.
+/// Always a new error, carrying nothing of the old one but its scrubbed text
+/// and status: none of these variants keeps a cause.
 fn without_secrets(error: ThalovantError, hidden: &[&str]) -> ThalovantError {
-    let hidden: Vec<&str> = hidden
-        .iter()
-        .copied()
-        .filter(|value| !value.is_empty())
-        .collect();
-    let scrub = |text: &str| {
-        hidden.iter().fold(text.to_string(), |text, secret| {
-            text.replace(secret, crate::redact::REDACTED)
-        })
-    };
     match error {
         ThalovantError::ApiResponse {
             status_code,
@@ -502,31 +516,82 @@ fn without_secrets(error: ThalovantError, hidden: &[&str]) -> ThalovantError {
             problem,
         } => ThalovantError::ApiResponse {
             status_code,
-            detail: scrub(&detail),
+            detail: scrub_text(&detail, hidden),
             problem: problem
-                .map(|problem| Box::new(ApiProblem::from(scrub_map(problem.into_map(), &scrub)))),
+                .map(|problem| Box::new(ApiProblem::from(scrub_map(problem.into_map(), hidden)))),
         },
-        ThalovantError::Api(message) => ThalovantError::Api(scrub(&message)),
+        ThalovantError::Api(message) => ThalovantError::Api(scrub_text(&message, hidden)),
         other => other,
     }
 }
 
-fn scrub_map(map: Map<String, Value>, scrub: &dyn Fn(&str) -> String) -> Map<String, Value> {
+/// A refusal's body with `hidden` taken out, before any message is made of
+/// it: as JSON when it parses (an escaped value is still the value), else as
+/// text.
+fn redacted_body(text: &str, hidden: &[&str]) -> String {
+    match serde_json::from_str::<Value>(text) {
+        Ok(parsed) => scrub_value(parsed, hidden).to_string(),
+        Err(_) => scrub_text(text, hidden),
+    }
+}
+
+/// `text` with every value in `hidden` replaced by `[redacted]`.
+///
+/// One pass, the longest value first, so that a value which is part of
+/// another cannot break the longer one up before it is matched; and never
+/// inside a `[redacted]` already there, so scrubbing twice changes nothing.
+fn scrub_text(text: &str, hidden: &[&str]) -> String {
+    let mut secrets: Vec<&str> = hidden
+        .iter()
+        .copied()
+        .filter(|value| !value.is_empty())
+        .collect();
+    if secrets.is_empty() {
+        return text.to_string();
+    }
+    secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    text.split(REDACTED_SECRET)
+        .map(|part| {
+            let mut scrubbed = String::with_capacity(part.len());
+            let mut rest = part;
+            while let Some(next) = rest.chars().next() {
+                match secrets.iter().find(|secret| rest.starts_with(**secret)) {
+                    Some(secret) => {
+                        scrubbed.push_str(REDACTED_SECRET);
+                        rest = &rest[secret.len()..];
+                    }
+                    None => {
+                        scrubbed.push(next);
+                        rest = &rest[next.len_utf8()..];
+                    }
+                }
+            }
+            scrubbed
+        })
+        .collect::<Vec<_>>()
+        .join(REDACTED_SECRET)
+}
+
+fn scrub_map(map: Map<String, Value>, hidden: &[&str]) -> Map<String, Value> {
     map.into_iter()
-        .map(|(key, value)| (scrub(&key), scrub_value(value, scrub)))
+        .map(|(key, value)| (scrub_text(&key, hidden), scrub_value(value, hidden)))
         .collect()
 }
 
-fn scrub_value(value: Value, scrub: &dyn Fn(&str) -> String) -> Value {
+fn scrub_value(value: Value, hidden: &[&str]) -> Value {
     match value {
-        Value::String(text) => Value::String(scrub(&text)),
+        Value::String(text) => Value::String(scrub_text(&text, hidden)),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|item| scrub_value(item, scrub))
+                .map(|item| scrub_value(item, hidden))
                 .collect(),
         ),
-        Value::Object(map) => Value::Object(scrub_map(map, scrub)),
+        Value::Object(map) => Value::Object(scrub_map(map, hidden)),
         other => other,
     }
 }
+
+#[cfg(test)]
+#[path = "browser_login_tests.rs"]
+mod tests;

@@ -34,9 +34,11 @@
 //! the browser opens, [`loopback_redirect_uri`] the redirect it comes back to,
 //! [`new_state`] the value that ties the two together, [`NativeSignInConfig`]
 //! reads where the API says to send the browser, and [`can_open_browser`] says
-//! whether this machine has a browser to send. A loopback redirect cannot be
-//! relayed: the browser that approves hands the code to its own computer,
-//! never to whoever sent the link.
+//! whether this machine has a browser to send. The browser that approves hands
+//! the code to its own computer's `127.0.0.1`, so a link or code sent to
+//! someone on another computer delivers nothing to the sender. That is all it
+//! promises: a forwarded callback port (`ssh -L`, a port-forwarding tool) or
+//! another user of the same computer can still complete a sign-in.
 
 use base64::{engine::general_purpose, Engine as _};
 use rand::{rngs::SysRng, TryRng};
@@ -44,7 +46,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 use url::Url;
 
@@ -347,8 +349,10 @@ fn require_safe_dashboard(url: Option<&str>) -> Result<()> {
 /// cleartext to observe, and that is how the control plane is run while
 /// somebody is working on it.
 pub(crate) fn require_secure_token_exchange(api_url: &str) -> Result<()> {
+    // Never the URL itself in an error: one that does not parse can still
+    // carry a credential (`https://user:secret@[bad`).
     let parsed = Url::parse(api_url)
-        .map_err(|_| ThalovantError::Api(format!("API URL could not be read: {api_url}")))?;
+        .map_err(|_| ThalovantError::Api("the Thalovant API URL could not be read".into()))?;
     if parsed.scheme() == "https" {
         return Ok(());
     }
@@ -360,7 +364,7 @@ pub(crate) fn require_secure_token_exchange(api_url: &str) -> Result<()> {
     }
     Err(ThalovantError::Api(format!(
         "refusing to send an authorization code and PKCE verifier in cleartext to {}; use https, or a loopback address while developing",
-        parsed.host_str().unwrap_or(api_url)
+        parsed.host_str().unwrap_or("the Thalovant API")
     )))
 }
 
@@ -414,7 +418,9 @@ pub fn loopback_redirect_uri(port: u32) -> Result<String> {
 /// `scopes` are dropped and the rest joined by one space; `scope` is left out
 /// when nothing is left, and the API then grants its default (`hubs:read
 /// clients:write`). `device_name` is cut to [`MAX_DEVICE_NAME_LENGTH`] code
-/// points, and left out when it is empty or `None`.
+/// points, and left out when it is empty or `None`. (`browser_login` gives a
+/// `None` [`default_device_name`]; an empty name is the caller's way of
+/// sending none.)
 pub fn browser_authorization_url<I, S>(
     authorization_endpoint: &str,
     client_id: &str,
@@ -565,10 +571,13 @@ impl NativeSignInConfig {
     ///
     /// Unusable ([`ThalovantError::Api`], with no status): a body that is not
     /// a JSON object; an `authorization_endpoint` that is not https (or http
-    /// on `localhost`, `127.0.0.1` or `::1`), has no host, or carries
-    /// credentials, a query, a fragment, whitespace, control characters or a
-    /// port no browser can open; a `token_endpoint` that is not a path on the
-    /// API (one leading `/`, not `//`, no `?`, `#`, `\` or whitespace); an
+    /// on `localhost`, `127.0.0.1` or `::1`), has a host that is not an IP
+    /// address or a DNS name of ASCII labels (`%`, `_`, an empty label, a
+    /// non-ASCII name not written as `xn--`, a numeric last label that is not
+    /// IPv4), or carries credentials, a query, a fragment, whitespace, control
+    /// characters, port 0 or a port above 65535; a `token_endpoint` that is
+    /// not a path on the API (one leading `/`, not `//`, every `%` followed by
+    /// two hex digits, no `:`, `?`, `#`, `\` or whitespace); an
     /// `sdk_client_id` that is not 1 to 64 of `A-Z a-z 0-9 . _ -`; or a
     /// `code_challenge_methods_supported` that is not a list naming `S256`.
     /// Other members are ignored.
@@ -649,42 +658,94 @@ fn usable_authorization_endpoint(value: &str) -> bool {
 }
 
 /// The lowercased host of an authority without userinfo, or `None` when it
-/// has none, has a bracketed host that is not an IPv6 address, or a port
-/// that is not a number from 0 to 65535 (an empty port is no port).
+/// has none, has a host a browser cannot reach ([`real_host`]), or a port
+/// that is not a number from 1 to 65535 (an empty port is no port).
 fn authority_host(authority: &str) -> Option<String> {
-    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+    let (host, bracketed, port) = if let Some(bracketed) = authority.strip_prefix('[') {
         let (inside, after) = bracketed.split_once(']')?;
-        inside.parse::<Ipv6Addr>().ok()?;
         let port = match after {
             "" => None,
             _ => Some(after.strip_prefix(':')?),
         };
-        (inside, port)
+        (inside, true, port)
     } else {
         if authority.contains(['[', ']']) {
             return None;
         }
         match authority.split_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
+            Some((host, port)) => (host, false, Some(port)),
+            None => (authority, false, None),
         }
     };
     if let Some(port) = port.filter(|port| !port.is_empty()) {
         let numeric = port.bytes().all(|byte| byte.is_ascii_digit());
-        if !numeric || !port.parse::<u32>().is_ok_and(|number| number <= 65535) {
+        // 0 parses, and no browser can open it either.
+        if !numeric
+            || !port
+                .parse::<u32>()
+                .is_ok_and(|number| (1..=65535).contains(&number))
+        {
             return None;
         }
     }
-    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    let host = host.to_ascii_lowercase();
+    real_host(&host, bracketed).then_some(host)
 }
 
-/// A path on the API: one leading slash, no query, fragment, backslash,
-/// whitespace or control character.
+/// Whether `host` (lowercased, brackets off), as written, names something a
+/// browser can reach.
+///
+/// An IPv6 address between brackets; an IPv4 address, which it must be
+/// whenever its last label is a number, as a browser reads it; or a DNS name
+/// of ASCII labels, each 1 to 63 letters, digits and inner hyphens, at most
+/// 253 characters in all. So `%`, `_`, an empty label, a trailing dot and a
+/// non-ASCII host (an international name is written in its `xn--` form) are
+/// not hosts.
+fn real_host(host: &str, bracketed: bool) -> bool {
+    if bracketed {
+        return host.parse::<Ipv6Addr>().is_ok();
+    }
+    if host.parse::<Ipv4Addr>().is_ok() {
+        return true;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let last = labels.last().copied().unwrap_or_default();
+    if !last.is_empty() && last.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false; // numeric like an IPv4 address, and not one
+    }
+    let label = |label: &str| {
+        let bytes = label.as_bytes();
+        (1..=63).contains(&bytes.len())
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+            && bytes.first() != Some(&b'-')
+            && bytes.last() != Some(&b'-')
+    };
+    host.len() <= 253 && labels.into_iter().all(label)
+}
+
+/// A path on the API: one leading slash, every `%` followed by two hex
+/// digits, and no colon, query, fragment, backslash, whitespace or control
+/// character.
+///
+/// No colon, because a URL joiner can read what follows the slash as a URL of
+/// its own (`/https://collector.example/token`, `/collector.example:443/token`),
+/// and the exchange carries the code and the verifier. A broken escape
+/// (`/v1/%zz`) is found here, while a device login can still stand in, rather
+/// than after somebody approved.
 fn usable_token_endpoint(value: &str) -> bool {
-    value.starts_with('/')
+    let bytes = value.as_bytes();
+    let whole_escapes = bytes.iter().enumerate().all(|(at, byte)| {
+        *byte != b'%'
+            || (bytes.get(at + 1).is_some_and(u8::is_ascii_hexdigit)
+                && bytes.get(at + 2).is_some_and(u8::is_ascii_hexdigit))
+    });
+    whole_escapes
+        && value.starts_with('/')
         && !value.starts_with("//")
         && !value.chars().any(|character| {
-            matches!(character, '?' | '#' | '\\')
+            matches!(character, ':' | '?' | '#' | '\\')
                 || character.is_whitespace()
                 || is_control(character)
         })

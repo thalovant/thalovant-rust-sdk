@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: 0.17.0, browser sign-in (browser-login).
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Final browser-login reference (39e31d8): digest, 119 vectors, request bound.
 
 # Quick facts: thalovant (Rust SDK)
 
@@ -12,7 +12,7 @@ Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: 0.17.0, browser sign-in (brows
 | Default control API | `https://api.thalovant.com` (`DEFAULT_CONTROL_API_URL`) |
 | Release | `auto-release.yml`, on a push to `main`, when `src/` (tests included), `Cargo.toml` or `LICENSE` changed since the latest `v*` tag, or when no such tag exists: publishes the version in `Cargo.toml` when its tag does not exist yet, else bumps the patch and publishes that |
 | Parity contract | `contracts/sdk-parity.json`, checked by the Python SDK's `scripts/check-sdk-parity.py` |
-| Reference digests accepted | `57c7e71f6456…` (Python `main`, 0.10.0) and `49744ee385bf…` (thalovant-python-sdk#113, browser sign-in) |
+| Reference digests accepted | `57c7e71f6456…` (Python `main`, 0.10.0) and `6dfb3bb31ac7…` (thalovant-python-sdk#113 at 39e31d8, browser sign-in) |
 
 ## Entry points
 
@@ -40,9 +40,10 @@ Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: 0.17.0, browser sign-in (brows
 | Redirect | `http://127.0.0.1:<port>/callback` (`native_auth::loopback_redirect_uri`), port 1024-65535 |
 | PKCE | S256 only; verifier 64 random bytes (86 characters), state 24 random bytes (32 characters), both from the OS |
 | Timeout | 300 s browser (`DEFAULT_BROWSER_LOGIN_TIMEOUT`), 900 s device login |
-| Device name | `thalovant-rust-sdk on <hostname>`, at most 120 code points |
+| Device name | `thalovant-rust-sdk on <hostname>` when `None`, left out when empty, at most 120 code points |
 | Errors | denied `DeviceAuthorizationDenied`, timeout `DeviceAuthorizationExpired`, other callback error `BrowserLoginFailed`, refused exchange `ApiResponse` 400 `invalid_grant` |
-| Vectors | `tests/conformance/browser-login-vectors.json` (98 cases): `tests/browser_login.rs` and `src/loopback_tests.rs` |
+| Request bound | configuration and exchange: 10 s each (`BROWSER_REQUEST_TIMEOUT`); the tab waits for the sign-in to end |
+| Vectors | `tests/conformance/browser-login-vectors.json` (119 cases): `tests/browser_login.rs` and `src/loopback_tests.rs`; private edges in `src/control/browser_login_tests.rs` |
 
 ## Chat apps (`/v1/bridges`)
 

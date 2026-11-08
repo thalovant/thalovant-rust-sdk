@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Sign-in section for browser sign-in (0.17.0); the quick start signs in with interactive_login().
+Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Sign-in section for browser sign-in (0.17.0), with the final reference's wording; the quick start signs in with interactive_login().
 
 <p align="center">
   <picture>
@@ -98,12 +98,14 @@ control.interactive_login(forced).await?;
 `interactive_login` opens your browser at the Thalovant consent page and
 listens on `127.0.0.1` for the answer (OAuth with PKCE on a loopback redirect,
 RFC 8252). It always prints the address too, in case the browser does not
-open. Only the browser on this computer can complete the sign-in, so a sign-in
-link that reaches somebody else gives them nothing.
+open. The browser that approves hands the code to this computer's
+`127.0.0.1`, so a link or code sent to someone on another computer delivers
+nothing to the sender.
 
 On a machine that cannot show a browser, it prints a code to enter at
 `thalovant.com/activate` from any browser instead (device login): over SSH
-(`SSH_CONNECTION` or `SSH_TTY`), in CI (`CI`), or on Linux and the BSDs with
+(`SSH_CONNECTION` or `SSH_TTY` set to a non-empty value), in CI (`CI`, any
+non-empty value), or on Linux and the BSDs with
 neither `DISPLAY` nor `WAYLAND_DISPLAY`. It does the same against an API that
 does not offer browser sign-in yet. Once the browser has been opened, its
 outcome stands: a denial or a timeout is returned, never turned into a device
@@ -112,7 +114,8 @@ login.
 `browser_login(BrowserLoginOptions)` is the browser sign-in on its own. Its
 options are `scopes` (none asks for the API's default, `hubs:read` and
 `clients:write`), `device_name` (what the consent page and the token show;
-`thalovant-rust-sdk on <hostname>` by default, at most 120 characters),
+`thalovant-rust-sdk on <hostname>` when `None`, nothing when empty, at most
+120 characters),
 `open_browser`, `timeout` (300 seconds), `prompt` (present the URL yourself)
 and `opener` (open it yourself). Both calls return the token answer and keep
 the token exactly as a device login does, so `revoke_api_token(None)` revokes

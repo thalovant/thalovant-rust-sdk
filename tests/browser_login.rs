@@ -907,9 +907,8 @@ fn the_browser_rule_reads_this_process_by_default() {
     ]
     .into_iter()
     .filter_map(|name| {
-        std::env::var(name)
-            .ok()
-            .map(|value| (name.to_string(), value))
+        // Lossy, never dropped: a value that is not Unicode is still set.
+        std::env::var_os(name).map(|value| (name.to_string(), value.to_string_lossy().into_owned()))
     })
     .collect();
     assert_eq!(
@@ -941,6 +940,12 @@ fn an_authorization_endpoint_no_browser_can_open_is_unusable() {
         "https:///authorize",
         "https://dash.thalovant.com?",
         "javascript://dash.thalovant.com/authorize",
+        "https://bad|host/authorize",
+        "https://dash.thalovant.com:0/authorize",
+        "https://dash.thalovant.com./authorize",
+        "https://-dash.thalovant.com/authorize",
+        "https://1.2.3/authorize",
+        "https://[127.0.0.1]/authorize",
     ] {
         assert!(
             NativeSignInConfig::from_value(&config(endpoint)).is_err(),
@@ -1121,10 +1126,50 @@ async fn an_echoed_code_and_verifier_never_reach_the_error() {
         );
     }
     assert!(
-        problem.contains("<redacted>"),
+        problem.contains("[redacted]"),
         "the echo was scrubbed, not dropped"
     );
     api.finish("echo");
+}
+
+#[tokio::test]
+async fn an_api_url_that_cannot_be_read_is_never_repeated_in_the_error() {
+    // It can still carry a credential, and a caller reports the error.
+    let opened: BrowserOpener = Arc::new(|_: &str| panic!("the browser was opened"));
+    for broken in [
+        "https://user:hunter2-secret@[bad",
+        "http://user:hunter2-secret@[::1",
+    ] {
+        let mut control = ControlPlane::new(broken, None);
+        let browser = control
+            .browser_login(BrowserLoginOptions {
+                opener: Some(opened.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an API URL that cannot be read");
+        let forced = control
+            .interactive_login(InteractiveLoginOptions {
+                method: LoginMethod::Browser,
+                opener: Some(opened.clone()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("an API URL that cannot be read");
+        for error in [browser, forced] {
+            assert!(error.status_code().is_none());
+            for form in [
+                error.to_string(),
+                format!("{error:?}"),
+                format!("{error:#?}"),
+            ] {
+                assert!(
+                    !form.contains("hunter2-secret"),
+                    "the API URL reached the error"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

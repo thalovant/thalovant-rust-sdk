@@ -29,7 +29,7 @@ use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use url::form_urlencoded;
@@ -59,17 +59,32 @@ pub(crate) const PAGE_HEADERS: [(&str, &str); 5] = [
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
 /// How long one connection may take to send its request head.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long an accepted tab waits for its page while the code is exchanged.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long closing waits for an accepted tab's page to be written.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
-/// How long, and how much, an answered connection is read for before it is
-/// closed, so that what the browser still sends cannot reset the connection
-/// before the browser has read its answer.
-const LINGER: Duration = Duration::from_secs(2);
-const LINGER_BYTES: usize = 1024 * 1024;
+/// After an answer, how long and how much of what the browser still sends is
+/// read and dropped before the connection closes. A socket closed with bytes
+/// unread answers them with a reset, and macOS then throws away the answer the
+/// browser had not read yet -- an oversized head's 400, say.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const DRAIN_LIMIT: usize = 1024 * 1024;
 /// How many connections may wait to be accepted.
 const BACKLOG: u32 = 64;
+/// How many connections are served at once. More wait in the backlog until
+/// one ends -- an idle one after [`REQUEST_READ_TIMEOUT`] at most -- so that
+/// connections nobody sends on cannot use up the process's descriptors.
+const MAX_CONNECTIONS: usize = 32;
+/// The `error` values RFC 6749 section 4.1.2.1 defines. Only these are kept
+/// from a callback: anything else is a value somebody else chose, and it could
+/// be the state or a code, which must never reach an error.
+pub(crate) const OAUTH_ERRORS: [&str; 7] = [
+    "invalid_request",
+    "unauthorized_client",
+    "access_denied",
+    "unsupported_response_type",
+    "invalid_scope",
+    "server_error",
+    "temporarily_unavailable",
+];
 
 /// What the person is told before the browser opens. Opening a browser can
 /// fail without a word, so the URL is always shown.
@@ -100,7 +115,7 @@ pub(crate) struct Callback {
     pub(crate) outcome: CallbackOutcome,
     /// The authorization code, when the person approved.
     pub(crate) code: Option<String>,
-    /// The `error` the page sent, when it sent a non-empty one.
+    /// The `error` the page sent, when it is one of [`OAUTH_ERRORS`].
     pub(crate) error: Option<String>,
 }
 
@@ -122,8 +137,9 @@ impl fmt::Debug for Callback {
 /// `state` is missing, given more than once, or not this sign-in's (compared
 /// in constant time, as UTF-8 bytes); otherwise `(200, callback)`. An `error`
 /// wins over a `code` sent with it: a refusal that also carries a code is
-/// still a refusal. Query values are decoded once, the way a form decodes
-/// them; `error_description` is not read.
+/// still a refusal, and an `error` outside [`OAUTH_ERRORS`] is not kept. Query
+/// values are decoded once, the way a form decodes them; `error_description`
+/// is not read.
 pub(crate) fn classify_request(method: &str, target: &str, state: &str) -> (u16, Option<Callback>) {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if method != "GET" || path != LOOPBACK_CALLBACK_PATH {
@@ -156,7 +172,7 @@ pub(crate) fn classify_request(method: &str, target: &str, state: &str) -> (u16,
             Callback {
                 outcome: CallbackOutcome::Failed,
                 code: None,
-                error: Some(first.clone()).filter(|error| !error.is_empty()),
+                error: Some(first.clone()).filter(|error| OAUTH_ERRORS.contains(&error.as_str())),
             }
         };
         return (200, Some(callback));
@@ -186,7 +202,10 @@ fn page(text: &str) -> String {
 }
 
 /// A whole HTTP/1.1 answer: the status, [`PAGE_HEADERS`], and a small page.
-pub(crate) fn response_bytes(status: u16, text: &str) -> Vec<u8> {
+///
+/// The answer to a `HEAD` (`head_only`) carries no body (RFC 9110 section
+/// 9.3.2); its `Content-Length` is the length the page would have had.
+pub(crate) fn response_bytes(status: u16, text: &str, head_only: bool) -> Vec<u8> {
     let body = page(text);
     let reason = match status {
         200 => "OK",
@@ -198,9 +217,12 @@ pub(crate) fn response_bytes(status: u16, text: &str) -> Vec<u8> {
         answer.push_str(&format!("{name}: {value}\r\n"));
     }
     answer.push_str(&format!(
-        "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     ));
+    if !head_only {
+        answer.push_str(&body);
+    }
     answer.into_bytes()
 }
 
@@ -263,7 +285,8 @@ async fn read_head(stream: &mut TcpStream) -> io::Result<Head> {
 struct Shared {
     state: String,
     /// Taken by the first connection that brings a callback with the right
-    /// state; every later one finds it gone.
+    /// state; every later one finds it gone. Taken and used under this lock,
+    /// which [`LoopbackListener::close`] checks under too.
     accept: Mutex<Option<oneshot::Sender<Callback>>>,
     /// How the sign-in ended: `None` while it has not.
     answer: watch::Receiver<Option<bool>>,
@@ -271,23 +294,22 @@ struct Shared {
     answered: Mutex<Option<oneshot::Sender<()>>>,
 }
 
-/// One connection: one request head read, one answer, closed.
+/// One connection: one request head read, one answer, drained, closed.
 async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
     let head = match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_head(&mut stream)).await {
         Ok(Ok(Head::Complete(head))) => head,
         Ok(Ok(Head::TooLarge)) => {
-            reply(&mut stream, 400, WRONG_STATE_TEXT).await;
-            linger(&mut stream).await;
+            answer(&mut stream, 400, WRONG_STATE_TEXT, false).await;
             return;
         }
         // Closed, broken or too slow: that connection's alone.
         _ => return,
     };
     let Some((method, target)) = request_line(&head) else {
-        reply(&mut stream, 400, WRONG_STATE_TEXT).await;
-        linger(&mut stream).await;
+        answer(&mut stream, 400, WRONG_STATE_TEXT, false).await;
         return;
     };
+    let head_only = method == "HEAD";
     let (status, callback) = classify_request(&method, &target, &shared.state);
     let Some(callback) = callback else {
         let text = if status == 404 {
@@ -295,29 +317,35 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
         } else {
             WRONG_STATE_TEXT
         };
-        reply(&mut stream, status, text).await;
-        linger(&mut stream).await;
+        answer(&mut stream, status, text, head_only).await;
         return;
     };
-    let first = shared
-        .accept
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    let Some(first) = first else {
+    // Taken and sent under the lock close() checks under: close() either
+    // sees this callback, and gives its tab the grace to be answered, or has
+    // already taken the acceptance away, and this connection never claims it.
+    let claimed = {
+        let mut accept = shared
+            .accept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        accept.take().map(|first| first.send(callback).is_ok())
+    };
+    let Some(sent) = claimed else {
         // A second answer with the right state, after the first was
         // accepted, is not this sign-in's any more either.
-        reply(&mut stream, 400, WRONG_STATE_TEXT).await;
-        linger(&mut stream).await;
+        answer(&mut stream, 400, WRONG_STATE_TEXT, false).await;
         return;
     };
-    let signed_in = if first.send(callback).is_ok() {
-        let mut answer = shared.answer.clone();
-        let waited = tokio::time::timeout(ANSWER_TIMEOUT, answer.wait_for(Option::is_some)).await;
+    let signed_in = if sent {
+        // Until the sign-in has ended, however long the exchange takes: the
+        // page says how it ended, so it cannot be written before it has.
+        // close() always answers, so this never outlives the sign-in.
+        let mut ended = shared.answer.clone();
+        let waited = ended.wait_for(Option::is_some).await;
         let ended = match waited {
-            Ok(Ok(ended)) => *ended,
-            // No answer within the bound, or the sign-in dropped: not signed in.
-            _ => None,
+            Ok(ended) => *ended,
+            // The sign-in was dropped: not signed in.
+            Err(_) => None,
         };
         ended.unwrap_or(false)
     } else {
@@ -329,7 +357,7 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
     } else {
         NOT_COMPLETED_TEXT
     };
-    reply(&mut stream, 200, text).await;
+    reply(&mut stream, 200, text, false).await;
     let done = shared
         .answered
         .lock()
@@ -338,27 +366,35 @@ async fn serve(mut stream: TcpStream, shared: Arc<Shared>) {
     if let Some(done) = done {
         let _ = done.send(());
     }
-    linger(&mut stream).await;
+    drain(&mut stream).await;
 }
 
-/// Write one answer and close the connection; a tab that went away changes
-/// nothing.
-async fn reply(stream: &mut TcpStream, status: u16, text: &str) {
-    let _ = stream.write_all(&response_bytes(status, text)).await;
+/// Write one answer, then let the browser finish before the connection closes.
+async fn answer(stream: &mut TcpStream, status: u16, text: &str, head_only: bool) {
+    reply(stream, status, text, head_only).await;
+    drain(stream).await;
+}
+
+/// Write one answer and shut the write side, so the browser sees it end; a
+/// tab that went away changes nothing.
+async fn reply(stream: &mut TcpStream, status: u16, text: &str, head_only: bool) {
+    let _ = stream
+        .write_all(&response_bytes(status, text, head_only))
+        .await;
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
 }
 
 /// Read and drop what the browser still sends after its answer -- the rest
 /// of an oversized head, a body nobody asked for -- until it closes its side,
-/// for at most [`LINGER`] and [`LINGER_BYTES`].
+/// for at most [`DRAIN_TIMEOUT`] and [`DRAIN_LIMIT`].
 ///
 /// Closing a socket that still holds unread data resets the connection, and
 /// a reset can throw away the answer before the browser has read it (macOS
-/// does). Closing the listener aborts a connection that is still lingering.
-async fn linger(stream: &mut TcpStream) {
+/// does). Closing the listener aborts a connection that is still draining.
+async fn drain(stream: &mut TcpStream) {
     let mut sink = [0_u8; 8192];
-    let mut left = LINGER_BYTES;
+    let mut left = DRAIN_LIMIT;
     let drain = async {
         while left > 0 {
             match stream.read(&mut sink).await {
@@ -367,7 +403,7 @@ async fn linger(stream: &mut TcpStream) {
             }
         }
     };
-    let _ = tokio::time::timeout(LINGER, drain).await;
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, drain).await;
 }
 
 /// No other socket may share the port: on Windows a socket bound without
@@ -415,6 +451,10 @@ pub(crate) struct LoopbackListener {
     /// Whether a tab brought the accepted callback and is owed its page.
     tab_waiting: bool,
     connections: JoinSet<()>,
+    /// One of [`MAX_CONNECTIONS`] slots, held before a connection is accepted
+    /// and handed to the task that serves it, which frees it when it ends.
+    slots: Arc<Semaphore>,
+    slot: Option<OwnedSemaphorePermit>,
 }
 
 impl LoopbackListener {
@@ -443,6 +483,8 @@ impl LoopbackListener {
             answered: Some(answered),
             tab_waiting: false,
             connections: JoinSet::new(),
+            slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            slot: None,
         })
     }
 
@@ -454,7 +496,9 @@ impl LoopbackListener {
     /// The first accepted callback, or `None` once `timeout` has passed.
     ///
     /// Connections are accepted while this runs, each served on its own
-    /// task, so a connection that never sends anything holds nobody up.
+    /// task, so a connection that never sends anything holds nobody up; at
+    /// most [`MAX_CONNECTIONS`] at once, and finished tasks are reaped as it
+    /// goes.
     /// Measured on the monotonic clock and never cut short: a timer that
     /// wakes early waits again for what is left. A wrong-state request
     /// neither ends the wait nor restarts it. Once a callback is accepted the
@@ -464,7 +508,9 @@ impl LoopbackListener {
         let deadline = Instant::now().checked_add(timeout);
         enum Event {
             Accepted(Option<Callback>),
+            Slot(OwnedSemaphorePermit),
             Connection(io::Result<(TcpStream, SocketAddr)>),
+            Reaped,
             Tick,
         }
         loop {
@@ -490,10 +536,20 @@ impl LoopbackListener {
                         None => std::future::pending().await,
                     }
                 };
+                let free = self.slot.is_some();
+                let slots = Arc::clone(&self.slots);
+                let connections = &mut self.connections;
+                let running = !connections.is_empty();
                 tokio::select! {
                     biased;
                     callback = accepted => Event::Accepted(callback.ok()),
-                    connection = listener.accept() => Event::Connection(connection),
+                    Some(_) = connections.join_next(), if running => Event::Reaped,
+                    slot = slots.acquire_owned(), if !free => match slot {
+                        Ok(slot) => Event::Slot(slot),
+                        // The semaphore is never closed.
+                        Err(_) => Event::Tick,
+                    },
+                    connection = listener.accept(), if free => Event::Connection(connection),
                     () = tick => Event::Tick,
                 }
             };
@@ -506,16 +562,21 @@ impl LoopbackListener {
                     self.tab_waiting = callback.is_some();
                     return callback;
                 }
+                Event::Slot(slot) => self.slot = Some(slot),
                 Event::Connection(Ok((stream, _))) => {
-                    self.connections
-                        .spawn(serve(stream, Arc::clone(&self.shared)));
+                    let slot = self.slot.take();
+                    let shared = Arc::clone(&self.shared);
+                    self.connections.spawn(async move {
+                        serve(stream, shared).await;
+                        drop(slot);
+                    });
                 }
                 Event::Connection(Err(_)) => {
                     // Out of descriptors, or a connection reset before it was
                     // accepted: pause rather than spin, and keep waiting.
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                Event::Tick => {}
+                Event::Reaped | Event::Tick => {}
             }
         }
     }
@@ -537,9 +598,21 @@ impl LoopbackListener {
     pub(crate) async fn close(&mut self) {
         self.finish(false);
         self.listener = None;
-        if let Some(mut accepted) = self.accepted.take() {
-            // A callback accepted after the wait ended still owes its tab a page.
-            self.tab_waiting |= accepted.try_recv().is_ok();
+        self.slot = None;
+        {
+            // Under the lock a connection claims the acceptance with: a
+            // callback claimed before this point -- after the wait ended,
+            // too -- is seen here and its tab gets the grace below, and none
+            // can be claimed after it.
+            let mut accept = self
+                .shared
+                .accept
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            accept.take();
+            if let Some(mut accepted) = self.accepted.take() {
+                self.tab_waiting |= accepted.try_recv().is_ok();
+            }
         }
         if let Some(answered) = self.answered.take() {
             if self.tab_waiting {

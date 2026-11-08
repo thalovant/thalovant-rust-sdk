@@ -336,8 +336,11 @@ pub enum ThalovantError {
         .code.as_deref().map(|code| format!(" ({code})")).unwrap_or_default()
     )]
     BrowserLoginFailed {
-        /// The `error` the consent page sent, when it is a plain code (1 to
-        /// 80 of `A-Z a-z 0-9 _ . : -`), such as `server_error`.
+        /// The `error` the consent page sent, when it is one of RFC 6749's
+        /// codes (`invalid_request`, `unauthorized_client`,
+        /// `unsupported_response_type`, `invalid_scope`, `server_error`,
+        /// `temporarily_unavailable`); `None` for anything else, which could
+        /// be the state or a code.
         code: Option<String>,
     },
     /// One [`ControlPlane::poll_device_login`](crate::ControlPlane::poll_device_login)
