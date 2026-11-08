@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Suggestions from the chat apps change (0.16.0) and its review, including the release-path parity gate.
+Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: CodeRabbit review-body close-out: ws:// for loopback only, and test-only changes without a release.
 
 # Suggestions
 
@@ -31,3 +31,15 @@ Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Suggestions from the chat apps
 - **Problem:** the release paths (`auto-release.yml`, `publish.yml`) reuse `sdk-parity.yml`, which checks this SDK as one consumer without `--release`, so a "not yet on par" state (such as `chat-apps` before the Python reference declares it) reports but does not stop a release.
 - **Proposed solution:** on release paths, check out every sibling SDK and run the checker with `--workspace ... --release`, keeping the consumer check for pull requests; decide it fleet-wide, since every SDK reuses the same workflow shape.
 - **Impact:** a release cannot ship while the fleet is behind; a release then waits on every sibling SDK's acknowledgement.
+
+## 6. Accept `ws://` only for a loopback hub, in every SDK at once
+
+- **Problem:** `authorized_wss_url` in `src/transport.rs` accepts `ws://` and puts `authorization` (base64 of `user-agent:access_key`) in the upgrade URL before Noise starts, so on a `ws://` endpoint the access key crosses the network in the clear (CodeRabbit on #30). The HTTP transport (`require_tls_endpoint`) and MQTT (`mqtt_options_for_identity`) already refuse cleartext for that reason. The Python reference accepts `ws://` the same way (`_hive.py`), so this port matches it and cannot change alone (`AUDIT.md`, Open).
+- **Proposed solution:** in the Python reference first, then in every port: accept `ws://` only for `localhost`, `127.0.0.1` and `[::1]`, the rule `validate_control_request_url` in `src/control.rs` already applies to `http://`, and add a shared vector for it.
+- **Impact:** removes the last path where the SDK sends the access key unencrypted. A client pointed at a `ws://` hub on another host fails to connect until its identity names a `wss://` endpoint, so this needs a minor release and a changelog note in each SDK.
+
+## 7. Let test-only changes under `src/` merge without a release
+
+- **Problem:** `auto-release.yml` treats any change under `src/` as release-relevant. A change to a `#[cfg(test)]` module therefore bumps the patch version and publishes a crate whose code did not change. The contract tests and full-request test servers asked for on #66 and #21 wait in draft #88 for that reason (`AUDIT.md`, Open).
+- **Proposed solution:** move unit-test modules into `src/**/*_tests.rs` files included with `#[cfg(test)] #[path = ...]`, as `src/transport_noise_tests.rs` already is, and have the planner in `auto-release.yml` skip a push whose `src/` changes are only `*_tests.rs` files.
+- **Impact:** test-only fixes merge when they are written. It costs a one-time move of the test modules and one more rule in the release planner.

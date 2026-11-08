@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Created with the chat apps surface (0.16.0).
+Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: Release row names the paths that cut a release.
 
 # Quick facts: thalovant (Rust SDK)
 
@@ -10,7 +10,7 @@ Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Created with the chat apps sur
 | Licence | MIT |
 | Binaries | none: a library crate |
 | Default control API | `https://api.thalovant.com` (`DEFAULT_CONTROL_API_URL`) |
-| Release | `auto-release.yml` publishes the version in `Cargo.toml` when its tag does not exist yet, else bumps the patch |
+| Release | `auto-release.yml`, on every push to `main` that changes `src/` (tests included), `Cargo.toml` or `LICENSE` since the last tag: publishes the version in `Cargo.toml` when its tag does not exist yet, else bumps the patch and publishes that |
 | Parity contract | `contracts/sdk-parity.json`, checked by the Python SDK's `scripts/check-sdk-parity.py` |
 
 ## Entry points

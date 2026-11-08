@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Chat apps questions (0.16.0), with the chat-listing scope.
+Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: Release-path, ws:// and hard-link questions from the CodeRabbit review-body close-out.
 
 # FAQ
 
@@ -36,3 +36,14 @@ Nothing breaks: every chat-apps enum keeps an unknown value in `Other(String)`. 
 
 **Which settings did the API refuse?**
 `error.api_fields()` lists their names (never values) for `bridge_settings_invalid`, `bridge_secrets_invalid` and the `bridge_url_*` codes; `error.api_code()` gives the code.
+
+## Releases and transports
+
+**Why does a test-only change wait for the next release?**
+`auto-release.yml` treats every change under `src/` as release-relevant, and unit tests live under `src/` in `#[cfg(test)]` modules. Merging a test-only change there would bump the patch version and publish a crate with no code change, so such changes wait in a draft pull request until the next `src/` change. Changes to `tests/`, `CHANGELOG.md` and these notes files cut no release. `SUGGESTIONS.md` item 7 proposes a way out.
+
+**Does the WSS transport accept `ws://`?**
+Yes, as the Python reference does: `authorized_wss_url` in `src/transport.rs` accepts `ws://` and `wss://`. The access key then crosses the network in the clear, though it does not open a session on its own (the Noise pre-shared key comes from the password). The HTTP and MQTT transports refuse cleartext endpoints. Use `wss://` for any hub that is not on this machine; `SUGGESTIONS.md` item 6 proposes making that the rule in every SDK.
+
+**Why does the first connect fail with "atomic Noise key publication requires a filesystem supporting hard links"?**
+The state folder is on a filesystem without hard links (FAT32, exFAT, some network shares). The static key is published with a hard link so that two processes never replace each other's key (`publish_private` in `src/noise_store.rs`). Keep the identity file on a local disk, since `Client::from_file` keeps the key beside it, or point the transport's `set_noise_state_dir` at a local folder.
