@@ -1,6 +1,43 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: Chat apps (0.16.0), merged with the CodeRabbit follow-up entries from main.
+Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: CodeRabbit review-body close-out on #21, #23, #30, #37, #40, #65 and #66.
 
 # Maintenance report
+
+## 2026-11-07: CodeRabbit review-body close-out
+
+CodeRabbit's review bodies on merged PRs hold 16 items that are not review threads: nitpicks, and comments outside the diff. Every one was checked against `main` (072a2d8). Every CodeRabbit review thread on these PRs was already resolved.
+
+| PR | Item | Outcome |
+| --- | --- | --- |
+| #21 | Reject an empty `etag` in `update_hub` / `delete_hub` | Fixed since 8a27279 (#42): both return `ThalovantError::Api` before any request; `empty_hub_etags_fail_before_any_request`. |
+| #21 | Read the whole request in `spawn_recording_server` | Fixed since 8a27279 (#42): `read_full_request` reads up to `Content-Length`. Nine older servers in `src/control.rs` that still read once are moved to it in #88, held (see below). |
+| #21 | Compare the install body as JSON, not as text | Fixed since 8a27279 (#42): `request_body` parses it and compares it as a `Value`. |
+| #23 | Document the breaking MQTT change and bump the version | Fixed since 706908c (#86): the 0.2.24 **BREAKING** entry names each change and how to migrate. Published versions are never replaced, and 0.3.0 and later shipped after it. |
+| #30 | Run Argon2id off the async workers | Fixed since 5156879 (#40): `receive_noise` runs handshake frames in `spawn_blocking`, and the PSK is cached since 922d140 (#39). |
+| #30 | Register the `Notified` waiter before spawning the read task | Fixed since 2939de5 (#37): created, pinned and `enable()`d before `tokio::spawn`, in the WSS transport and in the MQTT one too. |
+| #30 | Require `wss://` before adding `authorization` | Not changed. The Python reference accepts `ws://` the same way (`_hive.py`), so this is a decision for every SDK at once; the access key does not open a session without the password-derived PSK. Recorded in `AUDIT.md`; `SUGGESTIONS.md` item 6 proposes loopback-only `ws://`. |
+| #30 | Record why the WebSocket closed | Fixed since 8a27279 (#42), which records the close code as `last_error` (the peer's reason text is left out on purpose), and 3a9bed5 (#70), which stores the refusal verdict before `connect()` wakes. |
+| #37 | Reuse the PSK cache over HTTP and MQTT | Fixed since 922d140 (#39): `NoiseChannel::start` loads and saves the cache, and `continue_handshake` forgets it when the answer does not authenticate. |
+| #37 | Move WSS onto `NoiseChannel`; share the health check | Fixed since 922d140 (#39): all three transports hold a `NoiseChannel` and report health through `noise_health`. |
+| #40 | Tell staging collisions from publication races; hard-link portability | The staging part was fixed before merge (5156879): staging names carry a UUID, and a collision is its own error. Hard links stay, as in the reference: neither `fs::rename` nor `create_new` is a safe fallback. Recorded in `AUDIT.md` and `FAQ.md`. |
+| #40 | Bound the readiness spin loops | Fixed before merge (5156879): 5 s timeouts that fail with a message. |
+| #40 | One deadline for all describe windows | Fixed before merge (5156879): `describe_many` computes the deadline once; `describe_windows_share_one_deadline_and_keep_earlier_answers`. |
+| #65 | The 0.11.0 note gives the wrong quota-count ceiling | Still valid, fixed here: the entry now says 2^53 − 1, as `whole_count` enforces. |
+| #66 | Serialise `listed_in` in `as_value` | Fixed since 6ef9f57 (#80): `as_value` writes `listed_in`, the key the Python reference uses; `the_serialised_inventory_says_which_language_it_listed_in`. |
+| #66 | Retry contract tests | Still valid: written and passing in #88, held because `src/` is a release path. |
+
+Also fixed here: the `## 0.15.0 — 2026-10-11` heading, replaced by mistake when the 0.16.0 entry was added (13d9640).
+
+**Held, not merged: #88.** It adds `an_empty_listing_is_answered_by_its_usual_form` and `an_empty_listing_is_not_retried_when_nearest_is_off` to `src/intents.rs`, and moves the nine single-`read()` test servers in `src/control.rs` to `read_full_request`. It changes only test code, but `auto-release.yml` cuts a release for any change under `src/` since the latest tag, so merging it alone would ship a crate with no code change. It waits for the next `src/` change (`SUGGESTIONS.md` item 7).
+
+**Verification.** This change touches only `CHANGELOG.md` and the notes files, none of them a release path. On the branch of #88, on the current stable compiler: `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` are clean, and `cargo test --all-features -- --test-threads=2` passes (378 passed, 0 failed, doc tests included); `cargo package --allow-dirty --list` succeeds; `check-sdk-parity.py --consumer thalovant-rust-sdk` against the Python reference verifies.
+
+**Review round (#89).** CodeRabbit's ten comments on this change were all about wording, and nine are taken. The release rule now names both cases: the untagged `Cargo.toml` version, or the next patch, plus a release when no tag exists. The hard-link workaround names a filesystem with hard links, since a local exFAT disk has none. 2^53 − 1 is the binary64 limit, not every decoder's. The `ws://` advice is about the endpoint, not where the hub runs. The `ws://` suggestion checks the address actually connected to, not the name `localhost`, and only limits cleartext to loopback. The proposed release rule leaves `*_tests.rs` files out rather than skipping a push. The tenth asks for the cross-SDK `ws://` change itself, which stays `SUGGESTIONS.md` item 6.
+
+### Transparency report
+
+- **AI model:** Claude Opus 5.5 (`claude-opus-5-5`).
+- **Actions taken:** read every CodeRabbit review body on the seven PRs and checked each item against `main`, its history and the Python reference; corrected the changelog; wrote the held tests; updated `AUDIT.md`, `SUGGESTIONS.md`, `FAQ.md` and `QUICK_FACTS.md`; ran the checks above; replied on each original PR.
+- **Oversight:** pull-request CI. No human reviewed this change before the pull request was opened.
 
 ## 2026-11-03: chat apps (0.16.0)
 

@@ -1,6 +1,10 @@
-Last Edit: Claude Opus 5.5 - 2026-11-03 - Motive: 0.16.0 chat apps entry.
+Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: CodeRabbit follow-up on #65 (quota-count ceiling) and the lost 0.15.0 heading.
 
 # Changelog
+
+## Unreleased
+
+- Changelog only, no code change. The 0.11.0 entry said quota counts stop at the signed 64-bit maximum; they stop at 2^53 − 1, as `whole_count` in `src/refusal.rs` has done since 0.11.0, and the entry now says so (CodeRabbit on #65). The `0.15.0 — 2026-10-11` heading, replaced by mistake when the 0.16.0 entry was added, is back.
 
 ## 0.16.0 — 2026-11-03
 
@@ -15,6 +19,7 @@ Chat apps: a hub owner connects a chat network to a hub, and the hub answers the
 - `ApiProblem::fields()` and `ThalovantError::api_fields()` name the settings or secrets a refusal is about (`bridge_settings_invalid`, `bridge_secrets_invalid`, the `bridge_url_*` codes): the string entries of the problem's `fields`, or of an object `detail`'s, and empty otherwise. The existing classification is unchanged: 402 and 403 `plan_limit` (with `resource: "chat_bridge"`) are `ApiRefusal::Plan`, and 401, 423 and 403 `Insufficient scopes` are `ApiRefusal::Auth`.
 - `OperationResource` now derives `PartialEq`.
 
+## 0.15.0 — 2026-10-11
 
 The Python reference's 0.9.7 round (reference digest `5b973a65ab58…`), and the 0.9.6 change below, which was merged as 0.14.6. The minor bump is for one source-breaking change: `HubFallback::priority` is now `Option<i64>`.
 
@@ -89,7 +94,7 @@ The Home Assistant link: sign in on a device, create a connection of a named kin
 - A refusal ends an ask at once instead of letting it run to the deadline. The hub sends `hive.policy.denied` the instant it refuses, with no request id, and the request-id gate dropped it: the ask waited out its whole budget while a caller told somebody their hub "did not answer in time" about a question it had refused and explained. A denial with no request id is taken when it names the type this ask sent and this ask is the only utterance the client has out; a second ask, a query, or a fire-and-forget utterance still inside the shared grace window makes it ambiguous, so neither takes it.
 - `ThalovantError::PolicyDenied` carries `quota` -- period, limit, used, reset_after -- for a spent `intent_quota_exceeded`, and its message fits the refusal rather than offering allow-list advice for a spent day or for `backend_unavailable`. The field is boxed so the enum every `Result` carries stays inside clippy's `result_large_err` limit.
 - `ThalovantError::Unanswered` is new: `ovos.intent.unmatched` is the hub understanding a question and having nothing for it, which is not a failure. The enum is `#[non_exhaustive]`, so a caller with a wildcard arm keeps compiling.
-- `allowed` holds only non-blank, trimmed strings; quota counts are whole, never negative and never past a signed 64-bit integer.
+- `allowed` holds only non-blank, trimmed strings; quota counts are whole, never negative and at most 2^53 − 1 (9,007,199,254,740,991), the largest whole number a binary64 (double) holds exactly, which is how many JSON decoders store numbers. A count past that, like a negative one, reads as 0, as a count the hub did not send does.
 - `ThalovantError::Unanswered { said }` carries what the person said. Both event names put the input in the event's text; the old read of `reason`/`error` left it empty.
 - A fire-and-forget utterance is recorded once the connection is up and immediately before the publish, so the grace window is not spent on a handshake; a connect that fails records nothing, and a publish that errors keeps its record, because `emit_bus` over HTTP can fail after the hub already holds the frame. The deque is pruned as entries are added, so a client that only ever sends does not keep them for its lifetime.
 - A refusal on a quota the hub sent no numbers for says a quota has run out, rather than claiming "all questions used".
