@@ -1,4 +1,4 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Sign-in section for browser sign-in (0.17.0), with the final reference's wording; the quick start signs in with interactive_login().
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
 
 <p align="center">
   <picture>
@@ -338,6 +338,49 @@ A refusal is a `ThalovantError::ApiResponse` with an `api_code()` such as
 `api_fields()` names the settings or secrets it refused, never their values. A
 Free plan is HTTP 402 and a full allowance 403 `plan_limit`
 (`api_refusal()` is `ApiRefusal::Plan` for both); a stale `etag` is HTTP 412.
+
+## Intercom
+
+Say a short text aloud on a hub's speakers. Off by default at every level, announce-only,
+and **not a certified safety system**: it does not replace smoke or CO alarms, medical
+alert devices or emergency services. The platform never stores the text. (The names are
+`announce` and `*_intercom_*`: the HiveMind mesh already has an `intercom` frame.) Scopes:
+`intercom:read`, `intercom:send`, and `hubs:write` for settings and speakers.
+
+```rust,no_run
+use thalovant::{
+    AnnounceOptions, ControlPlane, IntercomPriority, IntercomRepeat, IntercomSpeakerUpdate,
+    IntercomTargets,
+};
+
+# async fn run(api: ControlPlane, hub_id: &str) -> thalovant::Result<()> {
+api.set_intercom_settings(hub_id, true).await?; // hubs:write
+api.update_intercom_speaker(
+    hub_id,
+    "kitchen",
+    &IntercomSpeakerUpdate { receive: Some(true), room: Some(Some("kitchen".into())), ..Default::default() },
+)
+.await?;
+
+let said = api
+    .announce(hub_id, &AnnounceOptions::new("Dinner is ready", IntercomTargets::Rooms(vec!["kitchen".into()])))
+    .await?;
+println!("{} {:?}", said.status, said.deliveries);
+
+let mut urgent = AnnounceOptions::new("Please answer", IntercomTargets::All);
+urgent.priority = Some(IntercomPriority::Urgent);
+urgent.repeat = Some(IntercomRepeat { times: 3, interval_seconds: 20 });
+urgent.wait = true; // polls while `sending`
+let done = api.announce(hub_id, &urgent).await?;
+println!("{} acked by {:?}", done.status, done.acked_by);
+# Ok(())
+# }
+```
+
+Refusals: `error.api_refusal()` is `Some(ApiRefusal::IntercomDisabled)` (switch off, kid or
+public hub), `Some(ApiRefusal::HubUnreachable)` (nothing was spoken) or
+`Some(ApiRefusal::Plan)`; `error.is_rate_limited()` is a 429 (its `retry_after_seconds` is
+in `error.api_problem()`).
 
 ## Reading an API error
 

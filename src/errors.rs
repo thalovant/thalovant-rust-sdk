@@ -151,6 +151,13 @@ pub enum ApiRefusal {
     /// 409 `home_assistant_already_linked`.
     /// [`ThalovantError::linked_client_id`] names the connection holding it.
     AlreadyLinked,
+    /// Intercom is off for the hub, or never allowed on it: code
+    /// `intercom_disabled` (any status). The hub's switch is off, or it is a
+    /// kid or public hub.
+    IntercomDisabled,
+    /// The API could not reach the hub to speak: HTTP 502 with code
+    /// `hub_unreachable`. Nothing was spoken; trying again is safe.
+    HubUnreachable,
 }
 
 /// The numbers behind a refusal that is a spent allowance, not a policy.
@@ -545,7 +552,12 @@ impl ThalovantError {
     ///   `Insufficient scopes`;
     /// - [`ApiRefusal::Plan`]: HTTP 402, or 403 with code `plan_limit`;
     /// - [`ApiRefusal::AlreadyLinked`]: HTTP 409 with code
-    ///   `home_assistant_already_linked`.
+    ///   `home_assistant_already_linked`;
+    /// - [`ApiRefusal::IntercomDisabled`]: code `intercom_disabled`;
+    /// - [`ApiRefusal::HubUnreachable`]: HTTP 502 with code `hub_unreachable`.
+    ///
+    /// A 429 is not a refusal kind of its own here; see
+    /// [`ThalovantError::is_rate_limited`].
     ///
     /// `None` for anything else. The error is unchanged: a 402 from
     /// [`ControlPlane::get_hub`](crate::ControlPlane::get_hub) is still
@@ -561,8 +573,18 @@ impl ThalovantError {
             402 => Some(ApiRefusal::Plan),
             403 if code == Some("plan_limit") => Some(ApiRefusal::Plan),
             409 if code == Some("home_assistant_already_linked") => Some(ApiRefusal::AlreadyLinked),
+            _ if code == Some("intercom_disabled") => Some(ApiRefusal::IntercomDisabled),
+            502 if code == Some("hub_unreachable") => Some(ApiRefusal::HubUnreachable),
             _ => None,
         }
+    }
+
+    /// Whether the API answered 429: too many requests. Intercom limits a hub
+    /// to 20 normal announcements a minute and 10 urgent ones an hour; the
+    /// problem's `retry_after_seconds` (see [`ThalovantError::api_problem`])
+    /// says how long to wait, when the body names it.
+    pub fn is_rate_limited(&self) -> bool {
+        self.status_code() == Some(429)
     }
 
     /// The connection that already holds a hub's link, on an

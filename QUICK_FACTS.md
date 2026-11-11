@@ -1,11 +1,11 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Final browser-login reference (39e31d8): digest, 119 vectors, request bound.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
 
 # Quick facts: thalovant (Rust SDK)
 
 | Fact | Value |
 | :-- | :-- |
 | Crate | `thalovant` on crates.io |
-| Version | 0.17.0 (`Cargo.toml`; the user agent reads it through `CARGO_PKG_VERSION`) |
+| Version | 0.18.0 (`Cargo.toml`; the user agent reads it through `CARGO_PKG_VERSION`) |
 | Rust | 1.88 or newer (`rust-version`), edition 2021 |
 | Licence | MIT |
 | Binaries | none: a library crate |
@@ -44,6 +44,22 @@ Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Final browser-login reference 
 | Errors | denied `DeviceAuthorizationDenied`, timeout `DeviceAuthorizationExpired`, other callback error `BrowserLoginFailed`, refused exchange `ApiResponse` 400 `invalid_grant` |
 | Request bound | configuration and exchange: 10 s each (`BROWSER_REQUEST_TIMEOUT`); the tab waits for the sign-in to end |
 | Vectors | `tests/conformance/browser-login-vectors.json` (119 cases): `tests/browser_login.rs` and `src/loopback_tests.rs`; private edges in `src/control/browser_login_tests.rs` |
+
+## Intercom (`src/intercom.rs`, `src/control/intercom.rs`; 0.18.0; scopes `intercom:read`, `intercom:send`, `hubs:write`)
+
+Announce-only text spoken aloud on a hub's speakers. Not a certified safety system; the platform never stores the text. Named `announce` / `*_intercom_*`: the mesh already has an `intercom` frame.
+
+| Call | Route | Returns |
+| :-- | :-- | :-- |
+| `get_intercom_settings(hub_id)` | `GET /v1/hubs/{id}/intercom/settings` | `IntercomSettings` |
+| `set_intercom_settings(hub_id, enabled)` | `PUT /v1/hubs/{id}/intercom/settings` | `IntercomSettings` |
+| `list_intercom_speakers(hub_id)` | `GET /v1/hubs/{id}/intercom/speakers` | `IntercomSpeakerList` |
+| `update_intercom_speaker(hub_id, client_id, &IntercomSpeakerUpdate)` | `PATCH /v1/hubs/{id}/intercom/speakers/{client_id}` | `IntercomSpeaker` |
+| `announce(hub_id, &AnnounceOptions)` | `POST /v1/hubs/{id}/intercom/announce` | `Announcement` |
+| `get_announcement(hub_id, id)` | `GET /v1/hubs/{id}/intercom/announcements/{id}` | `Announcement` |
+| `list_announcements(hub_id, &AnnouncementListOptions)` | `GET /v1/hubs/{id}/intercom/announcements` | `AnnouncementList` |
+
+- Errors (`src/errors.rs`): `ApiRefusal::IntercomDisabled`, `ApiRefusal::HubUnreachable`, `ThalovantError::is_rate_limited()`.
 
 ## Chat apps (`/v1/bridges`)
 

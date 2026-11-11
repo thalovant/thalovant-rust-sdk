@@ -1,6 +1,7 @@
 mod bridges;
 mod browser_login;
 mod hub_skills;
+mod intercom;
 pub use browser_login::{
     BrowserLoginOptions, BrowserOpener, BrowserPrompt, InteractiveLoginOptions, LoginMethod,
 };

@@ -16,6 +16,7 @@ pub mod home;
 pub mod hubs;
 pub mod identity;
 pub mod intents;
+pub mod intercom;
 mod loopback;
 pub mod native_auth;
 pub mod noise;
@@ -72,6 +73,14 @@ pub use intents::{
     HubSkillIntents, IntentDefinition, IntentDescribeOptions, IntentInventoryOptions,
     IntentInventorySource, IntentListOptions, IntentRegistration, DEFAULT_INTENT_TIMEOUT,
     DESCRIBE_BATCH, FALLBACK_CAPABILITY, FALLBACK_PROBE_TIMEOUT,
+};
+pub use intercom::{
+    announcement_text, AnnounceOptions, Announcement, AnnouncementList, AnnouncementListOptions,
+    AnnouncementStatus, DeliveryStatus, IntercomDelivery, IntercomDnd, IntercomPolicy,
+    IntercomPriority, IntercomQuietHours, IntercomRepeat, IntercomSettings, IntercomSpeaker,
+    IntercomSpeakerList, IntercomSpeakerUpdate, IntercomTargets, IntercomUnavailableReason,
+    MAX_ANNOUNCEMENT_SPEAKERS, MAX_ANNOUNCEMENT_TEXT, MAX_GROUPS, MAX_GROUP_LENGTH,
+    MAX_REPEAT_INTERVAL_SECONDS, MAX_REPEAT_TIMES, MAX_ROOM_LENGTH, MIN_REPEAT_INTERVAL_SECONDS,
 };
 pub use noise::{
     canonical_json, derive_psk, noise_protocol_name, select_noise_options, NoiseFrame,

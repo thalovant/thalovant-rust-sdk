@@ -1,6 +1,17 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: 0.17.0 follows the final browser-login reference (39e31d8) and the CodeRabbit review of #90.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
 
 # Changelog
+
+## 0.18.0 — Unreleased
+
+Intercom. Every addition is new API. Ports thalovant-python-sdk 0.12.0 (reference digest `690784dbb9af`; its `docs/intercom-porting.md` is the brief).
+
+- **Announce-only text spoken aloud on a hub's speakers**, through the routes under `/v1/hubs/{hub_id}/intercom`: `ControlPlane::announce(hub_id, &AnnounceOptions)`, `get_announcement`, `list_announcements(hub_id, &AnnouncementListOptions)`, `list_intercom_speakers`, `update_intercom_speaker` (only what is `Some` is sent; `room: Some(None)` clears the room), `get_intercom_settings` and `set_intercom_settings`. Scopes: `intercom:read`, `intercom:send`, `hubs:write` for settings and speakers. **Not a certified safety system**; the platform never stores the text. Named `announce` and `*_intercom_*` because the mesh already has an `intercom` frame.
+- Models in the new `thalovant::intercom` module (`IntercomSettings`, `IntercomSpeaker`, `IntercomPolicy`, `Announcement`, `IntercomDelivery`, `AnnouncementList`, `IntercomTargets` (an enum: exactly one of all, speakers, rooms, groups), `IntercomRepeat`); every status is an open enum with an `Other` variant. The text (1-280 characters counted as `char`s, trimmed, no control characters), the targets (at most 50 speakers) and the repeat (urgent only, 1-10 times, 5-120 seconds) are checked before anything is sent and fail with `ThalovantError::Api`. `wait` polls a `sending` announcement and returns the latest answer on timeout.
+- `ApiRefusal` gains `IntercomDisabled` (code `intercom_disabled`) and `HubUnreachable` (502 `hub_unreachable`); `ThalovantError::is_rate_limited()` is true for a 429. (A 429 is not an `ApiRefusal`: an existing test pins that, so it has its own predicate.)
+- `open_enum!` in `src/chat_apps.rs` is re-exported to the crate (`pub(crate) use`) so the intercom enums share it. No behaviour change.
+- The `intercom` parity capability is recorded (required), and the evidence hashes of `src/control.rs`, `src/errors.rs`, `src/lib.rs` and `src/chat_apps.rs` are refreshed for the other capabilities: each changed only by this addition.
+
 
 ## 0.17.0 — 2026-11-08
 

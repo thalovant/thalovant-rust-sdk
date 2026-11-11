@@ -1,6 +1,10 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: CodeRabbit round on #90 and the final browser-login reference (39e31d8).
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
 
 # Audit
+
+## Intercom (0.18.0): the text is in the request body
+
+`announce_body` (`src/intercom.rs`) builds the body that holds the text and `ControlPlane::announce` (`src/control/intercom.rs`) sends it; nothing logs or returns it, and `Announcement` never carries it (`tests/intercom.rs`, `announce_sends_the_contract_body_and_reads_deliveries`). It is not redacted from a `ThalovantError` the API echoes it in (`api_problem()` keeps the body); the contract says the API never echoes it. The announcement list shape (`items`, `next_cursor`) is taken from the contract; `data` and `cursor` are read too. A 429's `Retry-After` header is not kept on the error (only the problem's `retry_after_seconds`), as SUGGESTIONS #1 already says. Not exercised against a live API.
 
 Written after `cargo test --all-features -- --test-threads=2` passed in full on 2026-11-08 (see `MAINTENANCE_REPORT.md`), and from reading the code.
 

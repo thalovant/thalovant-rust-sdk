@@ -1,6 +1,12 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Browser sign-in (0.17.0, browser-login) and its verification.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
 
 # Maintenance report
+
+## 2026-11-11: intercom (0.18.0)
+
+Ported the `intercom` capability from thalovant-python-sdk 0.12.0 (digest `690784dbb9af`): `src/intercom.rs`, `src/control/intercom.rs` (seven `ControlPlane` methods), two `ApiRefusal` kinds and `is_rate_limited` in `src/errors.rs`, `tests/intercom.rs` (loopback peer), the parity record, README, QUICK_FACTS, FAQ, AUDIT and CHANGELOG. Verified with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test --all-features`; the other capabilities' evidence hashes for the files this change touched were refreshed after the suite passed.
+
+Transparency Report: AI model Claude Sonnet 5.5; actions: wrote the module, methods, tests, docs and parity record from the contract and the Python reference; oversight: none yet, review pending.
 
 ## 2026-11-08 (later): CodeRabbit on #90, and the final browser-login reference
 

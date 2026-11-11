@@ -1,6 +1,12 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Final reference digest; item 11 is now a client-wide request timeout.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
 
 # Suggestions
+
+## Shared intercom vectors
+
+- **Problem:** `intercom` has no conformance vectors; text rules (control characters, trimming, character count) are proved by each SDK's own tests.
+- **Proposal:** an `intercom-vectors.json` in the Python reference (validation and error-kind cases), claimed by the capability.
+- **Impact:** low effort; one more file for every consumer.
 
 ## 1. Read a 429's wait from the error
 
