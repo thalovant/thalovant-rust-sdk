@@ -1,4 +1,4 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0), amendment 2: cancel_announcement, fresh idempotency keys, safe ids, redacted Debug, wording.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0), final API: intercom:urgent, speaker kind/can_play/policy_synced, new refusal kinds, one text rule, DND timezone, replayed.
 
 <p align="center">
   <picture>
@@ -347,7 +347,10 @@ alert devices or emergency services. The API does not store the text (it keeps a
 and the length), and intercom does not record or store speech: while an alert sounds, the hub
 only checks whether a reply is an acknowledgement. (The names are `announce` and
 `*_intercom_*`: the HiveMind mesh already has an `intercom` frame.) Scopes: `intercom:read`,
-`intercom:send` (announce and cancel; plus `intercom:read` with `wait`), and `hubs:write` for settings and speakers.
+`intercom:send` (announce and cancel; plus `intercom:read` with `wait`), `intercom:urgent` (an
+**urgent** announcement, and so every `repeat`, needs it **in addition to** `intercom:send`; nothing
+implies it) and `hubs:write` for settings and speakers (owner, manager or administrator of the hub).
+The constants are `INTERCOM_READ_SCOPE`, `INTERCOM_SEND_SCOPE` and `INTERCOM_URGENT_SCOPE`.
 
 ```rust,no_run
 use thalovant::{
@@ -378,7 +381,7 @@ let mut urgent = AnnounceOptions::new("Please answer", IntercomTargets::All);
 urgent.priority = Some(IntercomPriority::Urgent);
 urgent.repeat = Some(IntercomRepeat { times: 3, interval_seconds: 20 });
 urgent.idempotency_key = Some(thalovant::new_request_id());
-urgent.wait = true; // polls while `sending`; needs intercom:read as well
+urgent.wait = true; // polls while `sending`; needs intercom:read as well, and intercom:urgent to send
 let done = api.announce(hub_id, &urgent).await?;
 println!("{} acked by {:?}", done.status, done.acked_by);
 
@@ -440,7 +443,10 @@ An urgent announcement that repeats can be stopped. These are the real controls:
   while the status is `sending`; for one that already completed, failed or was cancelled the API
   answers 409 `not_cancellable` (`ApiRefusal::NotCancellable`). If the hub cannot confirm the
   cancel, the record is still `cancelled` and `hub_confirmed` is `Some(false)`: speech already
-  queued on the hub may still play.
+  queued on the hub may still play. `error.announcement_status()` of a `not_cancellable` refusal
+  is the current status: refresh the result instead of showing an error. Stopping is never
+  refused for platform, hub or plan reasons: it works while the platform switch is off (the answer
+  then has `hub_confirmed: Some(false)` and no hub was called).
 - **The hub's Intercom switch** (`set_intercom_settings(hub_id, false)`, `hubs:write`) takes
   effect when the hub's runtime updates, which can take as long as a rollout; the hub's repeat
   loop also stops by itself when it sees the switch off.
@@ -451,6 +457,68 @@ An urgent announcement that repeats can be stopped. These are the real controls:
 
 Nothing here is instant for sound that is already playing, and none of it makes intercom a
 safety system.
+
+### Speakers: `kind`, `can_play` and `policy_synced`
+
+`list_intercom_speakers` lists every connection of the hub (the platform's own Intercom client is
+not listed). Each `IntercomSpeaker` has `kind` (`voice_satellite`, `web_chat`, `developer`,
+`embedded`, `home_assistant`; anything else reads `voice_satellite`) and `can_play`: the
+**effective** "can this connection play speech". True by default for a `voice_satellite` and
+`web_chat`; false for `home_assistant`, `developer` and `embedded` unless its owner declared
+`spec.intercom.can_play: true` on the **connection** (never on the speaker). A connection that
+cannot play is listed (grey it out) but `receive: Some(true)` is refused with
+`ApiRefusal::NotASpeaker` (422 `not_a_speaker`, `error.not_a_speaker_kind()`), it is excluded
+from `all`, rooms and groups, and naming it in `IntercomTargets::Speakers` is the same refusal
+with `error.not_speakers()`. `policy_synced` is set on the answer to `update_intercom_speaker`
+(`None` on list items); the list has its own, and `unavailable_reason`, which can be `platform`.
+`Some(false)` means the hub may hold an out-of-date consent map (a push failed and is retried in
+the background), so a speaker whose `receive` was just turned off can still be spoken to by a
+routine until it clears: show "Changes may take a moment to reach the home".
+
+`IntercomSpeakerUpdate` has exactly `receive`, `room`, `groups` and `dnd`; send only what changed.
+Do-not-disturb that is switched on needs `quiet_hours` with an IANA `timezone` (at most 64
+characters, such as `Europe/Paris`) and a `start` that differs from the `end`; a timezone that
+is given is checked even when it is off. The check is of the *shape* of the name (`Area/Location`);
+this crate links no timezone database, so a well-formed name that does not exist is the API's 422.
+
+### The text, and what an answer means
+
+`announce` checks the text with the API's own rule before anything is sent, so a refusal never
+costs a request and never echoes the text: NFC-normalised and trimmed, 1 to 280 characters (counted
+after that), no `<` or `>` (a speaker's text-to-speech may read them as markup), no control
+characters (a newline or a tab included), no bidirectional overrides or isolates and no other
+invisible format characters (the zero-width joiner and non-joiner are allowed), no private-use
+characters and no line or paragraph separators (a Rust string cannot hold a lone surrogate).
+`lang`, when given, is a language tag (`en`, `en-US`). Target lists hold at most 50 names of 1
+to 64 characters each; `all`, a room or a group that resolves to more than 50 speakers is
+`ApiRefusal::TooManyTargets` (422, `error.matched_speakers()`): name a room or a group. An
+`idempotency_key` is at most 128 printable ASCII characters.
+
+`delivered` means the hub handed the speech to that speaker's connection. There is **no playback
+receipt**: do not say "heard" or "played". Only `acked` (an urgent announcement somebody answered)
+is a person's answer, and `failed` is not proof that nothing was spoken. A delivery's `detail` is a
+fixed code from `DELIVERY_DETAIL_CODES` (`hub_no_response`, `rate_limited`, ...) or `None`; treat a
+code you do not know as opaque. `Announcement::replayed` is `true` when the answer is the stored
+one for your `idempotency_key` (the header `Idempotency-Replayed: true`, also after `wait`): nothing
+new was sent, so do not clear what a person typed, or say "sent", without saying so.
+
+At most two urgent announcements repeat on one hub at a time (the platform has a pool too): the
+next is `ApiRefusal::UrgentBusy` (429, `error.urgent_busy_scope()`, `retry_after_seconds` in
+`error.api_problem()`), with nothing stored and no rate token spent: cancel one that is running,
+or wait. An urgent announcement on a hub whose runtime has no active Intercom skill is
+`ApiRefusal::SkillNotInstalled` (409): nothing was sent.
+
+### Dark by default: the platform switch
+
+Until the platform operator turns intercom on, `get_intercom_settings` reads `enabled: false,
+unavailable_reason: Some(Platform)` for every hub, and every write and every announcement is
+refused with `ApiRefusal::IntercomDisabledPlatform` (503 `intercom_disabled_platform`; nothing is
+stored or sent). Treat it as "show the platform message", not as an error toast; reads and
+`cancel_announcement` keep working. A platform that is not configured yet is
+`ApiRefusal::IntercomNotConfigured` (503). Writing needs the owner, a manager or an administrator
+acting as themselves: a plain member can read but not enable, change a speaker or announce, an
+impersonated session cannot (`ApiRefusal::ImpersonationNotAllowed`), and a locked hub is
+`ApiRefusal::HubLocked`; switching off and cancelling stay open.
 
 ### Ids, timeouts and `Debug`
 
@@ -473,8 +541,14 @@ accessors look through to the poll's own error. Always set a fresh `idempotency_
 calling `announce` again with that same key replays the stored announcement (with its id) and does
 not announce a second time.
 
-Refusals: `error.api_refusal()` is `Some(ApiRefusal::IntercomDisabled)` (switch off, kid or
-public hub), `Some(ApiRefusal::HubUnreachable)` (502: the text may or may not have been
+Refusals: `error.api_refusal()` is `Some(ApiRefusal::IntercomDisabled)` (the hub's switch is off),
+`Some(ApiRefusal::IntercomUnavailable)` (a kid or public hub; `error.unavailable_reason()`),
+`Some(ApiRefusal::IntercomDisabledPlatform)` (these two and `IntercomDisabled` are what
+`kind.is_intercom_disabled()` is true for), `Some(ApiRefusal::IntercomNotConfigured)`,
+`Some(ApiRefusal::UrgentScopeRequired)` (403 `urgent_scope_required`; `kind.is_auth()`),
+`Some(ApiRefusal::UrgentBusy)`, `SkillNotInstalled`, `NotASpeaker`, `ReservedName`, `HubLocked`,
+`ImpersonationNotAllowed`, `TooManyTargets`, `ManagedClient` (403: the platform's own Intercom
+client cannot be managed; `error.refused_client_refs()`), `Some(ApiRefusal::HubUnreachable)` (502: the text may or may not have been
 spoken; `error.announcement_id()` names the recorded `failed` announcement: read it before
 sending again, and use a new key, because the same key replays the failed record),
 `Some(ApiRefusal::NotCancellable)` (409) or `Some(ApiRefusal::Plan)` (HTTP 402, or 403 with

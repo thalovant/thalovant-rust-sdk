@@ -1,4 +1,4 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom amendment 2: AnnounceOptions Debug redacted; open items (problem body, caps, replayed flag).
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom final API: replayed flag and the list/key caps are fixed; open items (timezone shape only, Unicode versions, problem body).
 
 # Audit
 
@@ -6,13 +6,20 @@ Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom amendment 2: Announ
 
 `AnnounceOptions` (`src/intercom.rs`) derived `Debug`, so `{:?}`, `{:#?}`, `tracing`'s `#[instrument]` or an error chain that printed it carried `text`. `Debug` is now written by hand and prints `text: <N chars>` (`tests/intercom.rs`, `announce_options_debug_never_prints_the_text`); no error or `Display` of the SDK carries the text either (`no_error_or_display_carries_the_text`). `Clone`, `PartialEq` and `Eq` still see the text. `announce_body` returns a `serde_json::Value` that holds it, but it is `pub(crate)` and never formatted.
 
-## Intercom (0.18.0): `ThalovantError::ApiResponse` keeps the whole API body (review L5); rooms, groups and key length are unchecked (L6)
+## Intercom (0.18.0): `ThalovantError::ApiResponse` keeps the whole API body (review L5)
 
-The API strips `input` and `ctx` from `/intercom/` errors, so the text does not reach `api_problem()` today; a regression would. `announce` does not cap rooms and groups (the API caps them at 50) or check `idempotency_key` against 128 characters (the API answers 422). Not in contract section J; proposed in `SUGGESTIONS.md`.
+The API strips `input` and `ctx` from `/intercom/` errors, so the text does not reach `api_problem()` today; a regression would. Not in contract section J; proposed in `SUGGESTIONS.md`.
 
-## Intercom (0.18.0): a replayed announcement is not marked as replayed
+## Intercom (0.18.0): the timezone check is a shape check, and the Unicode data is this build's
 
-The API answers a replay with `Idempotency-Replayed: true`; `Announcement` does not carry it, and Rust keeps no response headers beyond what `ThalovantError` reads (SUGGESTIONS #1 of this repo). The docs say what replay means (`README.md`, "Idempotency keys"). Proposed in `SUGGESTIONS.md`.
+`valid_timezone` (`src/intercom.rs`) checks that a quiet-hours timezone is at most 64 characters, not padded and `Area/Location`-shaped; it does not know whether the name exists. A well-formed unknown name (`Mars/Phobos`) and a mis-cased one (`europe/paris`, which the API rejects on Linux) reach the API and are its 422 (`tests/intercom.rs`, `an_unusable_do_not_disturb_is_refused_before_anything_is_sent` and `a_valid_do_not_disturb_is_sent` pin what is and is not refused locally). A timezone database was measured and not linked: `chrono-tz` 0.10 with default features off adds 7 crates to a fresh tree (a scratch crate's lock listed 8 packages, itself included; among them chrono, chrono-tz, num-traits, phf, phf_shared and siphasher) and about 19 s of clean build, and bakes one tzdata release into the crate, so a zone the API's newer tzdata knows would be refused here with no way round it. The Python, Node and Go ports ask their platform's database instead. `announcement_text` uses `icu_normalizer` (NFC) and `regex`'s Unicode tables for the categories (Cc, Cf, Co, Zl, Zp): both follow the Unicode version of the crate release, so a character assigned in a newer Unicode than this build's (or the API's) can pass here and be refused there, or the reverse; the API's answer stays authoritative. `icu_normalizer` was already in the tree through `idna_adapter`; it is now a direct dependency with default features off (the defaults would add `utf16_iter` and `write16`), so the lock gains no crate. A lone surrogate cannot exist in a `&str`, so that check is the type's.
+
+## Fixed (final API): the replayed flag and the caps
+
+- **A replayed announcement is marked.** `Announcement::replayed` is read from the response header `Idempotency-Replayed: true` by `ControlPlane::request_replayed` (`src/control.rs`) and survives `wait` (`tests/intercom.rs`, `a_replayed_announcement_says_so_and_a_first_answer_does_not`, `a_replayed_sending_announcement_is_202_and_stays_replayed_after_wait`, `a_failed_wait_keeps_the_replayed_flag_on_the_accepted_announcement`); it is never read from the body (`reads_and_cancel_are_never_replayed_and_a_body_cannot_forge_it`).
+- **Rooms, groups and the key length** (was L6): every target list is capped at 50 names of 64 characters and `idempotency_key` at 128 printable ASCII characters (`a_target_list_holds_at_most_50_names_of_at_most_64_characters`, `an_idempotency_key_is_at_most_128_printable_ascii_characters`).
+- **The text rule is the API's** (was: 1-280 and control characters only): `<` `>`, format characters, bidi controls, private use and separators are refused first, after NFC, and never echoed (`a_text_the_api_would_refuse_is_refused_first_and_never_echoed`, `the_text_is_nfc_normalised_trimmed_and_counted_after_that`).
+- **Quiet hours** that are on need a timezone and `start != end` (`an_unusable_do_not_disturb_is_refused_before_anything_is_sent`).
 
 ## Intercom (0.18.0): a poll that fails after the POST
 
@@ -22,7 +29,7 @@ The API answers a replay with `Idempotency-Replayed: true`; `Announcement` does 
 
 `announce_body` (`src/intercom.rs`) builds the body that holds the text and `ControlPlane::announce` (`src/control/intercom.rs`) sends it; nothing logs or returns it, and `Announcement` never carries it (`tests/intercom.rs`, `announce_sends_the_contract_body_and_reads_deliveries`). It is not redacted from a `ThalovantError` the API echoes it in (`api_problem()` keeps the body); the contract says the API never echoes it. The announcement list shape (`items`, `next_cursor`) is taken from the contract; `data` and `cursor` are read too. A 429's `Retry-After` header is not kept on the error (only the problem's `retry_after_seconds`), as SUGGESTIONS #1 already says. Not exercised against a live API.
 
-Written after `cargo test --all-features -- --test-threads=2` passed in full on 2026-11-08 (see `MAINTENANCE_REPORT.md`), and from reading the code.
+Written after `cargo test --all-features --no-fail-fast -- --test-threads=2` passed in full on 2026-11-11 (486 passed, 0 failed; `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` clean; see `MAINTENANCE_REPORT.md`), and from reading the code. At the default thread count `transport::noise_transport_tests::a_close_right_after_the_handshake_says_whether_it_was_a_refusal` timed out once under load; it passes alone and with two threads.
 
 ## Known issues and technical debt
 

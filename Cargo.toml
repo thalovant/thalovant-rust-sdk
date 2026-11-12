@@ -20,6 +20,9 @@ futures-util = { version = "0.3", features = ["sink"] }
 flate2 = "1"
 fs2 = "0.4.3"
 hex = "0.4"
+# NFC-normalises an announcement's text, as the API does before it counts it.
+# Already in the tree through idna_adapter: no new crate.
+icu_normalizer = { version = "2.4", default-features = false, features = ["compiled_data"] }
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "cookies"] }

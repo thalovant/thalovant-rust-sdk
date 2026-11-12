@@ -5,6 +5,8 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
+use crate::intercom::problem_code;
+
 pub type Result<T> = std::result::Result<T, ThalovantError>;
 
 /// What the API said when it refused a control-plane request: the whole error
@@ -151,10 +153,72 @@ pub enum ApiRefusal {
     /// 409 `home_assistant_already_linked`.
     /// [`ThalovantError::linked_client_id`] names the connection holding it.
     AlreadyLinked,
-    /// Intercom is off for the hub, or never allowed on it: code
-    /// `intercom_disabled` (any status). The hub's switch is off, or it is a
-    /// kid or public hub.
+    /// Intercom is off for the hub: code `intercom_disabled` (any status).
+    /// Turn the hub's switch on with
+    /// [`ControlPlane::set_intercom_settings`](crate::ControlPlane::set_intercom_settings)
+    /// (`hubs:write`, and a plan with intercom).
+    /// [`ApiRefusal::IntercomUnavailable`] and
+    /// [`ApiRefusal::IntercomDisabledPlatform`] are the stronger cases, which
+    /// that switch cannot change; [`ApiRefusal::is_intercom_disabled`] is true
+    /// for all three.
     IntercomDisabled,
+    /// Intercom is never available on the hub: HTTP 422 `intercom_unavailable`.
+    /// [`ThalovantError::unavailable_reason`] is `kid_hub` or `public_hub`.
+    /// Not retryable.
+    IntercomUnavailable,
+    /// Intercom is switched off for the whole platform: HTTP 503
+    /// `intercom_disabled_platform`. Nothing was written, sent or spent. Show
+    /// an explanation, not an error toast: only the platform operator can turn
+    /// it on. Reads and `cancel_announcement` still work.
+    IntercomDisabledPlatform,
+    /// Intercom is not configured on this platform yet: HTTP 503
+    /// `intercom_not_configured`. Nothing was sent. Say "Intercom is not
+    /// available yet".
+    IntercomNotConfigured,
+    /// An urgent announcement was sent without the scope `intercom:urgent`:
+    /// HTTP 403 `urgent_scope_required`. `priority` urgent (and so every
+    /// `repeat`) needs it IN ADDITION to `intercom:send`; nothing implies it.
+    /// It is checked before the idempotency lookup, the rate limit and the
+    /// hub: nothing was spent. Sign in again asking for the scope (the plan
+    /// must allow it), or send a normal announcement.
+    /// [`ApiRefusal::is_auth`] is true for it.
+    UrgentScopeRequired,
+    /// The urgent pool is full: HTTP 429 `intercom_urgent_busy`.
+    /// [`ThalovantError::urgent_busy_scope`] says whether the `hub` or the
+    /// `platform` is full; `retry_after_seconds` says when to ask again.
+    /// Nothing was stored and no rate token was spent: cancel one that is
+    /// running, or wait. ([`ThalovantError::is_rate_limited`] is true too.)
+    UrgentBusy,
+    /// The hub has no Intercom skill yet: HTTP 409 `skill_not_installed`. An
+    /// urgent announcement needs it active. Nothing was sent.
+    SkillNotInstalled,
+    /// A connection that cannot play speech was asked to receive: HTTP 422
+    /// `not_a_speaker`. [`ThalovantError::not_a_speaker_kind`] for a refused
+    /// `receive`, [`ThalovantError::not_speakers`] for an announcement that
+    /// named such connections. The owner declares `can_play` on the
+    /// connection, never on the speaker.
+    NotASpeaker,
+    /// A connection was created or renamed onto a name the platform reserves:
+    /// HTTP 422 `reserved_name`. Choose another name.
+    ReservedName,
+    /// The hub is locked: HTTP 403 `hub_locked`. Nothing was changed.
+    /// (`owner_locked` and `account_locked` are not kinds of their own:
+    /// read [`ThalovantError::api_code`].)
+    HubLocked,
+    /// An impersonated session cannot announce, enable intercom or change a
+    /// speaker: HTTP 403 `impersonation_not_allowed`. Switching intercom off
+    /// and cancelling stay open.
+    ImpersonationNotAllowed,
+    /// `all`, a room or a group resolved to more than 50 speakers: HTTP 422
+    /// `too_many_targets`. [`ThalovantError::matched_speakers`] is how many.
+    /// Name a room or a group.
+    TooManyTargets,
+    /// The platform-managed Intercom client cannot be edited, paused, deleted,
+    /// given credentials or named in an access policy: HTTP 403
+    /// `managed_client`. It is identified by `spec.intercomApi == "platform"`.
+    /// [`ThalovantError::refused_client_refs`] lists the managed connections an
+    /// access policy named. Not retryable.
+    ManagedClient,
     /// The API could not reach the hub to speak: HTTP 502 with code
     /// `hub_unreachable`. Whether the text was spoken is not guaranteed either
     /// way: the hub may have spoken it and lost the answer. The API records
@@ -167,7 +231,27 @@ pub enum ApiRefusal {
     /// The announcement cannot be cancelled: HTTP 409 with code
     /// `not_cancellable`. Only an announcement that is still `sending` can be;
     /// one that completed, failed or was cancelled already cannot.
+    /// [`ThalovantError::announcement_status`] is its current status: refresh
+    /// the result instead of showing an error.
     NotCancellable,
+}
+
+impl ApiRefusal {
+    /// Whether this is "intercom is off here": [`ApiRefusal::IntercomDisabled`]
+    /// or one of its stronger cases, [`ApiRefusal::IntercomUnavailable`] and
+    /// [`ApiRefusal::IntercomDisabledPlatform`].
+    pub fn is_intercom_disabled(&self) -> bool {
+        matches!(
+            self,
+            Self::IntercomDisabled | Self::IntercomUnavailable | Self::IntercomDisabledPlatform
+        )
+    }
+
+    /// Whether signing in again (with the right scope) is the way out:
+    /// [`ApiRefusal::Auth`], or [`ApiRefusal::UrgentScopeRequired`].
+    pub fn is_auth(&self) -> bool {
+        matches!(self, Self::Auth | Self::UrgentScopeRequired)
+    }
 }
 
 /// The numbers behind a refusal that is a spent allowance, not a policy.
@@ -587,9 +671,16 @@ impl ThalovantError {
     ///   `home_assistant_already_linked`;
     /// - [`ApiRefusal::IntercomDisabled`]: code `intercom_disabled`;
     /// - [`ApiRefusal::HubUnreachable`]: HTTP 502 with code `hub_unreachable`;
-    /// - [`ApiRefusal::NotCancellable`]: HTTP 409 with code `not_cancellable`.
+    /// - [`ApiRefusal::NotCancellable`]: HTTP 409 with code `not_cancellable`;
+    /// - the final intercom API's codes, whatever the status:
+    ///   `intercom_unavailable`, `intercom_disabled_platform`,
+    ///   `intercom_not_configured`, `urgent_scope_required`,
+    ///   `intercom_urgent_busy`, `skill_not_installed`, `not_a_speaker`,
+    ///   `reserved_name`, `hub_locked`, `impersonation_not_allowed`,
+    ///   `too_many_targets` and `managed_client` (the constants are in
+    ///   [`crate::intercom::problem_code`]).
     ///
-    /// A 429 is not a refusal kind of its own here; see
+    /// A 429 is otherwise not a refusal kind of its own here; see
     /// [`ThalovantError::is_rate_limited`].
     ///
     /// `None` for anything else. The error is unchanged: a 402 from
@@ -606,9 +697,31 @@ impl ThalovantError {
             402 => Some(ApiRefusal::Plan),
             403 if code == Some("plan_limit") => Some(ApiRefusal::Plan),
             409 if code == Some("home_assistant_already_linked") => Some(ApiRefusal::AlreadyLinked),
-            _ if code == Some("intercom_disabled") => Some(ApiRefusal::IntercomDisabled),
-            502 if code == Some("hub_unreachable") => Some(ApiRefusal::HubUnreachable),
-            409 if code == Some("not_cancellable") => Some(ApiRefusal::NotCancellable),
+            _ if code == Some(problem_code::DISABLED) => Some(ApiRefusal::IntercomDisabled),
+            _ if code == Some(problem_code::UNAVAILABLE) => Some(ApiRefusal::IntercomUnavailable),
+            _ if code == Some(problem_code::DISABLED_PLATFORM) => {
+                Some(ApiRefusal::IntercomDisabledPlatform)
+            }
+            _ if code == Some(problem_code::NOT_CONFIGURED) => {
+                Some(ApiRefusal::IntercomNotConfigured)
+            }
+            _ if code == Some(problem_code::URGENT_SCOPE_REQUIRED) => {
+                Some(ApiRefusal::UrgentScopeRequired)
+            }
+            _ if code == Some(problem_code::URGENT_BUSY) => Some(ApiRefusal::UrgentBusy),
+            _ if code == Some(problem_code::SKILL_NOT_INSTALLED) => {
+                Some(ApiRefusal::SkillNotInstalled)
+            }
+            _ if code == Some(problem_code::NOT_A_SPEAKER) => Some(ApiRefusal::NotASpeaker),
+            _ if code == Some(problem_code::RESERVED_NAME) => Some(ApiRefusal::ReservedName),
+            _ if code == Some(problem_code::HUB_LOCKED) => Some(ApiRefusal::HubLocked),
+            _ if code == Some(problem_code::IMPERSONATION_NOT_ALLOWED) => {
+                Some(ApiRefusal::ImpersonationNotAllowed)
+            }
+            _ if code == Some(problem_code::TOO_MANY_TARGETS) => Some(ApiRefusal::TooManyTargets),
+            _ if code == Some(problem_code::MANAGED_CLIENT) => Some(ApiRefusal::ManagedClient),
+            502 if code == Some(problem_code::HUB_UNREACHABLE) => Some(ApiRefusal::HubUnreachable),
+            409 if code == Some(problem_code::NOT_CANCELLABLE) => Some(ApiRefusal::NotCancellable),
             _ => None,
         }
     }
@@ -644,6 +757,45 @@ impl ThalovantError {
             .find_map(|value| value.and_then(Value::as_str).filter(|id| !id.is_empty()))
     }
 
+    /// A member of the problem body, at its top first and then inside a
+    /// `detail` that is itself an object (FastAPI's envelope).
+    fn problem_member(&self, key: &str) -> Option<&Value> {
+        let problem = self.api_problem()?;
+        let nested = problem.get("detail").and_then(Value::as_object);
+        [Some(problem.as_map()), nested]
+            .into_iter()
+            .flatten()
+            .find_map(|source| source.get(key))
+    }
+
+    /// A non-empty string member of the problem, when this error is `kind`.
+    fn problem_text(&self, kind: ApiRefusal, key: &str) -> Option<&str> {
+        if self.api_refusal() != Some(kind) {
+            return None;
+        }
+        self.problem_member(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    }
+
+    /// The non-empty strings of a list member of the problem, when this error
+    /// is `kind`; empty otherwise, and for a member of the wrong type.
+    fn problem_texts(&self, kind: ApiRefusal, key: &str) -> Vec<&str> {
+        if self.api_refusal() != Some(kind) {
+            return Vec::new();
+        }
+        self.problem_member(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The announcement the API recorded for a failed attempt, on an
     /// [`ApiRefusal::HubUnreachable`] refusal (502 `hub_unreachable`): read it
     /// with [`ControlPlane::get_announcement`](crate::ControlPlane::get_announcement)
@@ -653,20 +805,61 @@ impl ThalovantError {
     /// inside a `detail` that is itself an object. `None` for every other
     /// error, and when the answer names none.
     pub fn announcement_id(&self) -> Option<&str> {
-        if self.api_refusal() != Some(ApiRefusal::HubUnreachable) {
+        self.problem_text(ApiRefusal::HubUnreachable, "announcement_id")
+    }
+
+    /// The announcement's current status (`completed`, `partial`, `failed` or
+    /// `cancelled`), on an [`ApiRefusal::NotCancellable`] refusal: refresh the
+    /// result instead of showing an error. `None` for every other error, and
+    /// when the answer names none.
+    pub fn announcement_status(&self) -> Option<&str> {
+        self.problem_text(ApiRefusal::NotCancellable, "announcement_status")
+    }
+
+    /// Why intercom is never available on the hub (`kid_hub` or `public_hub`,
+    /// an open value), on an [`ApiRefusal::IntercomUnavailable`] refusal.
+    /// `None` for every other error, and when the answer names none.
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        self.problem_text(ApiRefusal::IntercomUnavailable, "reason")
+    }
+
+    /// Which urgent pool is full (`hub` or `platform`, an open value), on an
+    /// [`ApiRefusal::UrgentBusy`] refusal. `None` for every other error, and
+    /// when the answer names none.
+    pub fn urgent_busy_scope(&self) -> Option<&str> {
+        self.problem_text(ApiRefusal::UrgentBusy, "scope")
+    }
+
+    /// The connection kind of a refused `receive` (`home_assistant`,
+    /// `developer`, `embedded` ...), on an [`ApiRefusal::NotASpeaker`]
+    /// refusal. `None` for every other error, and for the refusal of an
+    /// announcement (see [`ThalovantError::not_speakers`]).
+    pub fn not_a_speaker_kind(&self) -> Option<&str> {
+        self.problem_text(ApiRefusal::NotASpeaker, "kind")
+    }
+
+    /// The named connections that cannot play speech, on an
+    /// [`ApiRefusal::NotASpeaker`] refusal of an announcement; empty for every
+    /// other error.
+    pub fn not_speakers(&self) -> Vec<&str> {
+        self.problem_texts(ApiRefusal::NotASpeaker, "not_speakers")
+    }
+
+    /// How many speakers the targets resolved to, on an
+    /// [`ApiRefusal::TooManyTargets`] refusal. `None` for every other error,
+    /// and when the member is not a whole number.
+    pub fn matched_speakers(&self) -> Option<u64> {
+        if self.api_refusal() != Some(ApiRefusal::TooManyTargets) {
             return None;
         }
-        let problem = self.api_problem()?;
-        let nested = problem.get("detail").and_then(Value::as_object);
-        [Some(problem.as_map()), nested]
-            .into_iter()
-            .flatten()
-            .find_map(|source| {
-                source
-                    .get("announcement_id")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-            })
+        self.problem_member("matched").and_then(Value::as_u64)
+    }
+
+    /// The managed connections an access policy named, on an
+    /// [`ApiRefusal::ManagedClient`] refusal; empty for every other error and
+    /// for a managed-client refusal that was not about a policy.
+    pub fn refused_client_refs(&self) -> Vec<&str> {
+        self.problem_texts(ApiRefusal::ManagedClient, "refused_client_refs")
     }
 
     /// Whether this is a timeout: [`ThalovantError::Timeout`], or

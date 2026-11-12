@@ -1,6 +1,16 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom amendment 2 (contract section J): cancel, key replay docs, id validation, redacted Debug, wording; new Python digest.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom final API (platform security review): urgent scope, speaker kind/can_play/policy_synced, refusal kinds, one text rule, DND timezone, replayed; Python digest 69badc4fb072.
 
 # Maintenance report
+
+## 2026-11-11: Intercom, the final API (platform security review; Python digest `69badc4fb072`)
+
+Ported the Python reference's final-API changes. `src/intercom.rs`: scope constants (`INTERCOM_URGENT_SCOPE`), `problem_code` constants, `DELIVERY_DETAIL_CODES`, `IntercomSpeaker::{kind, can_play, policy_synced}`, `IntercomSpeakerList::{policy_synced, unavailable_reason}`, `IntercomUnavailableReason::Platform`, `IntercomDelivery::detail`, `Announcement::replayed`, and the validators: `announcement_text` (NFC via `icu_normalizer`, `regex` categories Cc/Cf/Co/Zl/Zp, `<` `>`), `idempotency_key`, `valid_timezone` (shape only), target caps (50 names of 64 characters), the `lang` pattern and the do-not-disturb rules. `src/errors.rs`: twelve new `ApiRefusal` kinds, `is_intercom_disabled()`, `is_auth()` and the accessors `announcement_status()`, `unavailable_reason()`, `urgent_busy_scope()`, `not_a_speaker_kind()`, `not_speakers()`, `matched_speakers()`, `refused_client_refs()`. `src/control.rs`: `request_replayed` reads `Idempotency-Replayed`; `src/control/intercom.rs`: `announce` uses it, validates the key and keeps `replayed` through `wait`. `Cargo.toml`: `icu_normalizer` (default features off; no new crate in the lock). Tests: `tests/intercom.rs` (55 tests, 29 new on top of 26). Docs: README, QUICK_FACTS, FAQ, AUDIT, SUGGESTIONS, CHANGELOG. The version stays 0.18.0 (unreleased). `contracts/sdk-parity.json`: the digest is acknowledged and the evidence hashes of the files this change touched are refreshed.
+
+Deviations from the Python reference: the timezone is checked by shape, not against a database (a `chrono-tz` probe: 7 new crates, about 19 s of clean build, one baked tzdata release; see `AUDIT.md`); Rust has no lone surrogates, so that check is the type's; `Announcement::replayed` is skipped on deserialisation (set only from the header); the refusal kinds are variants of the one `ApiRefusal` enum rather than subclasses, so `is_intercom_disabled()` and `is_auth()` stand in for "a kind of".
+
+Verification (2026-11-11): `cargo test --all-features --no-fail-fast -- --test-threads=2`: 486 passed, 0 failed, 0 ignored (lib 337, `tests/intercom.rs` 55, doc tests 4, the other test binaries the rest); `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings` clean. One run at the default thread count timed out `transport::noise_transport_tests::a_close_right_after_the_handshake_says_whether_it_was_a_refusal` (a 750 ms close-timing test, unrelated to intercom); it passes alone and in the two-thread run, as `AUDIT.md` already says of the suite. `check-sdk-parity.py --workspace /tmp/ic-work --consumer thalovant-rust-sdk` passes.
+
+Transparency Report: AI model Claude Sonnet 5.5; actions: ported the final intercom API from the Python reference to the Rust SDK (code, tests, docs, parity record) and measured a timezone dependency; oversight: none yet, review pending.
 
 ## 2026-11-11: Intercom amendment 2 (client-side security review, contract section J)
 

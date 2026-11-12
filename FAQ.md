@@ -1,4 +1,4 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom amendment 2: cancel, key replay, ids, wording.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom final API: urgent scope, can_play, replayed, platform switch, timezone check.
 
 # FAQ
 
@@ -23,8 +23,23 @@ An id that is `.`, `..`, empty, or holds `/`, `?`, `#`, a backslash or a control
 ## Does `{:?}` on `AnnounceOptions` print the text?
 No. `Debug` prints `text: <N chars>`; the request still carries the text.
 
+## Why does an urgent `announce` fail with `ApiRefusal::UrgentScopeRequired`?
+`priority` urgent (and so every `repeat`) needs the scope `intercom:urgent` in addition to `intercom:send`. Nothing implies it. Nothing was spent: no rate token, no hub call. Sign in again with the scope (a paid plan), or send a normal announcement. `kind.is_auth()` is true for it.
+
+## Why is a Home Assistant link in the speaker list but `receive: Some(true)` fails with `ApiRefusal::NotASpeaker`?
+A connection that cannot play speech (`can_play` false: `home_assistant`, `developer` and `embedded` unless its owner declared `spec.intercom.can_play: true` on the connection) is listed so it can be greyed out, but it cannot receive and is never part of `all`, a room or a group.
+
+## What does `announcement.replayed` mean?
+The API answered with `Idempotency-Replayed: true`: this is the stored announcement for your key, nothing new was sent, whatever its status. Do not tell the person it was sent anew.
+
+## Why does everything fail with `ApiRefusal::IntercomDisabledPlatform`?
+Intercom ships dark: until the platform operator turns it on, `get_intercom_settings` reads `unavailable_reason: Some(Platform)` for every hub and every write and announcement is a 503 `intercom_disabled_platform`. Reads and `cancel_announcement` still work.
+
+## Why does a wrong timezone name only fail at the API?
+`update_intercom_speaker` checks the shape of `quiet_hours.timezone` (at most 64 characters, `Area/Location`, no padding), that an enabled window has one, and that `start != end`. This crate links no timezone database (chrono-tz would add seven crates and bake one tzdata release into the SDK, which then rejects zones the API already knows), so `Mars/Phobos` is the API's 422.
+
 ## Why was nobody spoken to?
-A speaker is skipped unless its `receive` is true (`skipped_not_receiving`, even for urgent); a normal announcement is skipped inside quiet hours (`skipped_dnd`; urgent bypasses them); an offline speaker is `offline`. `ApiRefusal::IntercomDisabled` means the hub's switch is off or it is a kid or public hub.
+A speaker is skipped unless its `receive` is true (`skipped_not_receiving`, even for urgent); a normal announcement is skipped inside quiet hours (`skipped_dnd`; urgent bypasses them); an offline speaker is `offline`. `ApiRefusal::IntercomDisabled` means the hub's switch is off; `ApiRefusal::IntercomUnavailable` means a kid or public hub. `delivered` is not "heard": there is no playback receipt.
 
 ## Sign-in
 

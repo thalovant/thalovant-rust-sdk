@@ -2225,6 +2225,31 @@ impl ControlPlane {
         answer_value(status, &body)
     }
 
+    /// [`request`](Self::request), and whether the answer carried the response
+    /// header `Idempotency-Replayed: true` (any case; anything else is no).
+    async fn request_replayed(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: Option<HeaderMap>,
+        auth: bool,
+    ) -> Result<(Value, bool)> {
+        let response = self.send(method, path, body, headers, auth).await?;
+        let status = response.status();
+        let replayed = response
+            .headers()
+            .get("idempotency-replayed")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+        let body = if status.is_success() {
+            response.text().await.map_err(unreachable)?
+        } else {
+            error_body(response).await
+        };
+        Ok((answer_value(status, &body)?, replayed))
+    }
+
     /// An authenticated GET, and how long a refusal of it asked the caller to
     /// wait: the problem's `retry_after_seconds` (at its top or inside a
     /// `detail` object), else the `Retry-After` header, else
