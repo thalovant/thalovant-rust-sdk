@@ -246,6 +246,137 @@ async fn a_wait_that_times_out_returns_the_latest_answer() {
     assert!(got.is_sending());
 }
 
+fn urgent_wait(poll: Option<Duration>, timeout: Option<Duration>) -> AnnounceOptions {
+    let mut options = AnnounceOptions::new("x", IntercomTargets::All);
+    options.priority = Some(IntercomPriority::Urgent);
+    options.repeat = Some(IntercomRepeat {
+        times: 1,
+        interval_seconds: 5,
+    });
+    options.wait = true;
+    options.poll_interval = poll;
+    options.wait_timeout = timeout;
+    options
+}
+
+#[tokio::test]
+async fn a_bad_poll_interval_or_wait_timeout_is_refused_before_the_post() {
+    let peer = serve(|_, _| answer("202 Accepted", announcement("sending", Value::Null)));
+    // A zero interval would poll without a pause until a 429.
+    let zero = urgent_wait(Some(Duration::ZERO), None);
+    let error = peer.control.announce(HUB, &zero).await.expect_err("zero");
+    assert!(
+        matches!(&error, ThalovantError::Api(m) if m.contains("poll_interval")),
+        "{error}"
+    );
+    // A wait the clock cannot reach is the Rust spelling of infinity.
+    let endless = urgent_wait(None, Some(Duration::MAX));
+    let error = peer
+        .control
+        .announce(HUB, &endless)
+        .await
+        .expect_err("endless");
+    assert!(
+        matches!(&error, ThalovantError::Api(m) if m.contains("wait_timeout")),
+        "{error}"
+    );
+    assert!(peer.requests().is_empty(), "nothing was announced");
+}
+
+#[tokio::test]
+async fn the_wait_deadline_bounds_a_stalled_status_read() {
+    let peer = serve(|request, _| {
+        if request.starts_with("POST") {
+            answer("202 Accepted", announcement("sending", Value::Null))
+        } else {
+            thread::sleep(Duration::from_secs(3)); // a read that never answers in time
+            ok(announcement("completed", Value::Null))
+        }
+    });
+    let options = urgent_wait(
+        Some(Duration::from_millis(10)),
+        Some(Duration::from_millis(300)),
+    );
+    let started = std::time::Instant::now();
+    let got = peer
+        .control
+        .announce(HUB, &options)
+        .await
+        .expect("the latest answer, not an error and not a hang");
+    assert!(got.is_sending());
+    assert_eq!(got.id, ANN);
+    assert!(
+        started.elapsed() < Duration::from_millis(2500),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn no_read_starts_once_the_deadline_passed_during_the_sleep() {
+    let peer = serve(|request, _| {
+        if request.starts_with("POST") {
+            answer("202 Accepted", announcement("sending", Value::Null))
+        } else {
+            ok(announcement("completed", Value::Null))
+        }
+    });
+    let options = urgent_wait(
+        Some(Duration::from_secs(30)),
+        Some(Duration::from_millis(40)),
+    );
+    let got = peer
+        .control
+        .announce(HUB, &options)
+        .await
+        .expect("announce");
+    assert!(got.is_sending()); // the sleep was cut to the deadline, and no read followed
+    let requests = peer.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(line(&requests[0]).starts_with("POST"));
+}
+
+#[tokio::test]
+async fn a_failed_poll_keeps_the_accepted_announcement() {
+    let peer = serve(|request, _| {
+        if request.starts_with("POST") {
+            answer("202 Accepted", announcement("sending", Value::Null))
+        } else {
+            answer("403 Forbidden", json!({"detail": "Insufficient scopes"}))
+        }
+    });
+    let mut options = urgent_wait(Some(Duration::from_millis(5)), None);
+    options.idempotency_key = Some("k-1".into());
+    let error = peer
+        .control
+        .announce(HUB, &options)
+        .await
+        .expect_err("a send-only token cannot poll");
+    assert!(
+        matches!(error, ThalovantError::AnnouncementWaitFailed { .. }),
+        "{error}"
+    );
+    // The announcement exists: its id and status come back with the error.
+    let kept = error.announcement().expect("the accepted announcement");
+    assert_eq!(kept.id, ANN);
+    assert!(kept.is_sending());
+    // The accessors for an API answer look through to the poll's own error.
+    assert_eq!(error.status_code(), Some(403));
+    assert_eq!(error.api_refusal(), Some(ApiRefusal::Auth));
+    assert!(!error.is_rate_limited() && !error.is_timeout() && !error.is_connection_error());
+    let message = error.to_string();
+    assert!(
+        message.contains(ANN) && message.contains("accepted"),
+        "{message}"
+    );
+    assert!(std::error::Error::source(&error).is_some());
+    let requests = peer.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(header(&requests[0], "idempotency-key"), Some("k-1"));
+    // Any other error has no announcement.
+    assert!(ThalovantError::Api("x".into()).announcement().is_none());
+}
+
 #[tokio::test]
 async fn get_and_list_announcements() {
     let peer = serve(|request, _| {
@@ -436,6 +567,12 @@ async fn errors_are_typed() {
             false,
         ),
         (
+            "402 Payment Required",
+            json!({"detail": "API access requires a paid plan."}),
+            Some(ApiRefusal::Plan),
+            false,
+        ),
+        (
             "403 Forbidden",
             json!({"detail": "Insufficient scopes"}),
             Some(ApiRefusal::Auth),
@@ -456,9 +593,20 @@ async fn errors_are_typed() {
             .announce(HUB, &AnnounceOptions::new("hello", IntercomTargets::All))
             .await
             .expect_err("a refusal");
+        // The status is asserted on its own: a body without a `code` must not
+        // let a wrong status pass.
+        let expected: u16 = status
+            .split_once(' ')
+            .expect("status")
+            .0
+            .parse()
+            .expect("number");
+        assert_eq!(error.status_code(), Some(expected), "{status} {problem}");
         assert_eq!(error.api_refusal(), refusal, "{status} {problem}");
         assert_eq!(error.is_rate_limited(), limited, "{status} {problem}");
-        assert_eq!(error.api_code(), problem["code"].as_str());
+        if let Some(code) = problem.get("code") {
+            assert_eq!(error.api_code(), code.as_str(), "{status} {problem}");
+        }
     }
 }
 

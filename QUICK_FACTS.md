@@ -1,4 +1,4 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): wait scope after the PR 91 review.
 
 # Quick facts: thalovant (Rust SDK)
 
@@ -59,7 +59,8 @@ Announce-only text spoken aloud on a hub's speakers. Not a certified safety syst
 | `get_announcement(hub_id, id)` | `GET /v1/hubs/{id}/intercom/announcements/{id}` | `Announcement` |
 | `list_announcements(hub_id, &AnnouncementListOptions)` | `GET /v1/hubs/{id}/intercom/announcements` | `AnnouncementList` |
 
-- Errors (`src/errors.rs`): `ApiRefusal::IntercomDisabled`, `ApiRefusal::HubUnreachable`, `ThalovantError::is_rate_limited()`.
+- Errors (`src/errors.rs`): `ApiRefusal::IntercomDisabled`, `ApiRefusal::HubUnreachable` (502; the text may or may not have been spoken: retry with the same `idempotency_key`), `ThalovantError::is_rate_limited()`; `ApiRefusal::Plan` is HTTP 402 or 403 `plan_limit`.
+- `announce` with `wait` also needs `intercom:read` (it polls `get_announcement`); a poll that fails after the POST is `ThalovantError::AnnouncementWaitFailed` (`announcement()` is the accepted announcement).
 
 ## Chat apps (`/v1/bridges`)
 

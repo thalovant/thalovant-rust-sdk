@@ -16,7 +16,7 @@
 //! | [`set_intercom_settings`](crate::ControlPlane::set_intercom_settings) | `PUT .../settings` | `hubs:write` |
 //! | [`list_intercom_speakers`](crate::ControlPlane::list_intercom_speakers) | `GET .../speakers` | `intercom:read` |
 //! | [`update_intercom_speaker`](crate::ControlPlane::update_intercom_speaker) | `PATCH .../speakers/{client_id}` | `hubs:write` |
-//! | [`announce`](crate::ControlPlane::announce) | `POST .../announce` | `intercom:send` |
+//! | [`announce`](crate::ControlPlane::announce) | `POST .../announce` | `intercom:send` (and `intercom:read` too with `wait`) |
 //! | [`get_announcement`](crate::ControlPlane::get_announcement) | `GET .../announcements/{id}` | `intercom:read` |
 //! | [`list_announcements`](crate::ControlPlane::list_announcements) | `GET .../announcements` | `intercom:read` |
 //!
@@ -27,9 +27,14 @@
 //! Refusals are [`ThalovantError`](crate::ThalovantError)s:
 //! [`ApiRefusal::IntercomDisabled`](crate::ApiRefusal::IntercomDisabled) (the
 //! hub's switch is off, or it is a kid or public hub),
-//! [`ApiRefusal::HubUnreachable`](crate::ApiRefusal::HubUnreachable) (nothing
-//! was spoken), [`is_rate_limited`](crate::ThalovantError::is_rate_limited)
-//! and [`ApiRefusal::Plan`](crate::ApiRefusal::Plan).
+//! [`ApiRefusal::HubUnreachable`](crate::ApiRefusal::HubUnreachable) (whether
+//! the text was spoken is not guaranteed: retry with the same
+//! `idempotency_key`),
+//! [`is_rate_limited`](crate::ThalovantError::is_rate_limited) and
+//! [`ApiRefusal::Plan`](crate::ApiRefusal::Plan) (HTTP 402, or 403
+//! `plan_limit`). With `wait`, a poll that fails after the announcement was
+//! accepted is [`ThalovantError::AnnouncementWaitFailed`](crate::ThalovantError::AnnouncementWaitFailed),
+//! which carries the accepted announcement.
 //!
 //! Every status is an open enum: a value this release does not know is kept
 //! in `Other`.
@@ -303,12 +308,15 @@ pub struct AnnounceOptions {
     pub lang: Option<String>,
     /// Sent as `Idempotency-Key` when set; never generated.
     pub idempotency_key: Option<String>,
-    /// Poll a `sending` announcement until it completes.
+    /// Poll a `sending` announcement until it completes. The polls need
+    /// `intercom:read` as well as `intercom:send`.
     pub wait: bool,
-    /// The longest wait: `times * interval + 15 s` when `None`. On timeout
-    /// the latest answer is returned, still `sending`.
+    /// The longest wait: `times * interval + 15 s` when `None`; a time the
+    /// clock cannot reach is refused before the POST. The deadline bounds each
+    /// poll, not only the sleep between polls. On timeout the latest answer is
+    /// returned, still `sending`.
     pub wait_timeout: Option<Duration>,
-    /// Time between polls: 2 s when `None`.
+    /// Time between polls: 2 s when `None`; zero is refused before the POST.
     pub poll_interval: Option<Duration>,
 }
 

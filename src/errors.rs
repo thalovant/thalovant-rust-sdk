@@ -156,7 +156,10 @@ pub enum ApiRefusal {
     /// kid or public hub.
     IntercomDisabled,
     /// The API could not reach the hub to speak: HTTP 502 with code
-    /// `hub_unreachable`. Nothing was spoken; trying again is safe.
+    /// `hub_unreachable`. Whether the text was spoken is not guaranteed either
+    /// way: the hub may have spoken it and lost the answer. The API records
+    /// the attempt. To retry, reuse the same `idempotency_key` the announcement
+    /// was sent with, so a retry is not said a second time.
     HubUnreachable,
 }
 
@@ -291,6 +294,26 @@ pub enum ThalovantError {
     },
     #[error("api error: {0}")]
     Api(String),
+    /// [`ControlPlane::announce`](crate::ControlPlane::announce) with `wait`
+    /// had the announcement accepted, then failed to follow it.
+    ///
+    /// The announcement exists: `announcement` is the answer to the POST, with
+    /// its id, so the caller can poll it later with
+    /// [`ControlPlane::get_announcement`](crate::ControlPlane::get_announcement)
+    /// (a poll needs `intercom:read`; a token with only `intercom:send` is
+    /// refused at the first one) and knows it must not be sent again.
+    /// `source` is why the poll failed. The accessors that read an API answer
+    /// ([`ThalovantError::status_code`], [`ThalovantError::api_refusal`],
+    /// [`ThalovantError::api_code`], [`ThalovantError::is_rate_limited`] ...)
+    /// look through to it.
+    #[error("announcement {} was accepted, but waiting for it failed: {source}", .announcement.id)]
+    AnnouncementWaitFailed {
+        /// The accepted announcement, as the POST answered it.
+        announcement: Box<crate::intercom::Announcement>,
+        /// Why following it failed.
+        #[source]
+        source: Box<ThalovantError>,
+    },
     /// The control-plane API answered with an error status.
     ///
     /// The message is one bounded line for display and can be shortened, so
@@ -495,6 +518,7 @@ impl ThalovantError {
     /// The HTTP status of an error the API answered with.
     pub fn status_code(&self) -> Option<u16> {
         match self {
+            Self::AnnouncementWaitFailed { source, .. } => source.status_code(),
             Self::Http(e) => e.status().map(|s| s.as_u16()),
             _ => self.api_answer().map(|(status_code, _)| status_code),
         }
@@ -503,6 +527,7 @@ impl ThalovantError {
     /// The status and body of an error that is an answer from the API.
     fn api_answer(&self) -> Option<(u16, Option<&ApiProblem>)> {
         match self {
+            Self::AnnouncementWaitFailed { source, .. } => source.api_answer(),
             Self::ApiResponse {
                 status_code,
                 problem,
@@ -613,7 +638,10 @@ impl ThalovantError {
     /// Whether this is a timeout: [`ThalovantError::Timeout`], or
     /// [`ThalovantError::AdmissionTimeout`].
     pub fn is_timeout(&self) -> bool {
-        matches!(self, Self::Timeout(_) | Self::AdmissionTimeout { .. })
+        match self {
+            Self::AnnouncementWaitFailed { source, .. } => source.is_timeout(),
+            _ => matches!(self, Self::Timeout(_) | Self::AdmissionTimeout { .. }),
+        }
     }
 
     /// Whether this is a connection error: [`ThalovantError::Connection`]
@@ -622,6 +650,9 @@ impl ThalovantError {
     /// [`ThalovantError::AdmissionTimeout`] or
     /// [`ThalovantError::AdmissionFailed`].
     pub fn is_connection_error(&self) -> bool {
+        if let Self::AnnouncementWaitFailed { source, .. } = self {
+            return source.is_connection_error();
+        }
         matches!(
             self,
             Self::Connection(_) | Self::AdmissionTimeout { .. } | Self::AdmissionFailed { .. }
@@ -731,7 +762,21 @@ impl ThalovantError {
     /// The error is the [`ThalovantError::Api`] such a failure has always
     /// been, so a match on that variant still catches it.
     pub fn is_api_unreachable(&self) -> bool {
-        matches!(self, Self::Api(message) if message.starts_with(API_UNREACHABLE))
+        match self {
+            Self::AnnouncementWaitFailed { source, .. } => source.is_api_unreachable(),
+            _ => matches!(self, Self::Api(message) if message.starts_with(API_UNREACHABLE)),
+        }
+    }
+
+    /// The accepted announcement of a failed wait: set for
+    /// [`ThalovantError::AnnouncementWaitFailed`], `None` for every other
+    /// error. Its id is how to poll it later, and the reason not to announce
+    /// again without the same idempotency key.
+    pub fn announcement(&self) -> Option<&crate::intercom::Announcement> {
+        match self {
+            Self::AnnouncementWaitFailed { announcement, .. } => Some(announcement),
+            _ => None,
+        }
     }
 
     /// A refusal of the credentials by the hub: a

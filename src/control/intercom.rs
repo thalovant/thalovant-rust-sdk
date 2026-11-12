@@ -108,6 +108,19 @@ impl ControlPlane {
     /// returned, still `sending`). Keep an `idempotency_key` to retry after an
     /// uncertain outcome without speaking twice.
     ///
+    /// **`wait` needs `intercom:read` as well as `intercom:send`**: the polls
+    /// are [`get_announcement`](Self::get_announcement). A poll can fail after
+    /// the announcement was accepted (a token with only `intercom:send` is
+    /// refused at the first poll; a 429; the network). The error is then
+    /// [`ThalovantError::AnnouncementWaitFailed`], which carries the accepted
+    /// announcement and the poll's own error ([`ThalovantError::announcement`]);
+    /// the accessors for an API answer look through to it. A retry still needs
+    /// the same `idempotency_key`, or it may speak the text a second time.
+    /// `poll_interval` must be above zero, and `wait_timeout` must be a time
+    /// the clock can reach; both are checked before the POST. The deadline
+    /// bounds each poll, not only the sleep between polls, and no poll starts
+    /// once the sleep used it.
+    ///
     /// Invalid input (text, targets, repeat, a blank id) fails locally with
     /// [`ThalovantError::Api`] before any request.
     pub async fn announce(&self, hub_id: &str, options: &AnnounceOptions) -> Result<Announcement> {
@@ -122,12 +135,11 @@ impl ControlPlane {
             Some(key) => Some(single_header("Idempotency-Key", key)?),
             None => None,
         };
-        let value = self
-            .request("POST", &path, Some(body), headers, true)
-            .await?;
-        let mut announcement: Announcement = serde_json::from_value(value)?;
-        if !options.wait || !announcement.is_sending() {
-            return Ok(announcement);
+        let poll = options.poll_interval.unwrap_or(Duration::from_secs(2));
+        if poll.is_zero() {
+            return Err(ThalovantError::Api(
+                "poll_interval must be greater than zero".into(),
+            ));
         }
         let repeat = options.repeat.unwrap_or(IntercomRepeat {
             times: 0,
@@ -136,11 +148,44 @@ impl ControlPlane {
         let timeout = options.wait_timeout.unwrap_or_else(|| {
             Duration::from_secs(u64::from(repeat.times) * u64::from(repeat.interval_seconds) + 15)
         });
-        let poll = options.poll_interval.unwrap_or(Duration::from_secs(2));
+        if options.wait && tokio::time::Instant::now().checked_add(timeout).is_none() {
+            return Err(ThalovantError::Api(
+                "wait_timeout is longer than the clock can count".into(),
+            ));
+        }
+        let value = self
+            .request("POST", &path, Some(body), headers, true)
+            .await?;
+        let mut announcement: Announcement = serde_json::from_value(value)?;
+        if !options.wait || !announcement.is_sending() {
+            return Ok(announcement);
+        }
         let deadline = tokio::time::Instant::now() + timeout;
-        while announcement.is_sending() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep_until((tokio::time::Instant::now() + poll).min(deadline)).await;
-            announcement = self.get_announcement(hub_id, &announcement.id).await?;
+        while announcement.is_sending() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep_until((now + poll).min(deadline)).await;
+            // With nothing left after the sleep, no read starts at all.
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            // Each read is bounded by what is left of the wait: a read the API
+            // is slow to answer must not carry the wait past its deadline.
+            match tokio::time::timeout_at(deadline, self.get_announcement(hub_id, &announcement.id))
+                .await
+            {
+                Ok(Ok(latest)) => announcement = latest,
+                Ok(Err(source)) => {
+                    // The announcement is accepted: its id is the caller's way back.
+                    return Err(ThalovantError::AnnouncementWaitFailed {
+                        announcement: Box::new(announcement),
+                        source: Box::new(source),
+                    });
+                }
+                Err(_elapsed) => break, // the latest answer, still `sending`
+            }
         }
         Ok(announcement)
     }

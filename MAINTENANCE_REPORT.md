@@ -1,10 +1,16 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: CodeRabbit review of PR 91: wait validation and deadline, accepted announcement kept on a poll error; digest 66bfb1ac5879.
 
 # Maintenance report
 
+## 2026-11-11: intercom review fixes (CodeRabbit, PR 91; Python digest `66bfb1ac5879`)
+
+`announce` refuses a zero `poll_interval` and a `wait_timeout` the clock cannot reach (`Instant::checked_add`) before the POST; the deadline bounds each poll (`tokio::time::timeout_at`, the latest `sending` answer on expiry) and no poll starts once the sleep used the deadline. A poll that fails after the POST is the new `ThalovantError::AnnouncementWaitFailed { announcement, source }` instead of the bare poll error, so the accepted announcement's id is not lost; `status_code`, `api_answer` (hence `api_problem`, `api_refusal`, `api_code`, `is_rate_limited`), `is_timeout`, `is_connection_error` and `is_api_unreachable` look through to `source`. README: the example lists the speakers and addresses one by its `client_id`. Docs: `wait` needs `intercom:read` too, 402 is listed with 403 `plan_limit` (`ApiRefusal::Plan`), and `ApiRefusal::HubUnreachable` no longer says a retry is safe. `tests/intercom.rs` asserts the status of every refusal on its own and adds a 402 case. Verification: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, parity check against the Python reference.
+
+Transparency Report: AI model Claude Sonnet 5.5; actions: fixed the review findings, added tests, refreshed the parity record; oversight: none yet, review pending.
+
 ## 2026-11-11: intercom (0.18.0)
 
-Ported the `intercom` capability from thalovant-python-sdk 0.12.0 (digest `690784dbb9af`): `src/intercom.rs`, `src/control/intercom.rs` (seven `ControlPlane` methods), two `ApiRefusal` kinds and `is_rate_limited` in `src/errors.rs`, `tests/intercom.rs` (loopback peer), the parity record, README, QUICK_FACTS, FAQ, AUDIT and CHANGELOG. Verified with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test --all-features`; the other capabilities' evidence hashes for the files this change touched were refreshed after the suite passed.
+Ported the `intercom` capability from thalovant-python-sdk 0.12.0 (digest `690784dbb9af`, since moved to `66bfb1ac5879`): `src/intercom.rs`, `src/control/intercom.rs` (seven `ControlPlane` methods), two `ApiRefusal` kinds and `is_rate_limited` in `src/errors.rs`, `tests/intercom.rs` (loopback peer), the parity record, README, QUICK_FACTS, FAQ, AUDIT and CHANGELOG. Verified with `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings` and `cargo test --all-features`; the other capabilities' evidence hashes for the files this change touched were refreshed after the suite passed.
 
 Transparency Report: AI model Claude Sonnet 5.5; actions: wrote the module, methods, tests, docs and parity record from the contract and the Python reference; oversight: none yet, review pending.
 

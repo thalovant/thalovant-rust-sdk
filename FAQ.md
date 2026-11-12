@@ -1,9 +1,12 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): wait scope and retry questions after the PR 91 review.
 
 # FAQ
 
 ## Is intercom a safety system, and why is there no `intercom()` method?
 It is announce-only text spoken by each speaker's own text-to-speech, and **not a certified safety system**: it does not replace smoke or CO alarms, medical alert devices or emergency services. The mesh already has an `intercom` frame, so the HTTP calls are `announce`, `get_announcement`, `list_announcements` and `*_intercom_*`. The platform never stores the text.
+
+## Why did `announce` with `wait` fail after the announcement was accepted?
+`wait` polls `get_announcement`, which needs `intercom:read` as well as `intercom:send`; a poll can also fail on a 429 or the network. The error is `ThalovantError::AnnouncementWaitFailed`: `error.announcement()` is the accepted announcement (its id), and `status_code()` and `api_refusal()` read the poll's own error. Set an `idempotency_key` and reuse it to retry, so the text is not said twice.
 
 ## Why was nobody spoken to?
 A speaker is skipped unless its `receive` is true (`skipped_not_receiving`, even for urgent); a normal announcement is skipped inside quiet hours (`skipped_dnd`; urgent bypasses them); an offline speaker is `offline`. `ApiRefusal::IntercomDisabled` means the hub's switch is off or it is a kid or public hub.

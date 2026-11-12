@@ -345,7 +345,7 @@ Say a short text aloud on a hub's speakers. Off by default at every level, annou
 and **not a certified safety system**: it does not replace smoke or CO alarms, medical
 alert devices or emergency services. The platform never stores the text. (The names are
 `announce` and `*_intercom_*`: the HiveMind mesh already has an `intercom` frame.) Scopes:
-`intercom:read`, `intercom:send`, and `hubs:write` for settings and speakers.
+`intercom:read`, `intercom:send` (plus `intercom:read` with `wait`), and `hubs:write` for settings and speakers.
 
 ```rust,no_run
 use thalovant::{
@@ -355,9 +355,12 @@ use thalovant::{
 
 # async fn run(api: ControlPlane, hub_id: &str) -> thalovant::Result<()> {
 api.set_intercom_settings(hub_id, true).await?; // hubs:write
+// A speaker is addressed by its `client_id` (from the list), not by a room or a name.
+let speakers = api.list_intercom_speakers(hub_id).await?; // intercom:read
+let speaker = &speakers.items[0];
 api.update_intercom_speaker(
     hub_id,
-    "kitchen",
+    &speaker.client_id,
     &IntercomSpeakerUpdate { receive: Some(true), room: Some(Some("kitchen".into())), ..Default::default() },
 )
 .await?;
@@ -370,16 +373,28 @@ println!("{} {:?}", said.status, said.deliveries);
 let mut urgent = AnnounceOptions::new("Please answer", IntercomTargets::All);
 urgent.priority = Some(IntercomPriority::Urgent);
 urgent.repeat = Some(IntercomRepeat { times: 3, interval_seconds: 20 });
-urgent.wait = true; // polls while `sending`
+urgent.idempotency_key = Some("please-answer-1".into());
+urgent.wait = true; // polls while `sending`; needs intercom:read as well
 let done = api.announce(hub_id, &urgent).await?;
 println!("{} acked by {:?}", done.status, done.acked_by);
 # Ok(())
 # }
 ```
 
+`wait` needs **`intercom:read` as well as `intercom:send`** (the polls are `get_announcement`).
+`poll_interval` must be above zero and `wait_timeout` a time the clock can reach (both are
+checked before anything is sent), and the deadline bounds each poll, not only the sleep between
+polls. A poll can fail after the announcement was accepted (a token with only `intercom:send`
+is refused at the first poll; a 429; the network): the error is then
+`ThalovantError::AnnouncementWaitFailed`, and `error.announcement()` is the accepted
+announcement, whose id lets you poll it later. `status_code()`, `api_refusal()` and the other
+accessors look through to the poll's own error. Always set an `idempotency_key` with `wait` and
+reuse it to retry, so a retry is not announced a second time.
+
 Refusals: `error.api_refusal()` is `Some(ApiRefusal::IntercomDisabled)` (switch off, kid or
-public hub), `Some(ApiRefusal::HubUnreachable)` (nothing was spoken) or
-`Some(ApiRefusal::Plan)`; `error.is_rate_limited()` is a 429 (its `retry_after_seconds` is
+public hub), `Some(ApiRefusal::HubUnreachable)` (502: the text may or may not have been
+spoken; retry with the same `idempotency_key`) or `Some(ApiRefusal::Plan)` (HTTP 402, or 403
+with `plan_limit`); `error.is_rate_limited()` is a 429 (its `retry_after_seconds` is
 in `error.api_problem()`).
 
 ## Reading an API error

@@ -1,6 +1,10 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): announce, speakers and settings on the control plane.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: CodeRabbit review of PR 91: a poll that fails after an accepted announcement now carries it.
 
 # Audit
+
+## Intercom (0.18.0): a poll that fails after the POST
+
+`ControlPlane::announce` with `wait` (`src/control/intercom.rs`) sends the POST, then polls `get_announcement`, which needs `intercom:read`. A token with only `intercom:send`, a 429 or a network error fails a poll after the announcement was accepted. The error is `ThalovantError::AnnouncementWaitFailed` (`src/errors.rs`), which carries the accepted announcement (`tests/intercom.rs`, `a_failed_poll_keeps_the_accepted_announcement`); a retry still needs the same `idempotency_key` to avoid speaking it again. A caller that matches `ThalovantError::ApiResponse` directly on the result of `announce(wait)` no longer matches a failed poll: use `status_code()` and `api_refusal()`, which look through.
 
 ## Intercom (0.18.0): the text is in the request body
 
