@@ -347,7 +347,7 @@ alert devices or emergency services. The API does not store the text (it keeps a
 and the length), and intercom does not record or store speech: while an alert sounds, the hub
 only checks whether a reply is an acknowledgement. (The names are `announce` and
 `*_intercom_*`: the HiveMind mesh already has an `intercom` frame.) Scopes: `intercom:read`,
-`intercom:send` (announce and cancel; plus `intercom:read` with `wait`), `intercom:urgent` (an
+`intercom:send` (announce and cancel; it implies `intercom:read`, which the polls of `wait` use), `intercom:urgent` (an
 **urgent** announcement, and so every `repeat`, needs it **in addition to** `intercom:send`; nothing
 implies it) and `hubs:write` for settings and speakers (owner, manager or administrator of the hub).
 The constants are `INTERCOM_READ_SCOPE`, `INTERCOM_SEND_SCOPE` and `INTERCOM_URGENT_SCOPE`.
@@ -362,7 +362,12 @@ use thalovant::{
 api.set_intercom_settings(hub_id, true).await?; // hubs:write
 // A speaker is addressed by its `client_id` (from the list), not by a room or a name.
 let speakers = api.list_intercom_speakers(hub_id).await?; // intercom:read
-let speaker = &speakers.items[0];
+// A connection with `can_play == false` is listed but cannot receive: pick one that can.
+let Some(speaker) = speakers.items.iter().find(|speaker| speaker.can_play) else {
+    return Err(thalovant::ThalovantError::Api(
+        "this hub has no connection that can play speech".into(),
+    ));
+};
 api.update_intercom_speaker(
     hub_id,
     &speaker.client_id,
@@ -381,7 +386,7 @@ let mut urgent = AnnounceOptions::new("Please answer", IntercomTargets::All);
 urgent.priority = Some(IntercomPriority::Urgent);
 urgent.repeat = Some(IntercomRepeat { times: 3, interval_seconds: 20 });
 urgent.idempotency_key = Some(thalovant::new_request_id());
-urgent.wait = true; // polls while `sending`; needs intercom:read as well, and intercom:urgent to send
+urgent.wait = true; // polls while `sending` (intercom:read, implied by intercom:send); urgent needs intercom:urgent
 let done = api.announce(hub_id, &urgent).await?;
 println!("{} acked by {:?}", done.status, done.acked_by);
 
@@ -405,9 +410,11 @@ The API scopes a key to `(hub, key)` and remembers it for 24 hours:
 - **The same key replays the stored announcement** (the response header is
   `Idempotency-Replayed: true`) and **never sends again**, whatever its status. A replayed
   `failed` announcement stays `failed`; it is not retried.
-- **A constant key silences you.** A literal key such as `"dinner"` sends once; every later
-  announcement with that key, for 24 hours, returns the first one's answer and nothing is
-  spoken. Never copy a literal key into real code, and never derive it from the text or the date.
+- **A constant key silences you.** A literal key such as `"dinner"` sends once. For the next 24
+  hours a later announcement with that key and the **same** request replays the first one's stored
+  answer, with the status it stored (`completed`, `failed`, ...), and nothing is spoken; one with a
+  **different** request is a 409. Never copy a literal key into real code, and never derive it
+  from the text or the date.
 - **Reuse a key only for the same attempt**, after a network drop or a timeout: the call then
   returns what the first attempt did (and its id) instead of speaking twice.
 - **To send the same text again on purpose, use a new key.**
@@ -415,7 +422,8 @@ The API scopes a key to `(hub, key)` and remembers it for 24 hours:
   spoken. The API recorded the attempt as a `failed` announcement and puts its id in the problem
   body: `error.announcement_id()`. Read it with `get_announcement` and look at the deliveries
   before you send again. Resending with the **same** key will not retry (it replays the `failed`
-  record); a deliberate second send needs a **new** key.
+  record). A `failed` record is not proof that nothing was spoken: weigh the risk of a repeated
+  announcement, and use a **new** key only when you choose to send a second attempt.
 
 ```rust,no_run
 # use thalovant::{AnnounceOptions, ApiRefusal, ControlPlane, IntercomTargets};
@@ -438,8 +446,9 @@ if let Err(error) = api.announce(hub_id, &options).await {
 
 An urgent announcement that repeats can be stopped. These are the real controls:
 
-- **`cancel_announcement(hub_id, announcement_id)`** (`intercom:send`, owner or admin of the
-  hub) asks the hub to stop repeating and returns the announcement as `cancelled`. It works only
+- **`cancel_announcement(hub_id, announcement_id)`** (`intercom:send`; the hub's owner, a
+  manager, a plain member of the tenant or an administrator, and an impersonated session too:
+  stopping speech is not restricted to the people who may announce) asks the hub to stop repeating and returns the announcement as `cancelled`. It works only
   while the status is `sending`; for one that already completed, failed or was cancelled the API
   answers 409 `not_cancellable` (`ApiRefusal::NotCancellable`). If the hub cannot confirm the
   cancel, the record is still `cancelled` and `hub_confirmed` is `Some(false)`: speech already
@@ -491,7 +500,8 @@ invisible format characters (the zero-width joiner and non-joiner are allowed), 
 characters and no line or paragraph separators (a Rust string cannot hold a lone surrogate).
 `lang`, when given, is a language tag (`en`, `en-US`). Target lists hold at most 50 names of 1
 to 64 characters each; `all`, a room or a group that resolves to more than 50 speakers is
-`ApiRefusal::TooManyTargets` (422, `error.matched_speakers()`): name a room or a group. An
+`ApiRefusal::TooManyTargets` (422, `error.matched_speakers()`); naming the same room or group
+resolves to the same speakers, so choose a narrower target or name at most 50. An
 `idempotency_key` is at most 128 printable ASCII characters.
 
 `delivered` means the hub handed the speech to that speaker's connection. There is **no playback
@@ -530,16 +540,18 @@ in `tokio::time::timeout`, give it at least 20 seconds. `AnnounceOptions` redact
 `Debug` (`text: <N chars>`), so `{:?}`, `{:#?}` and `tracing`'s `#[instrument]` never print what
 is spoken aloud.
 
-`wait` needs **`intercom:read` as well as `intercom:send`** (the polls are `get_announcement`).
+`wait` polls with `get_announcement` (`intercom:read`, which `intercom:send` implies, so no further
+scope is needed).
 `poll_interval` must be above zero and `wait_timeout` a time the clock can reach (both are
 checked before anything is sent), and the deadline bounds each poll, not only the sleep between
-polls. A poll can fail after the announcement was accepted (a token with only `intercom:send`
-is refused at the first poll; a 429; the network): the error is then
+polls. A poll can fail after the announcement was accepted (a 429; the network): the error is then
 `ThalovantError::AnnouncementWaitFailed`, and `error.announcement()` is the accepted
-announcement, whose id lets you poll it later. `status_code()`, `api_refusal()` and the other
-accessors look through to the poll's own error. Always set a fresh `idempotency_key` with `wait`:
-calling `announce` again with that same key replays the stored announcement (with its id) and does
-not announce a second time.
+announcement (the POST's own answer), whose id lets you poll it later. `status_code()`, `api_refusal()` and the other
+accessors look through to the poll's own error. Always set an `idempotency_key` with `wait`,
+created **before** the first call (a new key is a different attempt and can announce twice). To get
+the announcement back, call `announce` again with that same key and `wait` false: the POST replays
+the stored announcement (with its id, no status read) and does not announce a second time; with
+`wait` true the repeat call polls again and can fail the same way.
 
 Refusals: `error.api_refusal()` is `Some(ApiRefusal::IntercomDisabled)` (the hub's switch is off),
 `Some(ApiRefusal::IntercomUnavailable)` (a kid or public hub; `error.unavailable_reason()`),

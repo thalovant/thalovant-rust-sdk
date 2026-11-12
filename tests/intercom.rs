@@ -1429,6 +1429,104 @@ async fn a_failed_wait_keeps_the_replayed_flag_on_the_accepted_announcement() {
 }
 
 #[tokio::test]
+async fn a_failed_wait_carries_the_posts_answer_not_a_later_poll() {
+    // POST: sending, two deliveries. Poll 1: sending with a different body (no
+    // deliveries). Poll 2: a 403. The error carries what the POST answered.
+    let peer = serve(|request, number| {
+        if request.starts_with("POST") {
+            answer("202 Accepted", announcement("sending", Value::Null))
+        } else if number == 2 {
+            let mut later = announcement("sending", Value::Null);
+            later["deliveries"] = json!([]);
+            answer("200 OK", later)
+        } else {
+            answer("403 Forbidden", json!({"detail": "Insufficient scopes"}))
+        }
+    });
+    let options = urgent_wait(Some(Duration::from_millis(5)), None);
+    let error = peer
+        .control
+        .announce(HUB, &options)
+        .await
+        .expect_err("the second poll fails");
+    assert!(peer.requests().len() >= 3, "{:?}", peer.requests().len());
+    let kept = error.announcement().expect("the accepted announcement");
+    assert_eq!(kept.id, ANN);
+    assert_eq!(
+        kept.deliveries.len(),
+        2,
+        "the POST's deliveries, not the later poll's"
+    );
+}
+
+#[tokio::test]
+async fn a_huge_poll_interval_does_not_overflow_the_clock_after_the_post() {
+    let peer = serve(|request, _| {
+        if request.starts_with("POST") {
+            answer("202 Accepted", announcement("sending", Value::Null))
+        } else {
+            ok(announcement("completed", Value::Null))
+        }
+    });
+    let options = urgent_wait(Some(Duration::MAX), Some(Duration::from_millis(150)));
+    let started = std::time::Instant::now();
+    let got = peer
+        .control
+        .announce(HUB, &options)
+        .await
+        .expect("the sleep is cut to the deadline, no panic");
+    assert!(got.is_sending(), "the latest answer, still sending");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(
+        peer.requests().len(),
+        1,
+        "no read started after the sleep used the wait"
+    );
+}
+
+#[tokio::test]
+async fn the_urgent_scope_code_wins_over_the_generic_insufficient_scopes_refusal() {
+    let peer = serve(|_, _| {
+        answer(
+            "403 Forbidden",
+            json!({"status": 403, "code": "urgent_scope_required", "detail": "Insufficient scopes"}),
+        )
+    });
+    let mut options = AnnounceOptions::new("hello", IntercomTargets::All);
+    options.priority = Some(IntercomPriority::Urgent);
+    let error = peer.control.announce(HUB, &options).await.expect_err("403");
+    let kind = error.api_refusal().expect("a kind");
+    assert_eq!(kind, ApiRefusal::UrgentScopeRequired);
+    assert!(
+        kind.is_auth(),
+        "still an auth refusal for an existing handler"
+    );
+}
+
+#[tokio::test]
+async fn a_top_level_null_does_not_hide_the_member_inside_detail() {
+    let nested_id = json!({"announcement_id": null, "detail": {"code": "hub_unreachable", "announcement_id": ANN}});
+    let peer = serve(move |_, _| answer("502 Bad Gateway", nested_id.clone()));
+    let options = AnnounceOptions::new("hello", IntercomTargets::All);
+    let error = peer.control.announce(HUB, &options).await.expect_err("502");
+    assert_eq!(error.announcement_id(), Some(ANN));
+
+    let many = json!({"matched": null, "detail": {"code": "too_many_targets", "matched": 51}});
+    let peer = serve(move |_, _| answer("422 Unprocessable Entity", many.clone()));
+    let error = peer.control.announce(HUB, &options).await.expect_err("422");
+    assert_eq!(error.matched_speakers(), Some(51));
+
+    let speakers = json!({"not_speakers": "x", "detail": {"code": "not_a_speaker", "not_speakers": ["home-link"]}});
+    let peer = serve(move |_, _| answer("422 Unprocessable Entity", speakers.clone()));
+    let error = peer.control.announce(HUB, &options).await.expect_err("422");
+    assert_eq!(
+        error.not_speakers(),
+        vec!["home-link"],
+        "a wrong-typed top-level member is skipped too"
+    );
+}
+
+#[tokio::test]
 async fn reads_and_cancel_are_never_replayed_and_a_body_cannot_forge_it() {
     let peer = serve(|_, _| {
         let mut body = announcement("completed", Value::Null);

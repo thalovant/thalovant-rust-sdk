@@ -7,6 +7,28 @@ use thiserror::Error;
 
 use crate::intercom::problem_code;
 
+/// Whether `code` is one of the intercom problem codes that decide a refusal
+/// whatever the status (the two that need their own status, `hub_unreachable`
+/// and `not_cancellable`, are not here).
+fn is_intercom_code(code: &str) -> bool {
+    matches!(
+        code,
+        problem_code::DISABLED
+            | problem_code::UNAVAILABLE
+            | problem_code::DISABLED_PLATFORM
+            | problem_code::NOT_CONFIGURED
+            | problem_code::URGENT_SCOPE_REQUIRED
+            | problem_code::URGENT_BUSY
+            | problem_code::SKILL_NOT_INSTALLED
+            | problem_code::NOT_A_SPEAKER
+            | problem_code::RESERVED_NAME
+            | problem_code::HUB_LOCKED
+            | problem_code::IMPERSONATION_NOT_ALLOWED
+            | problem_code::TOO_MANY_TARGETS
+            | problem_code::MANAGED_CLIENT
+    )
+}
+
 pub type Result<T> = std::result::Result<T, ThalovantError>;
 
 /// What the API said when it refused a control-plane request: the whole error
@@ -211,7 +233,8 @@ pub enum ApiRefusal {
     ImpersonationNotAllowed,
     /// `all`, a room or a group resolved to more than 50 speakers: HTTP 422
     /// `too_many_targets`. [`ThalovantError::matched_speakers`] is how many.
-    /// Name a room or a group.
+    /// Naming that same room or group resolves to the same speakers: choose a
+    /// narrower target or name at most 50 speakers.
     TooManyTargets,
     /// The platform-managed Intercom client cannot be edited, paused, deleted,
     /// given credentials or named in an access policy: HTTP 403
@@ -391,8 +414,8 @@ pub enum ThalovantError {
     /// The announcement exists: `announcement` is the answer to the POST, with
     /// its id, so the caller can poll it later with
     /// [`ControlPlane::get_announcement`](crate::ControlPlane::get_announcement)
-    /// (a poll needs `intercom:read`; a token with only `intercom:send` is
-    /// refused at the first one) and knows it must not be sent again.
+    /// (a poll needs `intercom:read`, which `intercom:send` implies) and knows
+    /// it must not be sent again.
     /// `source` is why the poll failed. The accessors that read an API answer
     /// ([`ThalovantError::status_code`], [`ThalovantError::api_refusal`],
     /// [`ThalovantError::api_code`], [`ThalovantError::is_rate_limited`] ...)
@@ -693,7 +716,11 @@ impl ThalovantError {
         let detail = problem.and_then(ApiProblem::detail);
         match status_code {
             401 | 423 => Some(ApiRefusal::Auth),
-            403 if detail == Some("Insufficient scopes") => Some(ApiRefusal::Auth),
+            // A 403 that names an intercom code (`urgent_scope_required` is the
+            // one that is a refusal of scope) is that code's own refusal.
+            403 if detail == Some("Insufficient scopes") && !code.is_some_and(is_intercom_code) => {
+                Some(ApiRefusal::Auth)
+            }
             402 => Some(ApiRefusal::Plan),
             403 if code == Some("plan_limit") => Some(ApiRefusal::Plan),
             409 if code == Some("home_assistant_already_linked") => Some(ApiRefusal::AlreadyLinked),
@@ -759,13 +786,17 @@ impl ThalovantError {
 
     /// A member of the problem body, at its top first and then inside a
     /// `detail` that is itself an object (FastAPI's envelope).
-    fn problem_member(&self, key: &str) -> Option<&Value> {
+    ///
+    /// The first usable one wins: a top-level `null`, or a value of the wrong
+    /// type (`usable` says what the member must be), does not hide the member
+    /// inside `detail`.
+    fn problem_member(&self, key: &str, usable: fn(&Value) -> bool) -> Option<&Value> {
         let problem = self.api_problem()?;
         let nested = problem.get("detail").and_then(Value::as_object);
         [Some(problem.as_map()), nested]
             .into_iter()
             .flatten()
-            .find_map(|source| source.get(key))
+            .find_map(|source| source.get(key).filter(|value| usable(value)))
     }
 
     /// A non-empty string member of the problem, when this error is `kind`.
@@ -773,9 +804,10 @@ impl ThalovantError {
         if self.api_refusal() != Some(kind) {
             return None;
         }
-        self.problem_member(key)
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
+        self.problem_member(key, |value| {
+            value.as_str().is_some_and(|text| !text.is_empty())
+        })
+        .and_then(Value::as_str)
     }
 
     /// The non-empty strings of a list member of the problem, when this error
@@ -784,7 +816,7 @@ impl ThalovantError {
         if self.api_refusal() != Some(kind) {
             return Vec::new();
         }
-        self.problem_member(key)
+        self.problem_member(key, Value::is_array)
             .and_then(Value::as_array)
             .map(|items| {
                 items
@@ -852,7 +884,8 @@ impl ThalovantError {
         if self.api_refusal() != Some(ApiRefusal::TooManyTargets) {
             return None;
         }
-        self.problem_member("matched").and_then(Value::as_u64)
+        self.problem_member("matched", |value| value.as_u64().is_some())
+            .and_then(Value::as_u64)
     }
 
     /// The managed connections an access policy named, on an

@@ -171,15 +171,19 @@ impl ControlPlane {
     /// reported as failed. If the call ends without an answer, the outcome is
     /// unknown: call again with the **same** key to find out.
     ///
-    /// **`wait` needs `intercom:read` as well as `intercom:send`**: the polls
-    /// are [`get_announcement`](Self::get_announcement). A poll can fail after
-    /// the announcement was accepted (a token with only `intercom:send` is
-    /// refused at the first poll; a 429; the network). The error is then
-    /// [`ThalovantError::AnnouncementWaitFailed`], which carries the accepted
-    /// announcement and the poll's own error ([`ThalovantError::announcement`]);
-    /// the accessors for an API answer look through to it. Calling again with
-    /// the same `idempotency_key` replays the stored announcement instead of
-    /// speaking the text a second time; without a key it may speak it twice.
+    /// **`wait` polls with [`get_announcement`](Self::get_announcement)**
+    /// (`intercom:read`, which `intercom:send` implies, so no further scope is
+    /// needed). A poll can fail after the announcement was accepted (a 429; the
+    /// network). The error is then [`ThalovantError::AnnouncementWaitFailed`],
+    /// which carries the accepted announcement (the POST's own answer, whatever
+    /// later polls showed) and the poll's own error
+    /// ([`ThalovantError::announcement`]); the accessors for an API answer look
+    /// through to it. Create the `idempotency_key` before the first call and
+    /// keep it: calling again with that same key and `wait` false replays the
+    /// stored announcement, with its id, from the POST alone (no status read)
+    /// instead of speaking the text a second time; with `wait` true the repeat
+    /// call polls again and can fail the same way. A new key is a different
+    /// attempt and can speak twice, and without a key it may speak twice.
     /// `poll_interval` must be above zero, and `wait_timeout` must be a time
     /// the clock can reach; both are checked before the POST. The deadline
     /// bounds each poll, not only the sleep between polls, and no poll starts
@@ -237,12 +241,18 @@ impl ControlPlane {
             return Ok(announcement);
         }
         let deadline = tokio::time::Instant::now() + timeout;
+        // The POST's own answer: the accepted announcement an error carries,
+        // whatever later polls showed.
+        let accepted = announcement.clone();
         while announcement.is_sending() {
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 break;
             }
-            tokio::time::sleep_until((now + poll).min(deadline)).await;
+            // The interval is clamped to what is left before it is added to `now`:
+            // a huge `poll_interval` (`Duration::MAX`) must not overflow the clock
+            // after the announcement was accepted.
+            tokio::time::sleep_until(now + poll.min(deadline - now)).await;
             // With nothing left after the sleep, no read starts at all.
             if tokio::time::Instant::now() >= deadline {
                 break;
@@ -259,7 +269,7 @@ impl ControlPlane {
                 Ok(Err(source)) => {
                     // The announcement is accepted: its id is the caller's way back.
                     return Err(ThalovantError::AnnouncementWaitFailed {
-                        announcement: Box::new(announcement),
+                        announcement: Box::new(accepted),
                         source: Box::new(source),
                     });
                 }
@@ -287,8 +297,9 @@ impl ControlPlane {
     }
 
     /// Stop an urgent announcement that is still repeating
-    /// (`POST .../intercom/announcements/{id}/cancel`, `intercom:send`: owner or
-    /// admin of the hub; a hub-scoped token is honoured). Returns the
+    /// (`POST .../intercom/announcements/{id}/cancel`, `intercom:send`: the
+    /// hub's owner, a manager, a plain member of the tenant or an administrator;
+    /// a hub-scoped token is honoured). Returns the
     /// announcement with status `cancelled`.
     ///
     /// Only while it is `sending`: one that already completed, failed or was

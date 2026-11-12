@@ -585,7 +585,7 @@ pub struct AnnounceOptions {
     /// purpose you need a new key.
     pub idempotency_key: Option<String>,
     /// Poll a `sending` announcement until it completes. The polls need
-    /// `intercom:read` as well as `intercom:send`.
+    /// `intercom:read`, which `intercom:send` implies.
     pub wait: bool,
     /// The longest wait: `times * interval + 15 s` when `None`; a time the
     /// clock cannot reach is refused before the POST. The deadline bounds each
