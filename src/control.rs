@@ -1,6 +1,7 @@
 mod bridges;
 mod browser_login;
 mod hub_skills;
+mod intercom;
 pub use browser_login::{
     BrowserLoginOptions, BrowserOpener, BrowserPrompt, InteractiveLoginOptions, LoginMethod,
 };
@@ -2222,6 +2223,31 @@ impl ControlPlane {
     ) -> Result<Value> {
         let (status, body) = self.send_request(method, path, body, headers, auth).await?;
         answer_value(status, &body)
+    }
+
+    /// [`request`](Self::request), and whether the answer carried the response
+    /// header `Idempotency-Replayed: true` (any case; anything else is no).
+    async fn request_replayed(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: Option<HeaderMap>,
+        auth: bool,
+    ) -> Result<(Value, bool)> {
+        let response = self.send(method, path, body, headers, auth).await?;
+        let status = response.status();
+        let replayed = response
+            .headers()
+            .get("idempotency-replayed")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
+        let body = if status.is_success() {
+            response.text().await.map_err(unreachable)?
+        } else {
+            error_body(response).await
+        };
+        Ok((answer_value(status, &body)?, replayed))
     }
 
     /// An authenticated GET, and how long a refusal of it asked the caller to

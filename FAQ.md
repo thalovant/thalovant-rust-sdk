@@ -1,6 +1,45 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Browser sign-in questions after the final reference (39e31d8) and CodeRabbit on #90.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom final API: urgent scope, can_play, replayed, platform switch, timezone check.
 
 # FAQ
+
+## Is intercom a safety system, and why is there no `intercom()` method?
+It is announce-only text spoken by each speaker's own text-to-speech, and **not a certified safety system**: it does not replace smoke or CO alarms, medical alert devices or emergency services. The mesh already has an `intercom` frame, so the HTTP calls are `announce`, `get_announcement`, `list_announcements` and `*_intercom_*`. The API does not store the text (a keyed hash and the length only), and intercom does not record or store speech; while an alert sounds it only checks whether a reply is an acknowledgement.
+
+## Why did `announce` with `wait` fail after the announcement was accepted?
+`wait` polls `get_announcement` (`intercom:read`, which `intercom:send` implies); a poll can still fail on a 429 or the network. The error is `ThalovantError::AnnouncementWaitFailed`: `error.announcement()` is the accepted announcement (the POST's own answer, with its id), and `status_code()` and `api_refusal()` read the poll's own error. Create a fresh `idempotency_key` (`new_request_id()`) **before** the first call and keep that exact key (a new key is a different attempt and can announce twice), then call again with it and `wait` false: the POST replays the stored announcement, with its id, makes no status read and does not say it twice (with `wait` true the repeat call polls again and can fail the same way). If the first call had no key, poll `error.announcement()`'s id instead.
+
+## Why did my second announcement say nothing, and the result is the first one?
+The same `idempotency_key` replays the stored announcement (`Idempotency-Replayed: true`) for 24 hours and never sends again, whatever its status. You reused a key (or a constant like `"dinner"`). Use a fresh `new_request_id()` per announcement you mean to send; to send the same text again on purpose, use a new key.
+
+## `announce` failed with `ApiRefusal::HubUnreachable`. Can I send again with the same key?
+Not to send again: a replayed `failed` announcement stays `failed`. The hub may have spoken it, and a `failed` record is not proof that it did not. Read `get_announcement(hub_id, error.announcement_id().unwrap())`, weigh the risk of saying it twice, and use a new key only when you choose to send a second attempt.
+
+## How do I stop an urgent announcement that is repeating?
+`cancel_announcement(hub_id, announcement_id)` (`intercom:send`): status `cancelled`, `hub_confirmed == Some(false)` when the hub could not confirm. Only while `sending`, else `ApiRefusal::NotCancellable` (409). Other controls: the hub's switch, the platform kill switch, a speaker's `receive`, and somebody acknowledging by voice.
+
+## Why is `get_announcement(hub_id, "..")` refused?
+An id that is `.`, `..`, empty, or holds `/`, `?`, `#`, a backslash or a control character is refused (`ThalovantError::Api`) before any request: a dot segment would change the route.
+
+## Does `{:?}` on `AnnounceOptions` print the text?
+No. `Debug` prints `text: <N chars>`; the request still carries the text.
+
+## Why does an urgent `announce` fail with `ApiRefusal::UrgentScopeRequired`?
+`priority` urgent (and so every `repeat`) needs the scope `intercom:urgent` in addition to `intercom:send`. Nothing implies it. Nothing was spent: no rate token, no hub call. Sign in again with the scope (a paid plan), or send a normal announcement. `kind.is_auth()` is true for it.
+
+## Why is a Home Assistant link in the speaker list but `receive: Some(true)` fails with `ApiRefusal::NotASpeaker`?
+A connection that cannot play speech (`can_play` false: `home_assistant`, `developer` and `embedded` unless its owner declared `spec.intercom.can_play: true` on the connection) is listed so it can be greyed out, but it cannot receive and is never part of `all`, a room or a group.
+
+## What does `announcement.replayed` mean?
+The API answered with `Idempotency-Replayed: true`: this is the stored announcement for your key, nothing new was sent, whatever its status. Do not tell the person it was sent anew.
+
+## Why does everything fail with `ApiRefusal::IntercomDisabledPlatform`?
+Intercom ships dark: until the platform operator turns it on, `get_intercom_settings` reads `unavailable_reason: Some(Platform)` for every hub and every write and announcement is a 503 `intercom_disabled_platform`. Reads and `cancel_announcement` still work.
+
+## Why does a wrong timezone name only fail at the API?
+`update_intercom_speaker` checks the shape of `quiet_hours.timezone` (at most 64 characters, `Area/Location`, no padding), that an enabled window has one, and that `start != end`. This crate links no timezone database (chrono-tz would add seven crates and bake one tzdata release into the SDK, which then rejects zones the API already knows), so `Mars/Phobos` is the API's 422.
+
+## Why was nobody spoken to?
+A speaker is skipped unless its `receive` is true (`skipped_not_receiving`, even for urgent); a normal announcement is skipped inside quiet hours (`skipped_dnd`; urgent bypasses them); an offline speaker is `offline`. `ApiRefusal::IntercomDisabled` means the hub's switch is off; `ApiRefusal::IntercomUnavailable` means a kid or public hub. `delivered` is not "heard": there is no playback receipt.
 
 ## Sign-in
 

@@ -1,6 +1,24 @@
-Last Edit: Claude Opus 5.5 - 2026-11-08 - Motive: Final reference digest; item 11 is now a client-wide request timeout.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom final API: `replayed` and the caps are done; shared vectors and a timezone source are now the open items.
 
 # Suggestions
+
+## Scrub `input` and `ctx` from the problem on intercom calls
+
+- **Problem:** the problem keeps the whole API body; a regression in the API's error middleware would put the announcement text there (review L5).
+- **Proposal:** in `announce`, drop `input` and `ctx` from the problem.
+- **Impact:** low; defence in depth.
+
+## A timezone source for quiet hours
+
+- **Problem:** `valid_timezone` (`src/intercom.rs`) checks only the shape of a name, because `chrono-tz` would add seven crates and bake one tzdata release into the SDK (see `AUDIT.md`). `Mars/Phobos` is the API's 422.
+- **Proposal:** either an optional cargo feature `tz-names` that links `chrono-tz` for callers who want the local check, or a vector in the shared intercom vectors that fixes which names every SDK must refuse, so the ports agree without each linking a database.
+- **Impact:** low; the API stays authoritative either way.
+
+## Shared intercom vectors
+
+- **Problem:** `intercom` has no conformance vectors; the text rule (NFC, 1-280, `<` `>`, control/bidi/format/private-use), the do-not-disturb rule and the problem-code to refusal-kind mapping are proved by each SDK's own tests, on five different Unicode and timezone sources.
+- **Proposal:** an `intercom-vectors.json` in the Python reference (validation and error-kind cases), claimed by the capability.
+- **Impact:** low effort; one more file for every consumer.
 
 ## 1. Read a 429's wait from the error
 

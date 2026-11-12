@@ -290,6 +290,9 @@ macro_rules! open_enum {
     };
 }
 
+// Shared with the intercom models.
+pub(crate) use open_enum;
+
 open_enum! {
     /// Whether a bridge runs: `setup` until its first chats are chosen,
     /// then `active`.
