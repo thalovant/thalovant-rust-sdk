@@ -1,6 +1,18 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: CodeRabbit review of PR 91: a poll that fails after an accepted announcement now carries it.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom amendment 2: AnnounceOptions Debug redacted; open items (problem body, caps, replayed flag).
 
 # Audit
+
+## Intercom (0.18.0): `AnnounceOptions` derived `Debug` and printed the text (security review L4), now redacted
+
+`AnnounceOptions` (`src/intercom.rs`) derived `Debug`, so `{:?}`, `{:#?}`, `tracing`'s `#[instrument]` or an error chain that printed it carried `text`. `Debug` is now written by hand and prints `text: <N chars>` (`tests/intercom.rs`, `announce_options_debug_never_prints_the_text`); no error or `Display` of the SDK carries the text either (`no_error_or_display_carries_the_text`). `Clone`, `PartialEq` and `Eq` still see the text. `announce_body` returns a `serde_json::Value` that holds it, but it is `pub(crate)` and never formatted.
+
+## Intercom (0.18.0): `ThalovantError::ApiResponse` keeps the whole API body (review L5); rooms, groups and key length are unchecked (L6)
+
+The API strips `input` and `ctx` from `/intercom/` errors, so the text does not reach `api_problem()` today; a regression would. `announce` does not cap rooms and groups (the API caps them at 50) or check `idempotency_key` against 128 characters (the API answers 422). Not in contract section J; proposed in `SUGGESTIONS.md`.
+
+## Intercom (0.18.0): a replayed announcement is not marked as replayed
+
+The API answers a replay with `Idempotency-Replayed: true`; `Announcement` does not carry it, and Rust keeps no response headers beyond what `ThalovantError` reads (SUGGESTIONS #1 of this repo). The docs say what replay means (`README.md`, "Idempotency keys"). Proposed in `SUGGESTIONS.md`.
 
 ## Intercom (0.18.0): a poll that fails after the POST
 

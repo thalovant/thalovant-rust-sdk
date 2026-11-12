@@ -3,7 +3,7 @@
     "api-errors": {
       "implementation": {
         "src/control.rs": "89e11a1f2848e637d5d21be75d8e6a8c2cd41afea9bd8d76dee82cc07d0613c8",
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/lib.rs": "676ff1d5f9f462bc790bec2ef4c3e7676d3b1cd59764d73088acadb35ffa29a8",
         "src/redact.rs": "e84cc12f06c3def1be5475486aa6da53288710bb5ab245beccb60787dfa7d1b8"
       },
@@ -40,7 +40,7 @@
       "implementation": {
         "src/control.rs": "89e11a1f2848e637d5d21be75d8e6a8c2cd41afea9bd8d76dee82cc07d0613c8",
         "src/control/browser_login.rs": "7fba3fb43adfbdd4e4a44b8593fc1776aeccf07557529e0bf07569c7c6c01ab4",
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/lib.rs": "676ff1d5f9f462bc790bec2ef4c3e7676d3b1cd59764d73088acadb35ffa29a8",
         "src/loopback.rs": "f570f8cccaa331b57417f1434b1687005b95f9d9addedaf9b4c4b14074fd4fc7",
         "src/native_auth.rs": "f594a1bd07034e1787321b0cab60610c3c8330f8daa67baac5e26771a3414c51"
@@ -63,7 +63,7 @@
         "src/chat_apps.rs": "b079b399d98e3f91d6f6dd0109ba1da89502ec81d21430eaac5cd8cf5a551990",
         "src/control.rs": "89e11a1f2848e637d5d21be75d8e6a8c2cd41afea9bd8d76dee82cc07d0613c8",
         "src/control/bridges.rs": "07bb2ff6f8e53b1936b0d4bed03126ec4ee7dee7618b0794abb8e4969ba067b7",
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/lib.rs": "676ff1d5f9f462bc790bec2ef4c3e7676d3b1cd59764d73088acadb35ffa29a8"
       },
       "reason": "The owner routes under /v1/bridges are ControlPlane methods in src/control/bridges.rs (list_chat_app_connectors, get_bridge_networks, list_bridges, create_bridge, get_bridge, update_bridge, replace_bridge_token, replace_bridge_secrets, list_bridge_chats, send_bridge_test_message, get_bridge_avatar, delete_bridge), with the avatar read as bytes by request_bytes in src/control.rs. The models, open enums (an Other(String) variant keeps unknown values), request types and SecretValue (Debug prints <redacted>; no Display, Serialize or Deserialize; expose() is read only to build a request body) are in src/chat_apps.rs and re-exported from src/lib.rs. ApiProblem::fields and ThalovantError::api_fields in src/errors.rs read a refusal's fields, top-level or inside an object detail. tests/chat_apps.rs serves every route from a loopback HTTP peer and checks method, escaped path, query, exact body and If-Match only when an etag is set; parsing with unknown enum values and absent optional members; code, fields and the unchanged plan/auth classification of refusals; local refusals before any request; avatar bytes; and fake credentials absent from Debug, error Display/Debug and serialised output, with the missing traits checked at compile time.",
@@ -79,7 +79,7 @@
     "connection-admission": {
       "implementation": {
         "src/control.rs": "89e11a1f2848e637d5d21be75d8e6a8c2cd41afea9bd8d76dee82cc07d0613c8",
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/lib.rs": "676ff1d5f9f462bc790bec2ef4c3e7676d3b1cd59764d73088acadb35ffa29a8"
       },
       "reason": "wait_for_admission in src/control.rs polls GET /v1/operations/{id} (the OperationResource id, else the id at the end of links.self), every read bounded by the deadline: ready, no operation and 404 are admitted; failed and timed_out are ThalovantError::AdmissionFailed with the operation's error_code and no status; a 401 or 403 is returned as the ApiResponse it is (api_refusal says Auth); any other refusal of the wait is AdmissionFailed with no error_code, keeping status and problem; a 5xx is ridden out; a 429 waits the problem's retry_after_seconds (top level or inside a detail object), else the Retry-After header, else RateLimit-Reset (read from the response by get_with_retry_after, since ApiResponse keeps no headers), or the poll interval when longer, and one asking for longer than is left is AdmissionTimeout at once; the deadline is AdmissionTimeout, whose message ends 'it may still admit it later', for which is_timeout() and is_connection_error() in src/errors.rs are both true. An API out of reach is ApiUnreachable, returned as it is. An absolute links.self on another origin (scheme, host, port with default ports) than the API's is ThalovantError::Api and never fetched. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer with the case's headers, fills {api_host}/{api_port}, points 'unreachable' cases at a closed port, checks every request, requires every exchange to be used, and records through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
@@ -96,7 +96,7 @@
     "connection-kinds": {
       "implementation": {
         "src/control.rs": "89e11a1f2848e637d5d21be75d8e6a8c2cd41afea9bd8d76dee82cc07d0613c8",
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/lib.rs": "676ff1d5f9f462bc790bec2ef4c3e7676d3b1cd59764d73088acadb35ffa29a8"
       },
       "reason": "create_client_identity_of_type sends spec.connection_type and spec.version, deletes a client whose answer does not echo the kind (DELETE with If-Match: the answer's etag) and fails with ThalovantError::UnsupportedConnectionType, as it does for a 422 naming connection_type in its detail or code or in a validation error's loc or msg (under errors, or under detail when that is a list), never in the rest of the body, which echoes the request; get_client and delete_client (etag read first when none is given, one retry on 412, 404 is deleted) live in src/control.rs. Refusals are not retyped: an existing call still returns ThalovantError::ApiResponse, and ThalovantError::api_refusal() in src/errors.rs classifies Auth (401, 423, 403 Insufficient scopes), Plan (402, 403 plan_limit) and AlreadyLinked (409 home_assistant_already_linked, with linked_client_id() read from client_id/existing_client_id/connection_id, top level then nested detail). The runner asserts every refusal it classifies is still ApiResponse. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting.",
@@ -141,7 +141,7 @@
     "device-login": {
       "implementation": {
         "src/control.rs": "89e11a1f2848e637d5d21be75d8e6a8c2cd41afea9bd8d76dee82cc07d0613c8",
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/lib.rs": "676ff1d5f9f462bc790bec2ef4c3e7676d3b1cd59764d73088acadb35ffa29a8"
       },
       "reason": "begin_device_login (an empty scope list left out) and begin_device_login_as, which sends a registered app's client_id when given and leaves it out otherwise (login_with_browser_as for the whole flow; HOME_ASSISTANT_CLIENT_ID asserted equal to the vector file's home_assistant_client_id), describe_device_login (a signed-in GET /v1/auth/device/codes/{user_code}, percent-encoded, into the #[non_exhaustive] DeviceLoginRequest, client_verified only when the API says true and names the app), poll_device_login (one POST /v1/auth/device/token, returning the ApiToken or ThalovantError::DeviceLoginPending with the interval -- lengthened by five seconds for good per device code, kept in the control plane's private device_intervals -- DeviceLoginExpired or DeviceLoginDenied, each with the status and boxed problem) and revoke_api_token live in src/control.rs; revoking the token in use treats the API's 401 as revoked and forgets it, revoking again sends nothing until the next sign-in (a private flag every sign-in clears), and every sign-in sets token_id from its own answer; the variants and their status_code/api_problem answers in src/errors.rs. A 2xx without an access_token, or whose body is not a JSON object, is ThalovantError::Api with no status; any other failure goes through api_response_error(), which also fixes login_with_browser's poll dropping the status and body. Verification URLs go through browser_command's http(s)/host/no-credentials check, and every error is checked against message_excludes in Display and both Debug forms. HOME_ASSISTANT_SCOPES is asserted equal to the vector file's list. tests/home_link.rs serves each case's exchanges from a loopback HTTP peer, in order, through the real ControlPlane path, checks every request's method, path, body or body subset, If-Match and Authorization, requires every exchange to be used, and records what it produced through tests/common/mod.rs -- hashed beside it because it controls canonicalisation -- before asserting. login_with_browser_as now delegates to a private device_login, which interactive_login also calls with its injected opener; with no opener it opens the verification page exactly as before.",
@@ -200,16 +200,16 @@
     "intercom": {
       "status": "required",
       "implementation": {
-        "src/intercom.rs": "74be04be328e0687c95eecc2776fa5b7fbc9a3c0176dd01911421742f1fd57bf",
-        "src/control/intercom.rs": "d9860598a5882c9fd6b2ed804283278565297554973e9d29d6a45b21ff156321",
+        "src/intercom.rs": "35ba2ffbf9254b0e8b4cbe6e1f249ccf7738667b85b5544de20fa1b3032ca476",
+        "src/control/intercom.rs": "ed4648fe77f962cd18ff0e2f5a8189e49adc829099e681f2847f3a734abb62e7",
         "src/control.rs": "89e11a1f2848e637d5d21be75d8e6a8c2cd41afea9bd8d76dee82cc07d0613c8",
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/lib.rs": "676ff1d5f9f462bc790bec2ef4c3e7676d3b1cd59764d73088acadb35ffa29a8"
       },
       "tests": {
-        "tests/intercom.rs": "6ecc89d88550c6d19963009289590bfdd19a5a9ac368843536331a5c3d55baaf"
+        "tests/intercom.rs": "df5709855bfb057716a9002561a170695d3111c666f9db3eaf2b14cfa224238e"
       },
-      "reason": "src/control/intercom.rs adds every route under /v1/hubs/{hub_id}/intercom to ControlPlane: announce (the text trimmed to 1-280 characters counted as chars and free of control characters, IntercomTargets as an enum of exactly one of all, speakers (at most 50), rooms or groups, priority normal or urgent, repeat 1-10 times at 5-120 seconds for urgent only, an Idempotency-Key only when the caller sets one, and an optional wait, which needs intercom:read as well, that refuses a zero poll_interval and a wait_timeout the clock cannot reach before the POST, polls a sending announcement until it completes or wait_timeout passes (each poll is bounded by the time left, no poll starts once the deadline passed during the sleep, and the latest answer is returned), and reports a poll that fails after the POST as ThalovantError::AnnouncementWaitFailed, which carries the accepted announcement and the poll's error, the idempotency key being the retry), get_announcement, list_announcements with limit and cursor, list_intercom_speakers, update_intercom_speaker sending only the fields that are Some (room Some(None) sends null; an empty groups list clears them), get_intercom_settings and set_intercom_settings, with the hub, speaker and announcement ids percent-escaped as one path segment and blank ids refused locally as ThalovantError::Api; src/intercom.rs holds the models (open enums with an Other variant for announcement and delivery status, priority and unavailable_reason) and the request builders; src/errors.rs adds ApiRefusal::IntercomDisabled (code intercom_disabled), ApiRefusal::HubUnreachable (502 hub_unreachable) ThalovantError::AnnouncementWaitFailed (its status_code, api_refusal and the other API-answer accessors look through to the poll's error) and ThalovantError::is_rate_limited (429, kept out of ApiRefusal because an existing test pins a 429 as no refusal kind). Named announce and *_intercom_*, never a bare intercom: the mesh already has an intercom frame. tests/intercom.rs drives each route through a real loopback HTTP peer and proves the wire shape, the validation, the escaping, the polling (deadline, a stalled read, a failed poll) and the error kinds."
+      "reason": "src/control/intercom.rs adds every route under /v1/hubs/{hub_id}/intercom to ControlPlane: announce (the text trimmed to 1-280 characters counted as chars and free of control characters, IntercomTargets as an enum of exactly one of all, speakers (at most 50), rooms or groups, priority normal or urgent, repeat 1-10 times at 5-120 seconds for urgent only, an Idempotency-Key only when the caller sets one, and an optional wait, which needs intercom:read as well, that refuses a zero poll_interval and a wait_timeout the clock cannot reach before the POST, polls a sending announcement until it completes or wait_timeout passes (each poll is bounded by the time left, no poll starts once the deadline passed during the sleep, and the latest answer is returned), and reports a poll that fails after the POST as ThalovantError::AnnouncementWaitFailed, which carries the accepted announcement and the poll's error, the idempotency key being the retry), get_announcement, list_announcements with limit and cursor, list_intercom_speakers, update_intercom_speaker sending only the fields that are Some (room Some(None) sends null; an empty groups list clears them), get_intercom_settings and set_intercom_settings, with the hub, speaker and announcement ids percent-escaped as one path segment and blank ids refused locally as ThalovantError::Api; src/intercom.rs holds the models (open enums with an Other variant for announcement and delivery status, priority and unavailable_reason) and the request builders; src/errors.rs adds ApiRefusal::IntercomDisabled (code intercom_disabled), ApiRefusal::HubUnreachable (502 hub_unreachable) ThalovantError::AnnouncementWaitFailed (its status_code, api_refusal and the other API-answer accessors look through to the poll's error) and ThalovantError::is_rate_limited (429, kept out of ApiRefusal because an existing test pins a 429 as no refusal kind). Named announce and *_intercom_*, never a bare intercom: the mesh already has an intercom frame. tests/intercom.rs drives each route through a real loopback HTTP peer and proves the wire shape, the validation, the escaping, the polling (deadline, a stalled read, a failed poll) and the error kinds. Amendment 2 (client-side security review, contract section J): cancel_announcement (POST .../announcements/{id}/cancel, no body, intercom:send) returns the announcement, status Cancelled, and an optional hub_confirmed Option<bool> that is a real boolean or None (Some(false) when the hub could not confirm); a 409 not_cancellable is ApiRefusal::NotCancellable; the announcement status gains Cancelled; ThalovantError::announcement_id reads announcement_id from the problem (top or inside an object detail) on an ApiRefusal::HubUnreachable; the hub, speaker and announcement ids are refused locally with ThalovantError::Api, before any request, when empty or blank, a dot segment (. or ..), or holding /, ?, #, a backslash or a control character (valid_id), and are otherwise percent-encoded as one path segment; this SDK sets no request timeout, so the docs tell callers to wrap announce in a tokio timeout of at least 20 seconds; AnnounceOptions has a hand-written Debug that prints the text as <N chars>, and no SDK error or Display carries the text; README, QUICK_FACTS and FAQ use a fresh idempotency key (new_request_id or a UUID) per announcement and say that the same key replays the stored result (Idempotency-Replayed: true) and never re-sends, that a replayed failed announcement stays failed, that a deliberate second send needs a new key and that after a 502 hub_unreachable the announcement (announcement_id) is read first, and the wording says intercom does not record or store speech instead of nothing listens and names the real controls (platform kill switch, per-hub switch, cancel, voice acknowledgement); tests/intercom.rs proves each of these, with a doc guard against constant keys and over-promising phrases."
     },
     "inventory": {
       "implementation": {
@@ -227,7 +227,7 @@
     },
     "link-carriers": {
       "implementation": {
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/session.rs": "1d23d717a24c5dd84e443a2d6f71045748b3ff17cf3a290d81b6fd6a4b15c735",
         "src/transport.rs": "d75af98862231ea0b722641469d2fa678682c74b4d6ad5ddb07b6d159704a7f2"
       },
@@ -275,7 +275,7 @@
     },
     "refusal": {
       "implementation": {
-        "src/errors.rs": "da30f6341d752fe27e84d2a342b0e9fc5eecd7e8b4fabf7bd4cee9837450ad6d",
+        "src/errors.rs": "53b381b24abdbe77e65b523ae1327dac474eb2f2db4299639e93e19253536d32",
         "src/transport.rs": "d75af98862231ea0b722641469d2fa678682c74b4d6ad5ddb07b6d159704a7f2"
       },
       "reason": "refusal_belongs_to_ask() and failure_error() live in src/refusal.rs with their vector suite colocated, as this SDK's private unit suites are, so the module is recorded as test evidence beside the errors and transport it rests on; collect_ask_reply() in client.rs applies the rule with the transport's count of asks, queries and fire-and-forget utterances inside the shared grace window -- recorded once connected and immediately before the publish, and kept when the publish errors, since emit_bus over HTTP can fail after the hub holds the frame. ThalovantError gains Unanswered and PolicyDenied.quota, boxed so the enum every Result carries stays inside clippy's result_large_err limit.",
@@ -343,7 +343,8 @@
     "57c7e71f6456344877b34bb3093399f813c7a21fde3ae14f48c8b3fa04be43b9",
     "6dfb3bb31ac7590591febef1c4d8372984ca6cdad4700381f869db30c38452df",
     "690784dbb9af67d32523958808442d2b6ec5ea2f09ab881e56940b35333952a3",
-    "66bfb1ac58791122702bf56281a290a09da1ba3753596177827b4f99c194d960"
+    "66bfb1ac58791122702bf56281a290a09da1ba3753596177827b4f99c194d960",
+    "a82b669bc2cbc499fe92ea549d3ea2535132f94bf35be0383fe786efd0284f6f"
   ],
   "schema_version": 1
 }

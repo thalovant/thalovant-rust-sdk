@@ -1,6 +1,12 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: CodeRabbit review of PR 91: wait validation and deadline, accepted announcement kept on a poll error; digest 66bfb1ac5879.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom amendment 2 (contract section J): cancel, key replay docs, id validation, redacted Debug, wording; new Python digest.
 
 # Maintenance report
+
+## 2026-11-11: Intercom amendment 2 (client-side security review, contract section J)
+
+Added `ControlPlane::cancel_announcement` (`POST .../announcements/{id}/cancel`), `Announcement::hub_confirmed` (`Option<bool>`, tolerant deserialisation), `AnnouncementStatus::Cancelled`, `ApiRefusal::NotCancellable` (409 `not_cancellable`) and `ThalovantError::announcement_id()` for the 502 (`src/errors.rs`). `valid_id` (`src/intercom.rs`) refuses `.`, `..`, empty ids and ids holding `/`, `?`, `#`, a backslash or a control character before any request, for hub, client and announcement ids; `intercom_path` and `segment` (`src/control/intercom.rs`) use it (review L1). `AnnounceOptions` now has a hand-written `Debug` that prints `<N chars>` for the text (review L4). The SDK sets no request timeout, so the announce timeout item needs no code; the docs say to give a `tokio::time::timeout` at least 20 s (review M2). Docs: every example uses a fresh `new_request_id()` key; README, FAQ and QUICK_FACTS say that the same key replays the stored result and never re-sends, that a replayed `failed` stays `failed`, that a deliberate second send needs a new key, and to read the announcement after a 502 (review H3); the wording no longer says "nothing listens" or "stops every announcement at once" (J7). Tests (`tests/intercom.rs`): cancel route/body/scope/409, `hub_confirmed`, `announcement_id`, unsafe ids on every call, a replayed failed announcement, `Debug` under `{:?}`/`{:#?}` and nested, no error carrying the text, and a docs guard. Verification: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --all-features`, `scripts/check-sdk-parity.py --consumer thalovant-rust-sdk`. Not done (not in section J): L5, L6, a `replayed` field (`SUGGESTIONS.md`, `AUDIT.md`).
+
+Transparency Report: AI model Claude Sonnet 5.5; actions: implemented contract section J for the Rust SDK (code, tests, docs, parity record); oversight: none yet, review pending.
 
 ## 2026-11-11: intercom review fixes (CodeRabbit, PR 91; Python digest `66bfb1ac5879`)
 

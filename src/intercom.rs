@@ -2,12 +2,15 @@
 //!
 //! An announcement is a text of at most 280 characters, spoken by each chosen
 //! speaker's own text-to-speech. It is announce-only: there is no two-way
-//! audio and nothing listens. **It is not a certified safety system** and does
-//! not replace smoke or CO alarms, medical alert devices or emergency
-//! services.
+//! audio. Intercom does not record or store speech; while an urgent alert
+//! sounds, the hub only checks whether a reply is an acknowledgement. **It is
+//! not a certified safety system** and does not replace smoke or CO alarms,
+//! medical alert devices or emergency services.
 //!
-//! The platform never stores the text: the API keeps its SHA-256 and length,
-//! the targets, each speaker's result and the actor. The calls live on
+//! The API does not store the text: it keeps a keyed hash of it (HMAC-SHA256,
+//! server-side secret) and its length, the targets, each speaker's result and
+//! the actor. (The hub's own message bus and each speaker's text-to-speech are
+//! outside the platform's control.) The calls live on
 //! [`ControlPlane`](crate::ControlPlane), under `/v1/hubs/{hub_id}/intercom`:
 //!
 //! | Call | Route | Scope |
@@ -17,6 +20,7 @@
 //! | [`list_intercom_speakers`](crate::ControlPlane::list_intercom_speakers) | `GET .../speakers` | `intercom:read` |
 //! | [`update_intercom_speaker`](crate::ControlPlane::update_intercom_speaker) | `PATCH .../speakers/{client_id}` | `hubs:write` |
 //! | [`announce`](crate::ControlPlane::announce) | `POST .../announce` | `intercom:send` (and `intercom:read` too with `wait`) |
+//! | [`cancel_announcement`](crate::ControlPlane::cancel_announcement) | `POST .../announcements/{id}/cancel` | `intercom:send` |
 //! | [`get_announcement`](crate::ControlPlane::get_announcement) | `GET .../announcements/{id}` | `intercom:read` |
 //! | [`list_announcements`](crate::ControlPlane::list_announcements) | `GET .../announcements` | `intercom:read` |
 //!
@@ -28,13 +32,21 @@
 //! [`ApiRefusal::IntercomDisabled`](crate::ApiRefusal::IntercomDisabled) (the
 //! hub's switch is off, or it is a kid or public hub),
 //! [`ApiRefusal::HubUnreachable`](crate::ApiRefusal::HubUnreachable) (whether
-//! the text was spoken is not guaranteed: retry with the same
-//! `idempotency_key`),
+//! the text was spoken is not guaranteed: read the announcement named by
+//! [`announcement_id`](crate::ThalovantError::announcement_id) before sending
+//! again, and use a new key),
+//! [`ApiRefusal::NotCancellable`](crate::ApiRefusal::NotCancellable) (409),
 //! [`is_rate_limited`](crate::ThalovantError::is_rate_limited) and
 //! [`ApiRefusal::Plan`](crate::ApiRefusal::Plan) (HTTP 402, or 403
 //! `plan_limit`). With `wait`, a poll that fails after the announcement was
 //! accepted is [`ThalovantError::AnnouncementWaitFailed`](crate::ThalovantError::AnnouncementWaitFailed),
 //! which carries the accepted announcement.
+//!
+//! **Idempotency.** Set `idempotency_key` to a fresh unique key (a UUID) for
+//! each announcement you mean to send. The same key replays the stored answer
+//! (`Idempotency-Replayed: true`) and **never sends again**, whatever its
+//! status; a replayed `failed` announcement stays `failed`. To send the same
+//! text again on purpose, use a new key.
 //!
 //! Every status is an open enum: a value this release does not know is kept
 //! in `Other`.
@@ -89,6 +101,9 @@ open_enum! {
         Failed = "failed",
         /// An urgent announcement is still repeating: poll it.
         Sending = "sending",
+        /// Stopped with
+        /// [`cancel_announcement`](crate::ControlPlane::cancel_announcement).
+        Cancelled = "cancelled",
     }
 }
 
@@ -245,6 +260,27 @@ pub struct Announcement {
     /// The speaker that acknowledged an urgent announcement.
     #[serde(default)]
     pub acked_by: Option<String>,
+    /// Only on the answer to
+    /// [`cancel_announcement`](crate::ControlPlane::cancel_announcement):
+    /// `Some(false)` means the hub could not confirm the cancel (the record is
+    /// `cancelled` anyway), so speech already queued on the hub may still
+    /// play. `None` on every other answer, and when the API sent something
+    /// that is not a boolean.
+    #[serde(
+        default,
+        deserialize_with = "boolean_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hub_confirmed: Option<bool>,
+}
+
+/// A real boolean, or `None` for anything else: a malformed `hub_confirmed`
+/// must not fail the whole answer.
+fn boolean_or_none<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Value::deserialize(deserializer)?.as_bool())
 }
 
 fn normal_priority() -> IntercomPriority {
@@ -293,7 +329,11 @@ pub struct IntercomRepeat {
 }
 
 /// One announcement, for [`ControlPlane::announce`](crate::ControlPlane::announce).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` redacts the text: it prints `<N chars>`, never the characters, so
+/// `{:?}`, `{:#?}`, a `tracing` `#[instrument]` or a logged error chain does
+/// not carry what is spoken aloud in a home.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AnnounceOptions {
     /// 1 to 280 characters, trimmed, with no control characters. It is spoken
     /// aloud in a home.
@@ -306,7 +346,11 @@ pub struct AnnounceOptions {
     pub repeat: Option<IntercomRepeat>,
     /// A language tag such as `en-US`; `None` leaves it to the hub.
     pub lang: Option<String>,
-    /// Sent as `Idempotency-Key` when set; never generated.
+    /// Sent as `Idempotency-Key` when set; never generated. Use a fresh unique
+    /// key (a UUID) per announcement you mean to send: the same key replays
+    /// the stored result for 24 hours and never sends again, a replayed
+    /// `failed` announcement stays `failed`, and to send again on purpose you
+    /// need a new key.
     pub idempotency_key: Option<String>,
     /// Poll a `sending` announcement until it completes. The polls need
     /// `intercom:read` as well as `intercom:send`.
@@ -318,6 +362,28 @@ pub struct AnnounceOptions {
     pub wait_timeout: Option<Duration>,
     /// Time between polls: 2 s when `None`; zero is refused before the POST.
     pub poll_interval: Option<Duration>,
+}
+
+impl fmt::Debug for AnnounceOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct Redacted(usize);
+        impl fmt::Debug for Redacted {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "<{} chars>", self.0)
+            }
+        }
+        f.debug_struct("AnnounceOptions")
+            .field("text", &Redacted(self.text.chars().count()))
+            .field("targets", &self.targets)
+            .field("priority", &self.priority)
+            .field("repeat", &self.repeat)
+            .field("lang", &self.lang)
+            .field("idempotency_key", &self.idempotency_key)
+            .field("wait", &self.wait)
+            .field("wait_timeout", &self.wait_timeout)
+            .field("poll_interval", &self.poll_interval)
+            .finish()
+    }
 }
 
 impl AnnounceOptions {
@@ -372,6 +438,24 @@ fn non_blank(name: &str, value: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// An id (hub, client or announcement) fit to be one path segment, or an error
+/// before any request. Refused: an empty or blank one, `.` and `..` (dot
+/// segments, which a URL resolver collapses into another path), and any id
+/// holding `/`, `?`, `#`, a backslash or a control character.
+pub(crate) fn valid_id(name: &str, value: &str) -> ApiResult<()> {
+    non_blank(name, value)?;
+    if value == "."
+        || value == ".."
+        || value
+            .chars()
+            .any(|c| matches!(c, '/' | '?' | '#' | '\\') || c.is_control())
+    {
+        return Err(refuse(format!(
+            "{name} is not a valid id: it is a dot segment or holds '/', '?', '#', a backslash or a control character"
+        )));
+    }
+    Ok(())
+}
 /// The text as it is sent: trimmed, 1 to 280 characters, no control
 /// characters.
 pub fn announcement_text(text: &str) -> ApiResult<String> {

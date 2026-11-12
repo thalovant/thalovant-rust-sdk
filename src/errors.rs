@@ -158,9 +158,16 @@ pub enum ApiRefusal {
     /// The API could not reach the hub to speak: HTTP 502 with code
     /// `hub_unreachable`. Whether the text was spoken is not guaranteed either
     /// way: the hub may have spoken it and lost the answer. The API records
-    /// the attempt. To retry, reuse the same `idempotency_key` the announcement
-    /// was sent with, so a retry is not said a second time.
+    /// the attempt as a `failed` announcement and names it:
+    /// [`ThalovantError::announcement_id`]. Do not resend blindly: read that
+    /// announcement first. Reusing the same `idempotency_key` does not retry,
+    /// it replays the stored failed record and never sends again; to send the
+    /// text again on purpose, use a new key.
     HubUnreachable,
+    /// The announcement cannot be cancelled: HTTP 409 with code
+    /// `not_cancellable`. Only an announcement that is still `sending` can be;
+    /// one that completed, failed or was cancelled already cannot.
+    NotCancellable,
 }
 
 /// The numbers behind a refusal that is a spent allowance, not a policy.
@@ -579,7 +586,8 @@ impl ThalovantError {
     /// - [`ApiRefusal::AlreadyLinked`]: HTTP 409 with code
     ///   `home_assistant_already_linked`;
     /// - [`ApiRefusal::IntercomDisabled`]: code `intercom_disabled`;
-    /// - [`ApiRefusal::HubUnreachable`]: HTTP 502 with code `hub_unreachable`.
+    /// - [`ApiRefusal::HubUnreachable`]: HTTP 502 with code `hub_unreachable`;
+    /// - [`ApiRefusal::NotCancellable`]: HTTP 409 with code `not_cancellable`.
     ///
     /// A 429 is not a refusal kind of its own here; see
     /// [`ThalovantError::is_rate_limited`].
@@ -600,6 +608,7 @@ impl ThalovantError {
             409 if code == Some("home_assistant_already_linked") => Some(ApiRefusal::AlreadyLinked),
             _ if code == Some("intercom_disabled") => Some(ApiRefusal::IntercomDisabled),
             502 if code == Some("hub_unreachable") => Some(ApiRefusal::HubUnreachable),
+            409 if code == Some("not_cancellable") => Some(ApiRefusal::NotCancellable),
             _ => None,
         }
     }
@@ -633,6 +642,31 @@ impl ThalovantError {
                     .map(move |key| source.get(key))
             })
             .find_map(|value| value.and_then(Value::as_str).filter(|id| !id.is_empty()))
+    }
+
+    /// The announcement the API recorded for a failed attempt, on an
+    /// [`ApiRefusal::HubUnreachable`] refusal (502 `hub_unreachable`): read it
+    /// with [`ControlPlane::get_announcement`](crate::ControlPlane::get_announcement)
+    /// before sending again.
+    ///
+    /// Read from `announcement_id`, at the top of the problem first and then
+    /// inside a `detail` that is itself an object. `None` for every other
+    /// error, and when the answer names none.
+    pub fn announcement_id(&self) -> Option<&str> {
+        if self.api_refusal() != Some(ApiRefusal::HubUnreachable) {
+            return None;
+        }
+        let problem = self.api_problem()?;
+        let nested = problem.get("detail").and_then(Value::as_object);
+        [Some(problem.as_map()), nested]
+            .into_iter()
+            .flatten()
+            .find_map(|source| {
+                source
+                    .get("announcement_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+            })
     }
 
     /// Whether this is a timeout: [`ThalovantError::Timeout`], or

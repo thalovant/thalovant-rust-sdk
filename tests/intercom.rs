@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use thalovant::{
-    AnnounceOptions, AnnouncementListOptions, AnnouncementStatus, ApiRefusal, ControlPlane,
-    DeliveryStatus, IntercomDnd, IntercomPriority, IntercomQuietHours, IntercomRepeat,
-    IntercomSpeakerUpdate, IntercomTargets, ThalovantError,
+    AnnounceOptions, Announcement, AnnouncementListOptions, AnnouncementStatus, ApiRefusal,
+    ControlPlane, DeliveryStatus, IntercomDnd, IntercomPriority, IntercomQuietHours,
+    IntercomRepeat, IntercomSpeakerUpdate, IntercomTargets, ThalovantError,
 };
 
 const HUB: &str = "0f8a7c3e-2b1d-4c5e-9a6f-1d2c3b4a5e6f";
@@ -431,9 +431,9 @@ async fn get_and_list_announcements() {
 }
 
 #[tokio::test]
-async fn speakers_and_the_patch_sends_only_what_is_set_and_escapes_the_id() {
+async fn speakers_and_the_patch_sends_only_what_is_set() {
     let speaker = json!({
-        "client_id": "c/1", "slug": "kitchen", "name": "Kitchen", "online": true, "last_seen_at": null,
+        "client_id": "c-1", "slug": "kitchen", "name": "Kitchen", "online": true, "last_seen_at": null,
         "intercom": {"receive": true, "room": "kitchen", "groups": ["downstairs"],
                      "dnd": {"enabled": true, "quiet_hours": {"start": "22:00", "end": "07:00", "timezone": null}}}
     });
@@ -463,7 +463,7 @@ async fn speakers_and_the_patch_sends_only_what_is_set_and_escapes_the_id() {
     peer.control
         .update_intercom_speaker(
             HUB,
-            "c/1",
+            "c-1",
             &IntercomSpeakerUpdate {
                 receive: Some(true),
                 room: Some(None),
@@ -475,13 +475,13 @@ async fn speakers_and_the_patch_sends_only_what_is_set_and_escapes_the_id() {
     let request = peer.last();
     assert_eq!(
         line(&request),
-        format!("PATCH /v1/hubs/{HUB}/intercom/speakers/c%2F1 HTTP/1.1")
+        format!("PATCH /v1/hubs/{HUB}/intercom/speakers/c-1 HTTP/1.1")
     );
     assert_eq!(body(&request), json!({"receive": true, "room": null}));
     peer.control
         .update_intercom_speaker(
             HUB,
-            "c/1",
+            "c-1",
             &IntercomSpeakerUpdate {
                 dnd: Some(IntercomDnd {
                     enabled: true,
@@ -503,7 +503,7 @@ async fn speakers_and_the_patch_sends_only_what_is_set_and_escapes_the_id() {
 }
 
 #[tokio::test]
-async fn settings_and_an_id_is_escaped_as_one_path_segment() {
+async fn settings_and_an_id_is_one_percent_encoded_path_segment() {
     let peer = serve(|request, _| {
         if request.starts_with("PUT") {
             ok(json!({"enabled": true, "plan_allowed": true, "unavailable_reason": null}))
@@ -524,18 +524,30 @@ async fn settings_and_an_id_is_escaped_as_one_path_segment() {
     assert!(set.enabled && set.unavailable_reason.is_none());
     assert_eq!(body(&peer.last()), json!({"enabled": true}));
     peer.control
-        .get_intercom_settings("a/b?c")
+        .get_intercom_settings("a b%c")
         .await
-        .expect("escaped");
+        .expect("encoded");
     assert_eq!(
         line(&peer.last()),
-        "GET /v1/hubs/a%2Fb%3Fc/intercom/settings HTTP/1.1"
+        "GET /v1/hubs/a%20b%25c/intercom/settings HTTP/1.1"
     );
 }
 
 #[tokio::test]
 async fn errors_are_typed() {
     let cases: Vec<(&'static str, Value, Option<ApiRefusal>, bool)> = vec![
+        (
+            "409 Conflict",
+            json!({"code": "not_cancellable", "detail": "done"}),
+            Some(ApiRefusal::NotCancellable),
+            false,
+        ),
+        (
+            "409 Conflict",
+            json!({"code": "something_else", "detail": "no"}),
+            None,
+            false,
+        ),
         (
             "403 Forbidden",
             json!({"code": "intercom_disabled", "detail": "off"}),
@@ -738,4 +750,400 @@ async fn malformed_answers_are_errors() {
         .list_announcements(HUB, &AnnouncementListOptions::default())
         .await
         .is_err());
+}
+
+// --- Amendment 2: cancel, replay, ids, redaction, the 502 announcement id, doc rules ---------------------
+
+const UNSAFE_IDS: [&str; 16] = [
+    ".", "..", "", "   ", "a/b", "/", "a?b", "a#b", "a\\b", "a\u{0}b", "a\nb", "a\tb", "a\u{7f}b",
+    "a\u{85}b", "../x", "x/..",
+];
+
+#[tokio::test]
+async fn dot_segments_and_unsafe_ids_are_refused_before_any_request() {
+    let peer = serve(|_, _| ok(json!({})));
+    let c = &peer.control;
+    let all = || AnnounceOptions::new("hi", IntercomTargets::All);
+    let receive = IntercomSpeakerUpdate {
+        receive: Some(true),
+        ..Default::default()
+    };
+    for bad in UNSAFE_IDS {
+        let results = [
+            (
+                "get_intercom_settings",
+                c.get_intercom_settings(bad).await.err(),
+            ),
+            (
+                "set_intercom_settings",
+                c.set_intercom_settings(bad, true).await.err(),
+            ),
+            (
+                "list_intercom_speakers",
+                c.list_intercom_speakers(bad).await.err(),
+            ),
+            (
+                "update_intercom_speaker(hub)",
+                c.update_intercom_speaker(bad, "c1", &receive).await.err(),
+            ),
+            (
+                "update_intercom_speaker(client)",
+                c.update_intercom_speaker(HUB, bad, &receive).await.err(),
+            ),
+            ("announce", c.announce(bad, &all()).await.err()),
+            (
+                "get_announcement(hub)",
+                c.get_announcement(bad, ANN).await.err(),
+            ),
+            (
+                "get_announcement(announcement)",
+                c.get_announcement(HUB, bad).await.err(),
+            ),
+            (
+                "cancel_announcement(hub)",
+                c.cancel_announcement(bad, ANN).await.err(),
+            ),
+            (
+                "cancel_announcement(announcement)",
+                c.cancel_announcement(HUB, bad).await.err(),
+            ),
+            (
+                "list_announcements",
+                c.list_announcements(bad, &AnnouncementListOptions::default())
+                    .await
+                    .err(),
+            ),
+        ];
+        for (name, error) in results {
+            assert!(
+                matches!(error, Some(ThalovantError::Api(_))),
+                "{name}({bad:?}) = {error:?}"
+            );
+        }
+    }
+    assert!(peer.requests().is_empty(), "{:?}", peer.requests());
+}
+
+#[tokio::test]
+async fn ordinary_ids_pass_the_id_check() {
+    let peer = serve(|_, _| ok(announcement("completed", Value::Null)));
+    for good in [
+        HUB,
+        ANN,
+        "client-1",
+        "c_1",
+        "a.b",
+        "...",
+        "a..b",
+        ".hidden",
+        "name with space",
+    ] {
+        peer.control
+            .get_announcement(HUB, good)
+            .await
+            .unwrap_or_else(|error| panic!("{good:?} refused: {error}"));
+    }
+    assert_eq!(peer.requests().len(), 9);
+}
+
+#[tokio::test]
+async fn cancel_posts_to_the_cancel_route_and_reads_hub_confirmed() {
+    let mut cancelled = announcement("cancelled", Value::Null);
+    cancelled["priority"] = json!("urgent");
+    cancelled["hub_confirmed"] = json!(true);
+    let peer = serve(move |_, _| ok(cancelled.clone()));
+    let got = peer
+        .control
+        .cancel_announcement(HUB, ANN)
+        .await
+        .expect("cancel");
+    let request = peer.last();
+    assert_eq!(
+        line(&request),
+        format!("POST /v1/hubs/{HUB}/intercom/announcements/{ANN}/cancel HTTP/1.1")
+    );
+    assert_eq!(header(&request, "authorization"), Some("Bearer tok"));
+    assert!(
+        request.split_once("\r\n\r\n").expect("body").1.is_empty(),
+        "no body: the id in the path is all the API needs"
+    );
+    assert_eq!(got.status, AnnouncementStatus::Cancelled);
+    assert!(!got.is_sending());
+    assert_eq!(got.priority, IntercomPriority::Urgent);
+    assert_eq!(got.hub_confirmed, Some(true));
+    assert_eq!(
+        AnnouncementStatus::from("cancelled"),
+        AnnouncementStatus::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn hub_confirmed_is_a_real_boolean_or_none() {
+    for (sent, expected) in [
+        (json!(false), Some(false)),
+        (json!(true), Some(true)),
+        (json!("yes"), None),
+        (json!(1), None),
+        (Value::Null, None),
+    ] {
+        let mut cancelled = announcement("cancelled", Value::Null);
+        cancelled["hub_confirmed"] = sent.clone();
+        let peer = serve(move |_, _| ok(cancelled.clone()));
+        let got = peer
+            .control
+            .cancel_announcement(HUB, ANN)
+            .await
+            .expect("cancel");
+        assert_eq!(got.hub_confirmed, expected, "{sent}");
+    }
+}
+
+#[tokio::test]
+async fn hub_confirmed_is_optional_on_every_other_answer() {
+    let peer = serve(|_, _| ok(announcement("completed", Value::Null)));
+    let got = peer.control.get_announcement(HUB, ANN).await.expect("get");
+    assert_eq!(got.hub_confirmed, None);
+    let out = serde_json::to_value(&got).expect("serialise");
+    assert!(out.get("hub_confirmed").is_none(), "{out}");
+    let missing: Announcement =
+        serde_json::from_value(json!({"id": "a", "status": "cancelled"})).expect("minimal");
+    assert_eq!(missing.hub_confirmed, None);
+}
+
+#[tokio::test]
+async fn a_cancel_the_hub_could_not_confirm_is_still_a_cancelled_announcement() {
+    let mut cancelled = announcement("cancelled", Value::Null);
+    cancelled["hub_confirmed"] = json!(false);
+    let peer = serve(move |_, _| ok(cancelled.clone()));
+    let got = peer
+        .control
+        .cancel_announcement(HUB, ANN)
+        .await
+        .expect("cancel");
+    assert_eq!(got.status, AnnouncementStatus::Cancelled);
+    assert_eq!(got.hub_confirmed, Some(false));
+}
+
+#[tokio::test]
+async fn cancel_of_a_finished_announcement_is_a_typed_409() {
+    let peer = serve(|_, _| {
+        answer(
+            "409 Conflict",
+            json!({"code": "not_cancellable", "detail": "It already completed."}),
+        )
+    });
+    let error = peer
+        .control
+        .cancel_announcement(HUB, ANN)
+        .await
+        .expect_err("409");
+    assert_eq!(error.status_code(), Some(409));
+    assert_eq!(error.api_refusal(), Some(ApiRefusal::NotCancellable));
+    assert_eq!(error.api_code(), Some("not_cancellable"));
+    let scope = serve(|_, _| answer("403 Forbidden", json!({"detail": "Insufficient scopes"})));
+    let error = scope
+        .control
+        .cancel_announcement(HUB, ANN)
+        .await
+        .expect_err("403");
+    assert_eq!(error.api_refusal(), Some(ApiRefusal::Auth));
+}
+
+#[tokio::test]
+async fn a_502_names_the_announcement_the_api_recorded() {
+    for (problem, expected) in [
+        (
+            json!({"code": "hub_unreachable", "detail": "no hub", "announcement_id": ANN}),
+            Some(ANN),
+        ),
+        (
+            json!({"detail": {"code": "hub_unreachable", "detail": "no hub", "announcement_id": ANN}}),
+            Some(ANN),
+        ),
+        (json!({"code": "hub_unreachable", "detail": "no hub"}), None),
+        (
+            json!({"code": "hub_unreachable", "detail": "no hub", "announcement_id": 7}),
+            None,
+        ),
+        (
+            json!({"code": "hub_unreachable", "detail": "no hub", "announcement_id": ""}),
+            None,
+        ),
+    ] {
+        let reply = problem.clone();
+        let peer = serve(move |_, _| answer("502 Bad Gateway", reply.clone()));
+        let mut options = AnnounceOptions::new("hello", IntercomTargets::All);
+        options.idempotency_key = Some("k-1".into());
+        let error = peer.control.announce(HUB, &options).await.expect_err("502");
+        assert_eq!(error.status_code(), Some(502));
+        assert_eq!(error.api_refusal(), Some(ApiRefusal::HubUnreachable));
+        assert_eq!(error.announcement_id(), expected, "{problem}");
+    }
+    // Only a hub_unreachable refusal has one.
+    let other = serve(|_, _| {
+        answer(
+            "422 Unprocessable Entity",
+            json!({"code": "validation", "announcement_id": ANN}),
+        )
+    });
+    let error = other
+        .control
+        .announce(HUB, &AnnounceOptions::new("hello", IntercomTargets::All))
+        .await
+        .expect_err("422");
+    assert_eq!(error.announcement_id(), None);
+}
+
+#[tokio::test]
+async fn a_replayed_failed_announcement_stays_failed_and_the_key_is_sent_each_time() {
+    // The API replays the stored announcement for the same (hub, key) with
+    // `Idempotency-Replayed: true` and never sends again; the SDK neither
+    // fails nor retries behind the caller's back.
+    let peer = serve(|_, _| Answer {
+        status: "200 OK",
+        body: announcement("failed", Value::Null),
+        headers: vec![("Idempotency-Replayed", "true")],
+    });
+    let key = "11111111-1111-4111-8111-111111111111";
+    let mut options = AnnounceOptions::new("Dinner is ready", IntercomTargets::All);
+    options.idempotency_key = Some(key.into());
+    let first = peer.control.announce(HUB, &options).await.expect("first");
+    let again = peer.control.announce(HUB, &options).await.expect("again");
+    assert_eq!(first.status, AnnouncementStatus::Failed);
+    assert_eq!(again.status, AnnouncementStatus::Failed);
+    let requests = peer.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "nothing is retried behind the caller's back"
+    );
+    assert!(requests
+        .iter()
+        .all(|r| header(r, "idempotency-key") == Some(key)));
+}
+
+#[tokio::test]
+async fn announce_options_debug_never_prints_the_text() {
+    const SECRET: &str = "Take your pills at nine";
+    let mut options = AnnounceOptions::new(SECRET, IntercomTargets::Rooms(vec!["kitchen".into()]));
+    options.priority = Some(IntercomPriority::Urgent);
+    options.repeat = Some(IntercomRepeat {
+        times: 3,
+        interval_seconds: 20,
+    });
+    options.lang = Some("en-US".into());
+    options.idempotency_key = Some("k-1".into());
+    let nested = vec![Some(options.clone())];
+    let outputs = [
+        format!("{options:?}"),
+        format!("{options:#?}"),
+        format!("{:?}", Box::new(options.clone())),
+        format!("{nested:?}"),
+        format!("{nested:#?}"),
+        format!("{:?}", Some(&options)),
+    ];
+    for output in &outputs {
+        assert!(!output.contains(SECRET), "{output}");
+        assert!(!output.to_lowercase().contains("pills"), "{output}");
+        assert!(output.contains("<23 chars>"), "{output}");
+        assert!(
+            output.contains("kitchen") && output.contains("Urgent"),
+            "{output}"
+        );
+    }
+    // The characters are counted, not the bytes.
+    assert!(format!(
+        "{:?}",
+        AnnounceOptions::new("\u{1F600}\u{1F600}", IntercomTargets::All)
+    )
+    .contains("<2 chars>"));
+    // Equality and cloning still see the text; only the formatting hides it.
+    assert_eq!(options.clone(), options);
+    // The text still goes out in the request.
+    let peer = serve(|_, _| ok(announcement("completed", Value::Null)));
+    peer.control
+        .announce(HUB, &options)
+        .await
+        .expect("announce");
+    assert_eq!(body(&peer.last())["text"], SECRET);
+}
+
+#[tokio::test]
+async fn no_error_or_display_carries_the_text() {
+    const SECRET: &str = "Take your pills at nine";
+    let peer = serve(|_, _| {
+        answer(
+            "422 Unprocessable Entity",
+            json!({"code": "validation", "detail": "bad", "input": {"text": "x"}}),
+        )
+    });
+    let mut cases = vec![
+        AnnounceOptions::new(format!("{SECRET}\u{7}"), IntercomTargets::All),
+        AnnounceOptions::new(format!("{SECRET}{}", "x".repeat(300)), IntercomTargets::All),
+        AnnounceOptions::new(SECRET, IntercomTargets::Rooms(vec![])),
+    ];
+    let mut repeat = AnnounceOptions::new(SECRET, IntercomTargets::All);
+    repeat.repeat = Some(IntercomRepeat {
+        times: 2,
+        interval_seconds: 10,
+    });
+    cases.push(repeat);
+    let mut key = AnnounceOptions::new(SECRET, IntercomTargets::All);
+    key.idempotency_key = Some("bad\r\nkey".into());
+    cases.push(key);
+    cases.push(AnnounceOptions::new(SECRET, IntercomTargets::All)); // refused by the API
+    for options in &cases {
+        let error = peer
+            .control
+            .announce(HUB, options)
+            .await
+            .expect_err("refused");
+        for text in [
+            format!("{error}"),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            assert!(!text.contains(SECRET), "{text}");
+        }
+    }
+}
+
+#[test]
+fn docs_use_a_fresh_key_and_do_not_over_promise() {
+    // A fixed key replays the stored announcement for 24 hours and sends nothing: examples generate a fresh one.
+    let mut readme = String::new();
+    for name in ["README.md", "QUICK_FACTS.md", "FAQ.md"] {
+        let text = std::fs::read_to_string(name).unwrap_or_else(|error| panic!("{name}: {error}"));
+        for (number, line) in text.lines().enumerate() {
+            let compact: String = line.split_whitespace().collect();
+            assert!(
+                !compact.contains("idempotency_key=Some(\""),
+                "{name}:{} uses a constant idempotency key: {line}",
+                number + 1
+            );
+        }
+        let lowered = text.to_lowercase();
+        for phrase in [
+            "nothing listens",
+            "never listens",
+            "spoken once",
+            "stops every announcement at once",
+            "retry with the same",
+            "no two-way audio and nothing",
+        ] {
+            assert!(!lowered.contains(phrase), "{name} says {phrase:?}");
+        }
+        if name == "README.md" {
+            readme = lowered;
+        }
+    }
+    for word in [
+        "uuid",
+        "idempotency-replayed",
+        "cancel_announcement",
+        "new key",
+        "announcement_id",
+    ] {
+        assert!(readme.contains(word), "README.md does not mention {word:?}");
+    }
 }

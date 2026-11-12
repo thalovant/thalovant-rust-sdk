@@ -1,4 +1,4 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): wait scope after the PR 91 review.
+Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom amendment 2: cancel_announcement, key replay, ids, redacted Debug.
 
 # Quick facts: thalovant (Rust SDK)
 
@@ -47,7 +47,7 @@ Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom (0.18.0): wait scop
 
 ## Intercom (`src/intercom.rs`, `src/control/intercom.rs`; 0.18.0; scopes `intercom:read`, `intercom:send`, `hubs:write`)
 
-Announce-only text spoken aloud on a hub's speakers. Not a certified safety system; the platform never stores the text. Named `announce` / `*_intercom_*`: the mesh already has an `intercom` frame.
+Announce-only text spoken aloud on a hub's speakers. Not a certified safety system; the API does not store the text (keyed hash and length only). Named `announce` / `*_intercom_*`: the mesh already has an `intercom` frame.
 
 | Call | Route | Returns |
 | :-- | :-- | :-- |
@@ -57,10 +57,12 @@ Announce-only text spoken aloud on a hub's speakers. Not a certified safety syst
 | `update_intercom_speaker(hub_id, client_id, &IntercomSpeakerUpdate)` | `PATCH /v1/hubs/{id}/intercom/speakers/{client_id}` | `IntercomSpeaker` |
 | `announce(hub_id, &AnnounceOptions)` | `POST /v1/hubs/{id}/intercom/announce` | `Announcement` |
 | `get_announcement(hub_id, id)` | `GET /v1/hubs/{id}/intercom/announcements/{id}` | `Announcement` |
+| `cancel_announcement(hub_id, id)` | `POST /v1/hubs/{id}/intercom/announcements/{id}/cancel` (`intercom:send`; 409 `not_cancellable`) | `Announcement` (`status` `Cancelled`, optional `hub_confirmed: Option<bool>`) |
 | `list_announcements(hub_id, &AnnouncementListOptions)` | `GET /v1/hubs/{id}/intercom/announcements` | `AnnouncementList` |
 
-- Errors (`src/errors.rs`): `ApiRefusal::IntercomDisabled`, `ApiRefusal::HubUnreachable` (502; the text may or may not have been spoken: retry with the same `idempotency_key`), `ThalovantError::is_rate_limited()`; `ApiRefusal::Plan` is HTTP 402 or 403 `plan_limit`.
+- Errors (`src/errors.rs`): `ApiRefusal::IntercomDisabled`, `ApiRefusal::HubUnreachable` (502; the text may or may not have been spoken; `ThalovantError::announcement_id()` names the `failed` record: read it before sending again, and use a new key), `ApiRefusal::NotCancellable` (409), `ThalovantError::is_rate_limited()`; `ApiRefusal::Plan` is HTTP 402 or 403 `plan_limit`.
 - `announce` with `wait` also needs `intercom:read` (it polls `get_announcement`); a poll that fails after the POST is `ThalovantError::AnnouncementWaitFailed` (`announcement()` is the accepted announcement).
+- Idempotency: one fresh key per announcement (`new_request_id()` or a UUID); the same key replays the stored result (`Idempotency-Replayed: true`) and never re-sends (a replayed `failed` stays `failed`). Ids (hub, client, announcement) that are `.`, `..`, empty or hold `/ ? #`, a backslash or a control character are refused before any request (`valid_id`, `src/intercom.rs`). `AnnounceOptions` `Debug` redacts the text (`<N chars>`). No request timeout is set by the SDK.
 
 ## Chat apps (`/v1/bridges`)
 

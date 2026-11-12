@@ -4,17 +4,16 @@
 
 use super::*;
 use crate::intercom::{
-    announce_body, speaker_update_body, AnnounceOptions, Announcement, AnnouncementList,
+    announce_body, speaker_update_body, valid_id, AnnounceOptions, Announcement, AnnouncementList,
     AnnouncementListOptions, IntercomRepeat, IntercomSettings, IntercomSpeaker,
     IntercomSpeakerList, IntercomSpeakerUpdate,
 };
 
-/// The escaped path under a hub's intercom routes. A blank id is refused
-/// before anything is sent.
+/// The escaped path under a hub's intercom routes. An invalid id (blank, a dot
+/// segment, or holding `/`, `?`, `#`, a backslash or a control character) is
+/// refused before anything is sent.
 fn intercom_path(hub_id: &str, route: &str) -> Result<String> {
-    if hub_id.trim().is_empty() {
-        return Err(ThalovantError::Api("hub_id is required".into()));
-    }
+    valid_id("hub_id", hub_id)?;
     Ok(format!(
         "/v1/hubs/{}/intercom{route}",
         urlencoding::encode(hub_id)
@@ -22,9 +21,7 @@ fn intercom_path(hub_id: &str, route: &str) -> Result<String> {
 }
 
 fn segment(name: &str, value: &str) -> Result<String> {
-    if value.trim().is_empty() {
-        return Err(ThalovantError::Api(format!("{name} is required")));
-    }
+    valid_id(name, value)?;
     Ok(urlencoding::encode(value).into_owned())
 }
 
@@ -98,15 +95,34 @@ impl ControlPlane {
     }
 
     /// Say `options.text` aloud on a hub's speakers
-    /// (`POST .../intercom/announce`, `intercom:send`). The platform keeps only
-    /// the text's hash and length. Not a certified safety system.
+    /// (`POST .../intercom/announce`, `intercom:send`). The API keeps only a
+    /// keyed hash of the text and its length. Not a certified safety system.
     ///
     /// A normal announcement waits up to ten seconds for the hub and returns
     /// its result. An urgent one with `repeat` returns at once as `sending`;
     /// set `wait` to poll [`get_announcement`](Self::get_announcement) until it
     /// completes, or until `wait_timeout` passes (the latest answer is
-    /// returned, still `sending`). Keep an `idempotency_key` to retry after an
-    /// uncertain outcome without speaking twice.
+    /// returned, still `sending`).
+    ///
+    /// **Idempotency.** Set `idempotency_key` to a fresh unique key (a UUID)
+    /// for each announcement you mean to send, and reuse it only to repeat the
+    /// *same* attempt after a network drop or timeout. The key is scoped to the
+    /// hub and lasts 24 hours: the same key replays the stored announcement
+    /// (the response header `Idempotency-Replayed: true`) and **never sends
+    /// again**, whatever its status; a replayed `failed` announcement stays
+    /// `failed`. To send the same text again on purpose, use a **new** key.
+    /// After [`ApiRefusal::HubUnreachable`](crate::ApiRefusal::HubUnreachable)
+    /// (502 `hub_unreachable`) read the announcement first
+    /// ([`ThalovantError::announcement_id`], then
+    /// [`get_announcement`](Self::get_announcement)) before sending again: the
+    /// hub may have spoken it. A constant key such as `"dinner"` would silence
+    /// every later announcement for 24 hours.
+    ///
+    /// **Timeout.** The API waits up to ten seconds for the hub. This SDK sets
+    /// no request timeout of its own: wrap the call in a `tokio::time::timeout`
+    /// of at least twenty seconds, never less, or a spoken announcement can be
+    /// reported as failed. If the call ends without an answer, the outcome is
+    /// unknown: call again with the **same** key to find out.
     ///
     /// **`wait` needs `intercom:read` as well as `intercom:send`**: the polls
     /// are [`get_announcement`](Self::get_announcement). A poll can fail after
@@ -114,8 +130,9 @@ impl ControlPlane {
     /// refused at the first poll; a 429; the network). The error is then
     /// [`ThalovantError::AnnouncementWaitFailed`], which carries the accepted
     /// announcement and the poll's own error ([`ThalovantError::announcement`]);
-    /// the accessors for an API answer look through to it. A retry still needs
-    /// the same `idempotency_key`, or it may speak the text a second time.
+    /// the accessors for an API answer look through to it. Calling again with
+    /// the same `idempotency_key` replays the stored announcement instead of
+    /// speaking the text a second time; without a key it may speak it twice.
     /// `poll_interval` must be above zero, and `wait_timeout` must be a time
     /// the clock can reach; both are checked before the POST. The deadline
     /// bounds each poll, not only the sleep between polls, and no poll starts
@@ -203,6 +220,34 @@ impl ControlPlane {
         );
         let value = self
             .request("GET", &intercom_path(hub_id, &route)?, None, None, true)
+            .await?;
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Stop an urgent announcement that is still repeating
+    /// (`POST .../intercom/announcements/{id}/cancel`, `intercom:send`: owner or
+    /// admin of the hub; a hub-scoped token is honoured). Returns the
+    /// announcement with status `cancelled`.
+    ///
+    /// Only while it is `sending`: one that already completed, failed or was
+    /// cancelled is [`ApiRefusal::NotCancellable`](crate::ApiRefusal::NotCancellable)
+    /// (409 `not_cancellable`). The API asks the hub to stop repeating; a hub
+    /// that cannot confirm still leaves the record `cancelled` and the answer
+    /// has `hub_confirmed == Some(false)`: then speech already queued on the
+    /// hub may still play, and the hub's own stop paths (the hub switch, the
+    /// platform kill switch, somebody acknowledging) remain. Not a certified
+    /// safety system.
+    pub async fn cancel_announcement(
+        &self,
+        hub_id: &str,
+        announcement_id: &str,
+    ) -> Result<Announcement> {
+        let route = format!(
+            "/announcements/{}/cancel",
+            segment("announcement_id", announcement_id)?
+        );
+        let value = self
+            .request("POST", &intercom_path(hub_id, &route)?, None, None, true)
             .await?;
         Ok(serde_json::from_value(value)?)
     }
