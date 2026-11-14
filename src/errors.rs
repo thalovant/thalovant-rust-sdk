@@ -29,6 +29,35 @@ fn is_intercom_code(code: &str) -> bool {
     )
 }
 
+/// The `code` of every refusal the connection routes gained with home links
+/// and home bridges. Read [`ThalovantError::api_code`] first; the kind of each
+/// is [`ApiRefusal`]'s. A code not listed is an ordinary API error.
+pub mod connection_problem_code {
+    /// 422: no link on this hub; `reason` is `hub_operated_by_another_account`.
+    pub const CONNECTION_TYPE_UNAVAILABLE: &str = "connection_type_unavailable";
+    /// 422: the kind is not one the API creates; `known` lists the ones it does.
+    pub const CONNECTION_TYPE_UNKNOWN: &str = "connection_type_unknown";
+    /// 422: `connection_type` and `connectionType` were both sent and differ.
+    pub const CONNECTION_TYPE_AMBIGUOUS: &str = "connection_type_ambiguous";
+    /// 422: the connector list is empty, repeated or names an id it may not serve.
+    pub const CONNECTORS_INVALID: &str = "connectors_invalid";
+    /// 403: only the owner, from their own session, adds a device beside a link.
+    pub const DEVICE_OWNER_ONLY: &str = "device_owner_only_beside_home_link";
+    /// 403: the same, for a device's setup session.
+    pub const SETUP_SESSION_OWNER_ONLY: &str = "setup_session_owner_only_beside_home_link";
+    /// 403: the same, for downloading a device's identity.
+    pub const DEVICE_IDENTITY_OWNER_ONLY: &str = "device_identity_owner_only_beside_home_link";
+    /// 409: a hub with links does not scale out.
+    pub const HUB_SCALE_OUT_BREAKS_LINKS: &str = "hub_scale_out_breaks_links";
+    /// 409: the `Idempotency-Key` made something that was since removed.
+    pub const IDEMPOTENCY_KEY_SPENT: &str = "idempotency_key_spent";
+    /// 422: the setting is for a private hub only.
+    pub const SKILL_CONFIG_PRIVATE_HUB_ONLY: &str = "skill_config_private_hub_only";
+    /// Not an error code: the `replay.code` of a connection answered from an
+    /// earlier request with the same key.
+    pub const IDEMPOTENT_REPLAY: &str = "idempotent_replay";
+}
+
 pub type Result<T> = std::result::Result<T, ThalovantError>;
 
 /// What the API said when it refused a control-plane request: the whole error
@@ -257,6 +286,36 @@ pub enum ApiRefusal {
     /// [`ThalovantError::announcement_status`] is its current status: refresh
     /// the result instead of showing an error.
     NotCancellable,
+    /// No link can be made on this hub: HTTP 422 `connection_type_unavailable`.
+    /// [`ThalovantError::connection_unavailable_reason`] is
+    /// `hub_operated_by_another_account` when a hub another customer runs was
+    /// chosen. A link (`home_assistant` or `connector`) is made only on the
+    /// caller's own hub or one Thalovant runs; devices are not affected. When
+    /// it came from [`ControlPlane::create_client_identity_of_type`](crate::ControlPlane::create_client_identity_of_type)
+    /// the error is [`ThalovantError::UnsupportedConnectionType`], as before.
+    ConnectionTypeUnavailable,
+    /// A home bridge's `spec.connectors` was refused: HTTP 422
+    /// `connectors_invalid`. [`ThalovantError::connectors_invalid_reason`] is
+    /// `duplicate`, `own_kind` or `unknown_or_malformed`;
+    /// [`ThalovantError::connectors_known`] lists the ids a bridge may serve.
+    ConnectorsInvalid,
+    /// A device was added beside a home link by anybody but the account
+    /// owner: HTTP 403 `device_owner_only_beside_home_link`,
+    /// `setup_session_owner_only_beside_home_link` or
+    /// `device_identity_owner_only_beside_home_link`.
+    /// [`ThalovantError::link_client_id`] names the link.
+    OwnerOnlyBesideLink,
+    /// A change would scale a hub out while it carries links: HTTP 409
+    /// `hub_scale_out_breaks_links`. [`ThalovantError::hub_links`] counts
+    /// them. Remove the links first; there is no override.
+    HubScaleOutBreaksLinks,
+    /// An `Idempotency-Key` made something that was since removed: HTTP 409
+    /// `idempotency_key_spent`. Send the request again with a new key.
+    IdempotencyKeySpent,
+    /// A setting is for a private hub only: HTTP 422
+    /// `skill_config_private_hub_only`. [`ThalovantError::private_hub_settings`]
+    /// names them.
+    PrivateHubOnly,
 }
 
 impl ApiRefusal {
@@ -540,6 +599,24 @@ pub enum ThalovantError {
         /// The body of a refusal, when it was a JSON object.
         problem: Option<Box<ApiProblem>>,
     },
+    /// A connection create was answered from an earlier request with the same
+    /// `Idempotency-Key` (the response header `Idempotent-Replayed: true`, or
+    /// a `replay` object with code `idempotent_replay`).
+    ///
+    /// The connection exists, but its credentials were in the first answer
+    /// only: the platform does not store them, so a replay carries none, and
+    /// the SDK never hands back an identity it generated itself. `client` is
+    /// the replayed resource with every credential removed
+    /// ([`ThalovantError::replayed_client`], [`ThalovantError::replayed_client_id`]).
+    /// Download the identity from the owner's own session, or delete the
+    /// connection and create it again with a new key.
+    #[error(
+        "credentials not replayed: this create was answered from an earlier request with the same Idempotency-Key; the connection exists, but its credentials were in the first answer only"
+    )]
+    CredentialsNotReplayed {
+        /// The replayed connection, without credentials.
+        client: Box<Value>,
+    },
     /// A hub did not admit a new connection within the wait.
     ///
     /// Both a connection error and a timeout ([`ThalovantError::is_connection_error`]
@@ -701,7 +778,12 @@ impl ThalovantError {
     ///   `intercom_urgent_busy`, `skill_not_installed`, `not_a_speaker`,
     ///   `reserved_name`, `hub_locked`, `impersonation_not_allowed`,
     ///   `too_many_targets` and `managed_client` (the constants are in
-    ///   [`crate::intercom::problem_code`]).
+    ///   [`crate::intercom::problem_code`]);
+    /// - the connection refusals, by status and code (the constants are in
+    ///   [`connection_problem_code`]): 422 `connection_type_unavailable`,
+    ///   422 `connectors_invalid`, 403 `device_owner_only_beside_home_link`
+    ///   (and its two siblings), 409 `hub_scale_out_breaks_links`, 409
+    ///   `idempotency_key_spent` and 422 `skill_config_private_hub_only`.
     ///
     /// A 429 is otherwise not a refusal kind of its own here; see
     /// [`ThalovantError::is_rate_limited`].
@@ -749,6 +831,32 @@ impl ThalovantError {
             _ if code == Some(problem_code::MANAGED_CLIENT) => Some(ApiRefusal::ManagedClient),
             502 if code == Some(problem_code::HUB_UNREACHABLE) => Some(ApiRefusal::HubUnreachable),
             409 if code == Some(problem_code::NOT_CANCELLABLE) => Some(ApiRefusal::NotCancellable),
+            422 if code == Some(connection_problem_code::CONNECTION_TYPE_UNAVAILABLE) => {
+                Some(ApiRefusal::ConnectionTypeUnavailable)
+            }
+            422 if code == Some(connection_problem_code::CONNECTORS_INVALID) => {
+                Some(ApiRefusal::ConnectorsInvalid)
+            }
+            403 if matches!(
+                code,
+                Some(
+                    connection_problem_code::DEVICE_OWNER_ONLY
+                        | connection_problem_code::SETUP_SESSION_OWNER_ONLY
+                        | connection_problem_code::DEVICE_IDENTITY_OWNER_ONLY
+                )
+            ) =>
+            {
+                Some(ApiRefusal::OwnerOnlyBesideLink)
+            }
+            409 if code == Some(connection_problem_code::HUB_SCALE_OUT_BREAKS_LINKS) => {
+                Some(ApiRefusal::HubScaleOutBreaksLinks)
+            }
+            409 if code == Some(connection_problem_code::IDEMPOTENCY_KEY_SPENT) => {
+                Some(ApiRefusal::IdempotencyKeySpent)
+            }
+            422 if code == Some(connection_problem_code::SKILL_CONFIG_PRIVATE_HUB_ONLY) => {
+                Some(ApiRefusal::PrivateHubOnly)
+            }
             _ => None,
         }
     }
@@ -893,6 +1001,69 @@ impl ThalovantError {
     /// for a managed-client refusal that was not about a policy.
     pub fn refused_client_refs(&self) -> Vec<&str> {
         self.problem_texts(ApiRefusal::ManagedClient, "refused_client_refs")
+    }
+
+    /// Why no link can be made on the hub (`hub_operated_by_another_account`,
+    /// an open value), on an [`ApiRefusal::ConnectionTypeUnavailable`]
+    /// refusal. `None` for every other error, and when the answer names none.
+    pub fn connection_unavailable_reason(&self) -> Option<&str> {
+        self.problem_text(ApiRefusal::ConnectionTypeUnavailable, "reason")
+    }
+
+    /// Why a connector list was refused (`duplicate`, `own_kind` or
+    /// `unknown_or_malformed`, an open value), on an
+    /// [`ApiRefusal::ConnectorsInvalid`] refusal. `None` otherwise.
+    pub fn connectors_invalid_reason(&self) -> Option<&str> {
+        self.problem_text(ApiRefusal::ConnectorsInvalid, "reason")
+    }
+
+    /// The connector ids a home bridge may serve, on an
+    /// [`ApiRefusal::ConnectorsInvalid`] refusal; empty for every other error.
+    pub fn connectors_known(&self) -> Vec<&str> {
+        self.problem_texts(ApiRefusal::ConnectorsInvalid, "known")
+    }
+
+    /// The link that closes a device to everybody but the owner, on an
+    /// [`ApiRefusal::OwnerOnlyBesideLink`] refusal. `None` for every other
+    /// error, and when the answer names none.
+    pub fn link_client_id(&self) -> Option<&str> {
+        self.problem_text(ApiRefusal::OwnerOnlyBesideLink, "link_client_id")
+    }
+
+    /// How many links the hub carries, on an
+    /// [`ApiRefusal::HubScaleOutBreaksLinks`] refusal. `None` for every other
+    /// error, and when the member is not a whole number.
+    pub fn hub_links(&self) -> Option<u64> {
+        if self.api_refusal() != Some(ApiRefusal::HubScaleOutBreaksLinks) {
+            return None;
+        }
+        self.problem_member("links", |value| value.as_u64().is_some())
+            .and_then(Value::as_u64)
+    }
+
+    /// The settings refused for a public hub, by name, on an
+    /// [`ApiRefusal::PrivateHubOnly`] refusal; empty for every other error.
+    pub fn private_hub_settings(&self) -> Vec<&str> {
+        self.problem_texts(ApiRefusal::PrivateHubOnly, "settings")
+    }
+
+    /// The connection a create that was answered from an earlier request with
+    /// the same `Idempotency-Key` refers to, on
+    /// [`ThalovantError::CredentialsNotReplayed`]: the replayed resource
+    /// without any credential. `None` for every other error.
+    pub fn replayed_client(&self) -> Option<&Value> {
+        match self {
+            Self::CredentialsNotReplayed { client } => Some(client),
+            _ => None,
+        }
+    }
+
+    /// The id of [`ThalovantError::replayed_client`]'s connection.
+    pub fn replayed_client_id(&self) -> Option<&str> {
+        self.replayed_client()?
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
     }
 
     /// Whether this is a timeout: [`ThalovantError::Timeout`], or

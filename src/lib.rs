@@ -51,11 +51,11 @@ pub use control::{
     DeviceLoginOptions, DeviceLoginRequest, DevicePrompt, HubSkillWaitOptions,
     InteractiveLoginOptions, LoginMethod, LoginOptions, MarketplaceSkillsOptions,
     MemoryListOptions, OperationResource, OperationStatus, ReleaseOptions, SkillInstallOptions,
-    CONNECTION_TYPE_HOME_ASSISTANT, DEFAULT_ADMISSION_TIMEOUT, DEFAULT_CONTROL_API_URL,
-    DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_OPERATION_POLL_INTERVAL, DEFAULT_SKILL_SOURCE_TYPE,
-    HOME_ASSISTANT_CLIENT_ID, HOME_ASSISTANT_SCOPES,
+    CONNECTION_TYPE_CONNECTOR, CONNECTION_TYPE_HOME_ASSISTANT, DEFAULT_ADMISSION_TIMEOUT,
+    DEFAULT_CONTROL_API_URL, DEFAULT_DEVICE_POLL_INTERVAL, DEFAULT_OPERATION_POLL_INTERVAL,
+    DEFAULT_SKILL_SOURCE_TYPE, HOME_ASSISTANT_CLIENT_ID, HOME_ASSISTANT_SCOPES,
 };
-pub use errors::{ApiProblem, ApiRefusal, Result, ThalovantError};
+pub use errors::{connection_problem_code, ApiProblem, ApiRefusal, Result, ThalovantError};
 pub use events::{
     context_with_correlation, event_matches_context, merge_context, new_request_id, new_session_id,
     reply_context, utterance_payload, Context, Data, Event, Reply,
