@@ -5,7 +5,7 @@ Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom final API: intercom
 | Fact | Value |
 | :-- | :-- |
 | Crate | `thalovant` on crates.io |
-| Version | 0.18.0 (`Cargo.toml`; the user agent reads it through `CARGO_PKG_VERSION`) |
+| Version | 0.19.0 (`Cargo.toml`; the user agent reads it through `CARGO_PKG_VERSION`) |
 | Rust | 1.88 or newer (`rust-version`), edition 2021 |
 | Licence | MIT |
 | Binaries | none: a library crate |
@@ -44,6 +44,17 @@ Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom final API: intercom
 | Errors | denied `DeviceAuthorizationDenied`, timeout `DeviceAuthorizationExpired`, other callback error `BrowserLoginFailed`, refused exchange `ApiResponse` 400 `invalid_grant` |
 | Request bound | configuration and exchange: 10 s each (`BROWSER_REQUEST_TIMEOUT`); the tab waits for the sign-in to end |
 | Vectors | `tests/conformance/browser-login-vectors.json` (119 cases): `tests/browser_login.rs` and `src/loopback_tests.rs`; private edges in `src/control/browser_login_tests.rs` |
+
+## Home bridges and link refusals (0.19.0; ports Python 0.13.0, reference digest `8687c8429e28`; depends on thalovant-api #521, not deployed; safe against the old API)
+
+| Item | Where |
+| :-- | :-- |
+| `CONNECTION_TYPE_CONNECTOR` (`"connector"`; ids in `spec.connectors`) | `src/control.rs` |
+| Replay (`Idempotent-Replayed: true` or `replay.code` `idempotent_replay`) makes the create fail with `ThalovantError::CredentialsNotReplayed { client }` (`replayed_client()`, `replayed_client_id()`; no credentials, never a made-up identity) | `provision_client_identity` in `src/control.rs` |
+| `BootstrapIdentityResult::serves()`, `serves_warning()`, `replayed()` | `src/control.rs` |
+| New `ApiRefusal` kinds with accessors (`connection_unavailable_reason()`, `connectors_invalid_reason()`, `connectors_known()`, `link_client_id()`, `hub_links()`, `private_hub_settings()`) | `src/errors.rs` |
+| Code constants | `thalovant::connection_problem_code` |
+| Tests | `tests/connector_connections.rs` |
 
 ## Intercom (`src/intercom.rs`, `src/control/intercom.rs`; 0.18.0; scopes `intercom:read`, `intercom:send`, `intercom:urgent` (urgent needs it as well as `intercom:send`), `hubs:write`)
 

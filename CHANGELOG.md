@@ -2,6 +2,16 @@ Last Edit: Claude Sonnet 5.5 - 2026-11-12 - Motive: Intercom review round 2 (Cod
 
 # Changelog
 
+## 0.19.0 — Unreleased
+
+Home bridges and the rules the API enforces around links. Ports thalovant-python-sdk 0.13.0 (reference digest `8687c8429e28`; its `docs/home-link-porting.md`, section "connector-connections", is the brief). It depends on thalovant-api #521, which is not deployed yet, and is safe against the API as it is today: every new field is optional and an old answer reads as before. Everything is additive (`ApiRefusal` and `ThalovantError` are `#[non_exhaustive]`).
+
+- `CONNECTION_TYPE_CONNECTOR` (`connector`): a home bridge next to `home_assistant`. Its connector ids ride in `spec.connectors`; the SDK does not validate them.
+- **Replay.** A create answered from an earlier request with the same `Idempotency-Key` (response header `Idempotent-Replayed: true`, or a `replay` object with code `idempotent_replay`; not the intercom header `Idempotency-Replayed`) carries no credentials. `create_client_identity` and `create_client_identity_of_type` fail with the new `ThalovantError::CredentialsNotReplayed { client }` (`replayed_client()`, `replayed_client_id()`; the resource has every credential removed) and never return an identity the SDK made up. An answer with no credentials that is not a replay keeps the old fallback.
+- `BootstrapIdentityResult::serves()`, `serves_warning()` (the warning, `None` when there is none) and `replayed()` (false on a result you hold).
+- New `ApiRefusal` kinds, read by status and code at the top of the problem or inside an object `detail`: `ConnectionTypeUnavailable` (422; stays `ThalovantError::UnsupportedConnectionType` from `create_client_identity_of_type`, `connection_unavailable_reason()`), `ConnectorsInvalid` (422; `connectors_invalid_reason()`, `connectors_known()`; a refusal with this code is never retyped as an unsupported kind), `OwnerOnlyBesideLink` (403, three codes; `link_client_id()`), `HubScaleOutBreaksLinks` (409; `hub_links()`), `IdempotencyKeySpent` (409) and `PrivateHubOnly` (422; `private_hub_settings()`). The codes are in `thalovant::connection_problem_code`. A code not listed is an ordinary API error.
+- The `connector-connections` parity capability is recorded (required); the evidence hashes of `src/control.rs`, `src/errors.rs` and `src/lib.rs` are refreshed for the other capabilities: each changed only by this addition. Tests: `tests/connector_connections.rs` (16, mirroring the reference's `tests/test_connector_connections.py`; there are no shared vectors).
+
 ## 0.18.0 — Unreleased
 
 Intercom. Every addition is new API. Ports thalovant-python-sdk 0.12.0 (reference digest `66bfb1ac5879`; its `docs/intercom-porting.md` is the brief).

@@ -8,7 +8,7 @@ pub use browser_login::{
 pub use hub_skills::HubSkillWaitOptions;
 
 use crate::{
-    errors::{ApiProblem, Result, ThalovantError},
+    errors::{connection_problem_code, ApiProblem, ApiRefusal, Result, ThalovantError},
     identity::Identity,
     protocols::{
         endpoint_from_domain, select_data_plane_endpoint, HubDataPlaneEndpoints, HubProtocol,
@@ -55,6 +55,10 @@ pub const HOME_ASSISTANT_SCOPES: &[&str] = &["hubs:read", "clients:read", "clien
 pub const HOME_ASSISTANT_CLIENT_ID: &str = "thalovant-home-assistant";
 /// `spec.connection_type` of a Home Assistant link.
 pub const CONNECTION_TYPE_HOME_ASSISTANT: &str = "home_assistant";
+/// `spec.connection_type` of a home bridge: a link that serves the connector
+/// ids in `spec.connectors` (`music_assistant` today). Home Assistant has the
+/// kind above and is never one of a bridge's connectors.
+pub const CONNECTION_TYPE_CONNECTOR: &str = "connector";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1874,12 +1878,26 @@ impl ControlPlane {
             payload.insert("owner_id".to_string(), Value::String(owner_id));
         }
 
+        let key = opts
+            .idempotency_key
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let created = self
-            .create_client(Value::Object(payload), opts.idempotency_key)
+            .request_flagged(
+                "POST",
+                "/v1/clients",
+                Some(Value::Object(payload)),
+                Some(single_header("Idempotency-Key", &key)?),
+                true,
+                "idempotent-replayed",
+            )
             .await;
-        let client = match (created, connection_type) {
-            (Ok(client), _) => client,
-            (Err(error), Some(kind)) if refuses_connection_type(&error) => {
+        let (client, header_replay) = match (created, connection_type) {
+            (Ok(answer), _) => answer,
+            // A kind the API refused for a reason of its own keeps that reason.
+            (Err(error), Some(kind))
+                if refuses_connection_type(&error)
+                    && error.api_refusal() != Some(ApiRefusal::ConnectorsInvalid) =>
+            {
                 return Err(ThalovantError::UnsupportedConnectionType {
                     connection_type: kind.to_string(),
                     reason: format!(
@@ -1892,6 +1910,11 @@ impl ControlPlane {
             }
             (Err(error), _) => return Err(error),
         };
+        if header_replay || has_replay_marker(&client) {
+            return Err(ThalovantError::CredentialsNotReplayed {
+                client: Box::new(scrub_client_secrets(&client)),
+            });
+        }
         if let Some(kind) = connection_type {
             self.require_connection_type(&client, kind).await?;
         }
@@ -2235,11 +2258,27 @@ impl ControlPlane {
         headers: Option<HeaderMap>,
         auth: bool,
     ) -> Result<(Value, bool)> {
+        self.request_flagged(method, path, body, headers, auth, "idempotency-replayed")
+            .await
+    }
+
+    /// [`request`](Self::request), and whether the answer carried the response
+    /// header `flag` (a lowercase name) as `true` (any case; anything else is
+    /// no).
+    async fn request_flagged(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: Option<HeaderMap>,
+        auth: bool,
+        flag: &str,
+    ) -> Result<(Value, bool)> {
         let response = self.send(method, path, body, headers, auth).await?;
         let status = response.status();
         let replayed = response
             .headers()
-            .get("idempotency-replayed")
+            .get(flag)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"));
         let body = if status.is_success() {
@@ -2545,6 +2584,33 @@ impl BootstrapIdentityResult {
             .and_then(Value::as_str)
     }
 
+    /// Whether the API answered from an earlier create with the same
+    /// `Idempotency-Key` (a `replay` object in the answer). A replay carries no
+    /// credentials, so [`ControlPlane::create_client_identity`] fails with
+    /// [`ThalovantError::CredentialsNotReplayed`] instead of returning one:
+    /// this is `false` on a result you hold.
+    pub fn replayed(&self) -> bool {
+        has_replay_marker(&self.client)
+    }
+
+    /// What a new link will serve: `devices` (`id`, `name`, `connection_type`,
+    /// `active`), `count` and `warning`. Present for a `home_assistant` or
+    /// `connector` link: the same account's devices on the same hub, and
+    /// nobody else's. `None` for any other kind, and from an API that does not
+    /// say.
+    pub fn serves(&self) -> Option<&Map<String, Value>> {
+        self.client.get("serves").and_then(Value::as_object)
+    }
+
+    /// The warning in [`BootstrapIdentityResult::serves`]: this link will
+    /// serve none of the account's devices. `None` when there is none.
+    pub fn serves_warning(&self) -> Option<&str> {
+        self.serves()?
+            .get("warning")
+            .and_then(Value::as_str)
+            .filter(|warning| !warning.is_empty())
+    }
+
     /// The operation that carries the new client to its hub, when the API
     /// returned one; [`ControlPlane::wait_for_admission`] waits for it.
     pub fn operation(&self) -> Option<OperationResource> {
@@ -2821,6 +2887,46 @@ fn token_id_value(token: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+/// Whether a create's answer says it is an earlier request's: a `replay`
+/// object whose `code` is `idempotent_replay`.
+fn has_replay_marker(client: &Value) -> bool {
+    client
+        .get("replay")
+        .and_then(|marker| marker.get("code"))
+        .and_then(Value::as_str)
+        == Some(connection_problem_code::IDEMPOTENT_REPLAY)
+}
+
+/// Whether an object key names a credential a replayed resource must not keep.
+fn is_client_secret_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "initialidentify" | "initialidentifytoken"
+    ) || crate::redact::is_secret_key(key)
+}
+
+/// A copy of a client resource without anything that carries a credential:
+/// `initial_identify`, `initial_identify_token`, and `apiKey`, `password` and
+/// `cryptoKey` (in any spelling) wherever they appear. Reference keys such as
+/// `apiKeyRef` stay: they point at stored secrets and hold none.
+fn scrub_client_secrets(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| !is_client_secret_key(key))
+                .map(|(key, item)| (key.clone(), scrub_client_secrets(item)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(scrub_client_secrets).collect()),
+        other => other.clone(),
+    }
 }
 
 /// A 422 whose problem is about `connection_type`.
