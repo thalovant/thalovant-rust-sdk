@@ -1,5 +1,3 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-12 - Motive: Intercom review round 2 (CodeRabbit PR 91): poll interval clamp, the POST's answer on a failed wait, urgent-scope precedence, nested problem members, docs aligned with the API.
-
 # Changelog
 
 ## 0.19.0 — Unreleased

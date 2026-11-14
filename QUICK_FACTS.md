@@ -1,5 +1,3 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-11 - Motive: Intercom final API: intercom:urgent, speaker kind/can_play/policy_synced, refusal kinds, text rule, DND zone, replayed.
-
 # Quick facts: thalovant (Rust SDK)
 
 | Fact | Value |
