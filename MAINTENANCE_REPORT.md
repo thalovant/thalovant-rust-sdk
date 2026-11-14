@@ -1,5 +1,3 @@
-Last Edit: Claude Sonnet 5.5 - 2026-11-12 - Motive: Intercom review fixes, round 2 (CodeRabbit PR 91): poll interval clamp, the POST's answer on a failed wait, urgent-scope code before the generic refusal, nested problem members, docs aligned with the API; Python digest a0722fec2c54.
-
 # Maintenance report
 
 ## 2026-11-14: Home bridges and link refusals (0.19.0; Python digest `8687c8429e28`)
