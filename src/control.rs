@@ -4837,7 +4837,10 @@ mod tests {
         assert!(!public.contains("LEAK"), "{public}");
         assert!(public.contains("home.example.com"));
         let secret = result.as_value(true).to_string();
-        assert!(secret.contains("LEAK-ENDPOINT") && secret.contains("LEAK-HUB"), "{secret}");
+        assert!(
+            secret.contains("LEAK-ENDPOINT") && secret.contains("LEAK-HUB"),
+            "{secret}"
+        );
     }
 
     #[test]

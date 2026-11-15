@@ -2,10 +2,10 @@
   "capabilities": {
     "api-errors": {
       "implementation": {
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/errors.rs": "08a8338b833d56d9a6533f489ac3f51fd8cc30cd44ebf32554fbc18481c7b9fc",
         "src/lib.rs": "529a30cb385c465b8b2e4c5879a9ffbb5c0cd742328e1459ac7151febd8de7a8",
-        "src/redact.rs": "d2bec610c47a65ba7cce87e3e56fe62fed70d3b146e4bfd9444bd5a7a4f012bd"
+        "src/redact.rs": "aa4ab9789a56096392ac8405f5e9a61127622c37358db763b416a71d8f92dcdc"
       },
       "reason": "ApiProblem and ThalovantError's api_problem/api_code/api_detail live in src/errors.rs; api_response_error() in src/control.rs parses every failure body once and fills ApiResponse.problem, leaving the bounded, redacted display line as it was, and ApiProblem's hand-written Debug redacts secret-named keys so {:?} and an unwrap() panic cannot print an echoed password; the display line and that Debug also print every validation error's input as [omitted], in each entry of a detail or errors list, through omit_echoed_inputs in src/redact.rs, since an echoed input can sit under any key. tests/api_errors.rs serves each shared vector from a loopback HTTP peer, reads it back through ControlPlane::get_hub and records what it produced through tests/common/mod.rs, which is hashed beside it because it controls canonicalisation.",
       "status": "required",
@@ -38,7 +38,7 @@
     },
     "browser-login": {
       "implementation": {
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/control/browser_login.rs": "7fba3fb43adfbdd4e4a44b8593fc1776aeccf07557529e0bf07569c7c6c01ab4",
         "src/errors.rs": "08a8338b833d56d9a6533f489ac3f51fd8cc30cd44ebf32554fbc18481c7b9fc",
         "src/lib.rs": "529a30cb385c465b8b2e4c5879a9ffbb5c0cd742328e1459ac7151febd8de7a8",
@@ -61,7 +61,7 @@
     "chat-apps": {
       "implementation": {
         "src/chat_apps.rs": "b079b399d98e3f91d6f6dd0109ba1da89502ec81d21430eaac5cd8cf5a551990",
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/control/bridges.rs": "07bb2ff6f8e53b1936b0d4bed03126ec4ee7dee7618b0794abb8e4969ba067b7",
         "src/errors.rs": "08a8338b833d56d9a6533f489ac3f51fd8cc30cd44ebf32554fbc18481c7b9fc",
         "src/lib.rs": "529a30cb385c465b8b2e4c5879a9ffbb5c0cd742328e1459ac7151febd8de7a8"
@@ -78,7 +78,7 @@
     },
     "connection-admission": {
       "implementation": {
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/errors.rs": "08a8338b833d56d9a6533f489ac3f51fd8cc30cd44ebf32554fbc18481c7b9fc",
         "src/lib.rs": "529a30cb385c465b8b2e4c5879a9ffbb5c0cd742328e1459ac7151febd8de7a8"
       },
@@ -95,7 +95,7 @@
     },
     "connection-kinds": {
       "implementation": {
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/errors.rs": "08a8338b833d56d9a6533f489ac3f51fd8cc30cd44ebf32554fbc18481c7b9fc",
         "src/lib.rs": "529a30cb385c465b8b2e4c5879a9ffbb5c0cd742328e1459ac7151febd8de7a8"
       },
@@ -112,7 +112,7 @@
     },
     "connector-connections": {
       "implementation": {
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/errors.rs": "08a8338b833d56d9a6533f489ac3f51fd8cc30cd44ebf32554fbc18481c7b9fc",
         "src/lib.rs": "529a30cb385c465b8b2e4c5879a9ffbb5c0cd742328e1459ac7151febd8de7a8"
       },
@@ -130,7 +130,7 @@
       "reason": "Applicable public behavior is implemented and exercised by the named regression suites and shared fixtures. Rust unit tests are colocated with their implementation; complete tested modules are recorded as test evidence and exports/delegates as implementation evidence. The authorization-code grant with PKCE is covered here alongside the device grant: the challenge is checked to be S256 of the verifier, the verifier never to reach the browser, a redirect answering a different attempt or carrying error= to be refused, and the token exchange to refuse cleartext to a non-loopback host.",
       "status": "required",
       "tests": {
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/hubs.rs": "6de08259a8bbe50ac17f71b988a7b63ee66844204cd82770d53960f5f7ba0823",
         "src/native_auth.rs": "f594a1bd07034e1787321b0cab60610c3c8330f8daa67baac5e26771a3414c51"
       }
@@ -152,7 +152,7 @@
     },
     "device-login": {
       "implementation": {
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/errors.rs": "08a8338b833d56d9a6533f489ac3f51fd8cc30cd44ebf32554fbc18481c7b9fc",
         "src/lib.rs": "529a30cb385c465b8b2e4c5879a9ffbb5c0cd742328e1459ac7151febd8de7a8"
       },
@@ -211,7 +211,7 @@
     },
     "intercom": {
       "implementation": {
-        "src/control.rs": "97f2546e5a7bd871301d499c8156cc32e9d6a98b6c04f0e66a56e975524c5622",
+        "src/control.rs": "319b4575206686aa29980c0207cd1f1968b82acc28bb74f98685516a9bfab816",
         "src/control/intercom.rs": "c995176de77ed0dd93ae4f6073c2cac6a671c8014893046d4ee611c9934e1e0c",
         "src/errors.rs": "08a8338b833d56d9a6533f489ac3f51fd8cc30cd44ebf32554fbc18481c7b9fc",
         "src/intercom.rs": "115969ee2fc32d65a9f4d175610137be428f554f9ae898ba1c0c7f2a070fcc4e",

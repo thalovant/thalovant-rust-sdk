@@ -206,7 +206,10 @@ mod tests {
             "list": ["https://u:LEAK2@h.example.com/x"],
         }));
         let text = redacted.to_string();
-        assert!(!text.contains("LEAK") && !text.contains("hubuser"), "{text}");
+        assert!(
+            !text.contains("LEAK") && !text.contains("hubuser"),
+            "{text}"
+        );
         assert_eq!(redacted["plain"], "wss://home.example.com/path/");
         assert_eq!(redacted["email"], "someone@example.com");
         assert_eq!(redacted["list"][0], "https://h.example.com/x");
