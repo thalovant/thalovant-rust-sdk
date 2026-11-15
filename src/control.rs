@@ -56,7 +56,7 @@ pub const HOME_ASSISTANT_CLIENT_ID: &str = "thalovant-home-assistant";
 /// `spec.connection_type` of a Home Assistant link.
 pub const CONNECTION_TYPE_HOME_ASSISTANT: &str = "home_assistant";
 /// `spec.connection_type` of a home bridge: a link that serves the connector
-/// ids in `spec.connectors` (`music_assistant` today). Home Assistant has the
+/// ids in `spec.connectors` (`jellyfin` and `music_assistant` today). Home Assistant has the
 /// kind above and is never one of a bridge's connectors.
 pub const CONNECTION_TYPE_CONNECTOR: &str = "connector";
 
@@ -2684,7 +2684,15 @@ impl BootstrapIdentityResult {
             "hub": hub,
             "client": client,
             "selected_protocol": self.selected_protocol(),
-            "selected_endpoint": self.endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone()),
+            "selected_endpoint": self.endpoint.as_ref().map(|endpoint| {
+                // The endpoint can be written `user:pass@host`; only
+                // `include_secrets` keeps that.
+                if include_secrets {
+                    endpoint.endpoint.clone()
+                } else {
+                    crate::protocols::redact_endpoint_credentials(&endpoint.endpoint)
+                }
+            }),
         })
     }
 }
@@ -4815,6 +4823,21 @@ mod tests {
             }),
             endpoint: None,
         }
+    }
+
+    #[test]
+    fn bootstrap_summary_strips_url_userinfo_unless_secrets_are_requested() {
+        let mut result = bootstrap_result_with_secrets();
+        result.endpoint = Some(SelectedHubEndpoint {
+            protocol: HubProtocol::Wss,
+            endpoint: "wss://user:LEAK-ENDPOINT@home.example.com".to_string(),
+        });
+        result.hub = json!({"id": "hub-1", "data_plane_endpoints": {"wss": "wss://u:LEAK-HUB@home.example.com"}});
+        let public = result.as_value(false).to_string();
+        assert!(!public.contains("LEAK"), "{public}");
+        assert!(public.contains("home.example.com"));
+        let secret = result.as_value(true).to_string();
+        assert!(secret.contains("LEAK-ENDPOINT") && secret.contains("LEAK-HUB"), "{secret}");
     }
 
     #[test]

@@ -116,8 +116,22 @@ fn redact_value_scoped(value: &Value, in_identity_bundle: bool) -> Value {
                 .map(|item| redact_value_scoped(item, in_identity_bundle))
                 .collect(),
         ),
+        Value::String(text) => Value::String(strip_url_userinfo(text)),
         other => other.clone(),
     }
+}
+
+/// `text` with `user:password@` removed when it is a URL carrying it (a
+/// data-plane endpoint written `wss://user:pass@host`); any other string as is.
+pub(crate) fn strip_url_userinfo(text: &str) -> String {
+    if text.contains("://") && text.contains('@') {
+        if let Ok(url) = reqwest::Url::parse(text) {
+            if !url.username().is_empty() || url.password().is_some() {
+                return crate::protocols::redact_endpoint_credentials(text);
+            }
+        }
+    }
+    text.to_string()
 }
 
 fn redact_map_scoped(map: &Map<String, Value>, in_identity_bundle: bool) -> Map<String, Value> {
@@ -181,6 +195,21 @@ mod tests {
                 "expected {pointer} to be redacted"
             );
         }
+    }
+
+    #[test]
+    fn strips_userinfo_from_url_values_and_leaves_other_strings() {
+        let redacted = redact_value(&json!({
+            "wss": "wss://hubuser:LEAK@home.example.com",
+            "plain": "wss://home.example.com/path/",
+            "email": "someone@example.com",
+            "list": ["https://u:LEAK2@h.example.com/x"],
+        }));
+        let text = redacted.to_string();
+        assert!(!text.contains("LEAK") && !text.contains("hubuser"), "{text}");
+        assert_eq!(redacted["plain"], "wss://home.example.com/path/");
+        assert_eq!(redacted["email"], "someone@example.com");
+        assert_eq!(redacted["list"][0], "https://h.example.com/x");
     }
 
     #[test]

@@ -1,5 +1,9 @@
 # Audit
 
+## 2026-11-15: fixed in 0.19.1, redacted result kept URL userinfo
+
+`as_value(false)` (`src/control.rs`) returned `selected_endpoint` and hub/client URL strings with `user:pass@`. `redact_value` (`src/redact.rs`) now strips it. Open by design: `serde_json::to_string(&identity)` serialises the secrets (identity file).
+
 ## Intercom (0.18.0): `AnnounceOptions` derived `Debug` and printed the text (security review L4), now redacted
 
 `AnnounceOptions` (`src/intercom.rs`) derived `Debug`, so `{:?}`, `{:#?}`, `tracing`'s `#[instrument]` or an error chain that printed it carried `text`. `Debug` is now written by hand and prints `text: <N chars>` (`tests/intercom.rs`, `announce_options_debug_never_prints_the_text`); no error or `Display` of the SDK carries the text either (`no_error_or_display_carries_the_text`). `Clone`, `PartialEq` and `Eq` still see the text. `announce_body` returns a `serde_json::Value` that holds it, but it is `pub(crate)` and never formatted.
