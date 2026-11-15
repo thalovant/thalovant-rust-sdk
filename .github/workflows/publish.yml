@@ -37,7 +37,7 @@ jobs:
       name: crates
       url: https://crates.io/crates/thalovant
     env:
-      CARGO_REGISTRY_TOKEN_FROM_SECRET: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      CRATES_IO_TOKEN_SECRET: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag || '' }}
     permissions:
       contents: write
@@ -147,7 +147,7 @@ jobs:
         run: echo "thalovant ${{ steps.version.outputs.version }} is already published on crates.io."
 
       - name: Authenticate with crates.io trusted publishing
-        if: ${{ steps.registry.outputs.exists == 'false' && env.CARGO_REGISTRY_TOKEN_FROM_SECRET == '' }}
+        if: ${{ steps.registry.outputs.exists == 'false' && env.CRATES_IO_TOKEN_SECRET == '' }}
         id: crates-auth
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1
 
@@ -155,13 +155,13 @@ jobs:
         if: steps.registry.outputs.exists == 'false'
         run: cargo publish --dry-run --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN_SECRET || steps.crates-auth.outputs.token }}
 
       - name: Publish to crates.io
         if: steps.registry.outputs.exists == 'false'
         run: cargo publish --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN_FROM_SECRET || steps.crates-auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ env.CRATES_IO_TOKEN_SECRET || steps.crates-auth.outputs.token }}
 
       - name: Verify crates.io artifact matches the attested crate
         env:
