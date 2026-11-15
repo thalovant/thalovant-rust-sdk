@@ -4839,7 +4839,7 @@ mod tests {
         let secret = result.as_value(true).to_string();
         assert!(
             secret.contains("LEAK-ENDPOINT") && secret.contains("LEAK-HUB"),
-            "{secret}"
+            "as_value(true) must keep the real values"
         );
     }
 
