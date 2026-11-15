@@ -125,3 +125,7 @@ Yes, as the Python reference does: `authorized_wss_url` in `src/transport.rs` ac
 
 **Why does the first connect fail with "atomic Noise key publication requires a filesystem supporting hard links"?**
 The state folder is on a filesystem without hard links (FAT32, exFAT, some network shares). The static key is published with a hard link so that two processes never replace each other's key (`publish_private` in `src/noise_store.rs`). Keep the state on a filesystem that supports hard links (NTFS, ext4, APFS; not FAT32 or exFAT, even on a local disk). That is the identity file's folder, since `Client::from_file` keeps the key beside it, or the folder you give the transport's `set_noise_state_dir`.
+
+## Does `as_value(false)` hide `user:pass@` in endpoints?
+
+From 0.19.1, yes: `selected_endpoint` and URL values in `hub` and `client` are stripped; `as_value(true)` keeps them.

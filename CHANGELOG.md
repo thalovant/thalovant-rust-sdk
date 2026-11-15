@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.19.1 — Unreleased
+
+Security hardening, found by installing 0.19.0 from crates.io and printing a connector-flow result (`Debug` was already redacted). `BootstrapIdentityResult::as_value(false)` kept `user:pass@` in `selected_endpoint` and in URL values inside the raw `hub` and `client` records; both are stripped now (`redact_value` strips userinfo from any URL string; only `as_value(true)` keeps it). The connector docs name `jellyfin` and `music_assistant`. The published crate no longer contains `Last Edit:` headers. Upgrading from 0.19.0 is advised; 0.19.0 stays published. Evidence: `redact::tests::strips_userinfo_from_url_values_and_leaves_other_strings`, `control::tests::bootstrap_summary_strips_url_userinfo_unless_secrets_are_requested`.
+
 ## 0.19.0 — Unreleased
 
 Home bridges and the rules the API enforces around links. Ports thalovant-python-sdk 0.13.0 (reference digest `8687c8429e28`; its `docs/home-link-porting.md`, section "connector-connections", is the brief). It depends on thalovant-api #521, which is not deployed yet, and is safe against the API as it is today: every new field is optional and an old answer reads as before. Everything is additive (`ApiRefusal` and `ThalovantError` are `#[non_exhaustive]`).

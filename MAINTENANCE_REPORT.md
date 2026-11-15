@@ -1,5 +1,13 @@
 # Maintenance report
 
+## 2026-11-15: URL userinfo in the redacted result (0.19.1)
+
+Added `thalovant = "=0.19.0"` to a consumer project, ran the connector flow against a local mock (`create_client_identity_of_type`): `{:?}` and `{:#?}` of the result and identity, and `as_value(false)`, printed no secret; `serde_json::to_string(&identity)` carries them by design (identity-file form). One gap: `selected_endpoint` and URL values in `hub`/`client` kept `user:pass@` (`src/control.rs`, `src/redact.rs`). Fixed with `strip_url_userinfo`. Registry contents equal the `v0.19.0` tag apart from `Cargo.toml` normalisation. `contracts/sdk-parity.json` hashes refreshed for `src/control.rs` and `src/redact.rs`; parity passes. The version is bumped by the release workflow.
+
+Verification: `cargo test --lib` 339 passed, 0 failed (two new tests).
+
+Transparency Report: AI model Claude Sonnet 5.5; actions: ran the published crate, found the gap, wrote the fix, tests and docs; oversight: PR review and CI only.
+
 ## 2026-11-14: Home bridges and link refusals (0.19.0; Python digest `8687c8429e28`)
 
 Ported the Python reference's `connector-connections` (0.13.0): `CONNECTION_TYPE_CONNECTOR`, replay detection with `ThalovantError::CredentialsNotReplayed`, `BootstrapIdentityResult::{serves, serves_warning, replayed}`, six `ApiRefusal` kinds with accessors and `connection_problem_code` (`src/control.rs`, `src/errors.rs`, `src/lib.rs`). Depends on thalovant-api #521 (not deployed); safe against the old API. Version bumped to 0.19.0 (0.18.0 is published). Tests: `tests/connector_connections.rs`. `contracts/sdk-parity.json`: digest acknowledged next to the earlier ones, new capability, refreshed hashes.
